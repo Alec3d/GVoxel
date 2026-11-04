@@ -68,9 +68,9 @@ function V.OpenScanMenu()
 	end
 	local frame = vgui.Create("DFrame")
 	menu = frame
-	frame:SetSize(430, 570)
+	frame:SetSize(580, 620)
 	frame:Center()
-	frame:SetTitle("GVoxel — dimensions de la zone")
+	frame:SetTitle(V.L("GVoxel — dimensions de la zone"))
 	frame:SetDeleteOnClose(true)
 	frame:MakePopup()
 	frame.VMMetres = V.SelectedMetres()
@@ -81,18 +81,18 @@ function V.OpenScanMenu()
 
 	local title = vgui.Create("DLabel", frame)
 	title:SetPos(18, 38)
-	title:SetSize(395, 45)
-	title:SetText("Relache R pour utiliser ce menu.\nR court lance l'analyse de la selection.")
+	title:SetSize(544, 45)
+	title:SetText(V.L("Relache R pour utiliser ce menu.\nR court lance l'analyse de la selection."))
 	local choices = {}
 	for i, metres in ipairs(V.ScanSizes) do
 		local button = vgui.Create("DButton", frame)
-		button:SetPos(18 + (i - 1) * 202, 91)
-		button:SetSize(192, 48)
+		button:SetPos(18 + (i - 1) * 277, 91)
+		button:SetSize(267, 48)
 		choices[metres] = button
 		local function refresh()
 			for size, b in pairs(choices) do
 				b:SetText(
-					(size == frame.VMMetres and "[ Selectionne ] " or "")
+					(size == frame.VMMetres and V.L("[ Selectionne ] ") or "")
 						.. size
 						.. " x "
 						.. size
@@ -102,6 +102,7 @@ function V.OpenScanMenu()
 				)
 			end
 		end
+		frame.VMRefreshSizes = refresh
 		button.DoClick = function()
 			frame.VMMetres = metres
 			RunConsoleCommand("vm_custom_block", "0")
@@ -111,70 +112,70 @@ function V.OpenScanMenu()
 	end
 	local custom = vgui.Create("DCheckBoxLabel", frame)
 	custom:SetPos(18, 149)
-	custom:SetSize(395, 23)
-	custom:SetText("Custom block — boite rectangulaire a 4 points")
+	custom:SetSize(544, 23)
+	custom:SetText(V.L("Custom block — boite rectangulaire a 4 points"))
 	custom:SetConVar("vm_custom_block")
 	local help = vgui.Create("DLabel", frame)
 	help:SetPos(18, 178)
-	help:SetSize(395, 42)
+	help:SetSize(544, 72)
 	help:SetWrap(true)
 	help:SetText(
-		"Molette : depart, largeur X, longueur Y, hauteur.\nPuis molette : deplacer / verrouiller. R : analyser.\nDimensions ajustees a la grille ; maximum 32 m par axe."
+		V.L("Molette : depart, largeur X, longueur Y, hauteur.\nPuis molette : deplacer / verrouiller. R : analyser.\nDimensions ajustees a la grille ; maximum 32 m par axe.")
 	)
 	local undo = vgui.Create("DButton", frame)
-	undo:SetPos(18, 224)
-	undo:SetSize(190, 27)
-	undo:SetText("Retirer le dernier point")
+	undo:SetPos(18, 254)
+	undo:SetSize(267, 27)
+	undo:SetText(V.L("Retirer le dernier point"))
 	undo.DoClick = function()
 		V.UndoCustomBlockSelection()
 	end
 	local reset = vgui.Create("DButton", frame)
-	reset:SetPos(220, 224)
-	reset:SetSize(190, 27)
-	reset:SetText("Recommencer la boite")
+	reset:SetPos(295, 254)
+	reset:SetSize(267, 27)
+	reset:SetText(V.L("Recommencer la boite"))
 	reset.DoClick = function()
 		V.ResetCustomBlockSelection()
 	end
 	local slider = vgui.Create("DNumSlider", frame)
-	slider:SetPos(18, 260)
-	slider:SetSize(392, 46)
-	slider:SetText("Rayon de l'outil (unites)")
+	slider:SetPos(18, 290)
+	slider:SetSize(544, 46)
+	slider:SetText(V.L("Rayon de l'outil (unites)"))
 	slider:SetMin(24)
 	slider:SetMax(80)
 	slider:SetDecimals(0)
 	slider:SetValue(math.max(24, weapon:GetBrushRadius()))
 	frame.VMRadius = slider
 	for i, option in ipairs({
-		{ "Afficher les limites des zones", "vm_show_zone" },
-		{ "Afficher le releve en fil de fer", "vm_show_wireframe" },
-		{ "Afficher le viseur de creusement", "vm_show_cursor" },
-		{ "Remplacer visuellement le BSP", "vm_replace_visual" },
+		{ V.L("Afficher les limites des zones"), "vm_show_zone" },
+		{ V.L("Afficher le releve en fil de fer"), "vm_show_wireframe" },
+		{ V.L("Afficher le viseur de creusement"), "vm_show_cursor" },
+		{ V.L("Remplacer visuellement le BSP"), "vm_replace_visual" },
 	}) do
 		local check = vgui.Create("DCheckBoxLabel", frame)
-		check:SetPos(18, 316 + (i - 1) * 27)
-		check:SetSize(395, 23)
+		check:SetPos(18, 346 + (i - 1) * 27)
+		check:SetSize(544, 23)
 		check:SetText(option[1])
 		check:SetConVar(option[2])
 	end
 	local info = vgui.Create("DLabel", frame)
-	info:SetPos(18, 431)
-	info:SetSize(395, 58)
+	info:SetPos(18, 461)
+	info:SetSize(544, 78)
 	info:SetWrap(true)
 	info:SetText(
-		"Une zone partagee par serveur. Gauche : creuser ; droite : ajouter. Les modifications attendent la preparation des collisions et des clients."
+		V.L("Une zone partagee par serveur. Gauche : creuser ; droite : ajouter. Les modifications attendent la preparation des collisions et des clients.")
 	)
 	local cancel = vgui.Create("DButton", frame)
-	cancel:SetPos(18, 510)
-	cancel:SetSize(160, 42)
-	cancel:SetText("Annuler / effacer le releve")
+	cancel:SetPos(18, 560)
+	cancel:SetSize(260, 42)
+	cancel:SetText(V.L("Annuler / effacer le releve"))
 	cancel.DoClick = function()
 		net.Start("vm_scan_cancel")
 		net.SendToServer()
 	end
 	local close = vgui.Create("DButton", frame)
-	close:SetPos(190, 510)
-	close:SetSize(220, 42)
-	close:SetText("Enregistrer et fermer")
+	close:SetPos(290, 560)
+	close:SetSize(272, 42)
+	close:SetText(V.L("Enregistrer et fermer"))
 	close.DoClick = function()
 		V.CloseScanMenu(true)
 	end
@@ -184,7 +185,7 @@ local function requestScan()
 	if V.CustomBlockEnabled() then
 		local low, high = V.CustomBlockScanBounds()
 		if not low then
-			LocalPlayer():ChatPrint("[GVoxel] " .. high)
+			LocalPlayer():ChatPrint("[GVoxel] " .. V.L(high))
 			return
 		end
 		net.Start("vm_scan_custom")
@@ -291,23 +292,23 @@ hook.Add("HUDPaint", "GVoxel.ScanStatus", function()
 	end
 	local text
 	if scan.phase == 0 then
-		text = string.format("Analyse de la zone : %d %%", scan.ratio * 100)
+		text = string.format(V.L("Analyse de la zone : %d %%"), scan.ratio * 100)
 	elseif scan.built < 64 then
-		text = string.format("Preparation du terrain : %d / 64 blocs", scan.built)
+		text = string.format(V.L("Preparation du terrain : %d / 64 blocs"), scan.built)
 	elseif scan.phase ~= 2 then
-		text = "Reception du terrain..."
+		text = V.L("Reception du terrain...")
 	elseif not scan.visualReady then
 		text = string.format(
-			"Capture des textures du sol : %d / %d",
+			V.L("Capture des textures du sol : %d / %d"),
 			scan.region.surfaceFinished or 0,
 			#(scan.region.surfaceList or {})
 		)
 	else
 		text = string.format(
-			"Analyse terminee — %.1f s — %d rayons | %s — terrain voxel praticable",
+			V.L("Analyse terminee — %.1f s — %d rayons | %s — terrain voxel praticable"),
 			scan.elapsed,
 			scan.rays,
-			V.VisualReplacementEnabled() and "Rendu voxel actif" or "Rendu voxel desactive"
+			V.VisualReplacementEnabled() and V.L("Rendu voxel actif") or V.L("Rendu voxel desactive")
 		)
 	end
 	draw.SimpleTextOutlined(
@@ -321,4 +322,17 @@ hook.Add("HUDPaint", "GVoxel.ScanStatus", function()
 		1,
 		color_black
 	)
+end)
+
+-- Reopen with the current settings so all labels update without losing a draft.
+hook.Add("GVoxel.LanguageChanged", "GVoxel.ScanMenuLanguage", function()
+    if not IsValid(menu) then return end
+    local metres, radius = menu.VMMetres, menu.VMRadius:GetValue()
+    V.CloseScanMenu(false)
+    V.OpenScanMenu()
+    if IsValid(menu) then
+        menu.VMMetres = metres
+        menu.VMRefreshSizes()
+        menu.VMRadius:SetValue(radius)
+    end
 end)

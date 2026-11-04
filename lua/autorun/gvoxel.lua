@@ -12,6 +12,7 @@ if CLIENT and V.ReleaseClientScan then
 	V.ReleaseClientScan()
 end
 local shared = {
+	"sh_language",
 	"sh_field",
 	"sh_crater",
 	"sh_features",

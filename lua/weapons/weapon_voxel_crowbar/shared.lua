@@ -3,9 +3,9 @@ if SERVER then
 end
 
 SWEP.Base = "weapon_base"
-SWEP.PrintName = "Pied-de-biche voxel"
+SWEP.PrintName = CLIENT and "#gvoxel.tool_name" or "Voxel crowbar"
 SWEP.Author = "GVoxel"
-SWEP.Instructions = "Gauche : creuser | Droite : ajouter | R : analyser / menu | Molette : points Custom block"
+SWEP.Instructions = CLIENT and "#gvoxel.tool_instructions" or "Left: dig | Right: add | R: scan / menu | Middle click: custom box points"
 SWEP.Category = "GVoxel"
 SWEP.Spawnable = true
 SWEP.AdminOnly = true
@@ -87,8 +87,8 @@ if CLIENT then
 		local tr = GVoxel.TraceSculptPreview(LocalPlayer(), region, GVoxel.Reach)
 		local valid = tr.VoxelScan
 		local radius = region and GVoxel.ScanBrushRadius(region, self:GetBrushRadius()) or self:GetBrushRadius()
-		local message = valid and "Gauche : creuser    Droite : ajouter"
-			or "R court : analyser le BSP    |    R maintenu : dimensions"
+		local message = valid and GVoxel.L("Gauche : creuser    Droite : ajouter")
+			or GVoxel.L("R court : analyser le BSP    |    R maintenu : dimensions")
 		local custom = GVoxel.CustomBlockEnabled()
 		if custom then
 			message = GVoxel.CustomBlockStatus()
@@ -105,12 +105,12 @@ if CLIENT then
 			1,
 			Color(0, 0, 0, 220)
 		)
-		local detail = custom and "Custom block | R maintenu : menu / annuler les points"
-			or "Zone : "
+		local detail = custom and GVoxel.L("Custom block | R maintenu : menu / annuler les points")
+			or GVoxel.L("Zone : ")
 				.. GVoxel.SelectedMetres()
-				.. " m de cote    |    Rayon : "
+				.. GVoxel.L(" m de cote    |    Rayon : ")
 				.. radius
-				.. "    |    Zone partagee"
+				.. GVoxel.L("    |    Zone partagee")
 		draw.SimpleTextOutlined(
 			detail,
 			"Trebuchet18",

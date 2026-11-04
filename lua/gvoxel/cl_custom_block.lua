@@ -26,7 +26,7 @@ function V.GetCustomBlockSelection()
 end
 function V.CustomBlockScanBounds()
 	if #state.points ~= 4 or state.moving then
-		return nil, "Poser quatre points et verrouiller la boite avant R."
+		return nil, V.L("Poser quatre points et verrouiller la boite avant R.")
 	end
 	local selected = V.CustomSelectionPreview(state)
 	if not selected.bounds then
@@ -41,23 +41,23 @@ function V.CustomBlockStatus()
 		return
 	end
 	local instructions = {
-		"Molette : point 1, coin de depart",
-		"Molette : point 2, largeur X",
-		"Molette : point 3, longueur Y",
-		"Viser la hauteur puis molette : point 4",
+		V.L("Molette : point 1, coin de depart"),
+		V.L("Molette : point 2, largeur X"),
+		V.L("Molette : point 3, longueur Y"),
+		V.L("Viser la hauteur puis molette : point 4"),
 	}
-	local text = message
+	local text = message and V.L(message)
 		or (
-			state.moving and "Deplacer en visant ; molette pour verrouiller"
+			state.moving and V.L("Deplacer en visant ; molette pour verrouiller")
 			or instructions[#state.points + 1]
-			or "R : analyser | Molette : deplacer la boite"
+			or V.L("R : analyser | Molette : deplacer la boite")
 		)
 	if preview and preview.low and preview.high then
 		local e = (preview.bounds and preview.bounds.extent or preview.high - preview.low) / V.UnitsPerMetre
 		text = text
-			.. string.format(" | %.2f x %.2f x %.2f m%s", e.x, e.y, e.z, preview.bounds and " (grille)" or " (apercu)")
+			.. string.format(" | %.2f x %.2f x %.2f m%s", e.x, e.y, e.z, preview.bounds and V.L(" (grille)") or V.L(" (apercu)"))
 	end
-	return text
+	return V.L(text)
 end
 hook.Add("Think", "GVoxel.CustomBlockSelection", function()
 	local weapon = V.GetActiveVoxelTool and V.GetActiveVoxelTool()

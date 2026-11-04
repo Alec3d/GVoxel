@@ -11,7 +11,8 @@ hook.Add("PlayerCanPickupWeapon","GVoxel.AdminToolPickup",function(ply,weapon)
 end)
 function V.Notify(ply, message)
 	if IsValid(ply) then
-		ply:ChatPrint("[GVoxel] " .. message)
+		local code = ply.GetInfo and ply:GetInfo("gvoxel_language") or "en"
+		ply:ChatPrint("[GVoxel] " .. (V.Localize and V.Localize(message, code) or message))
 	end
 end
 function V.BrushIntersectsBody(center, radius)

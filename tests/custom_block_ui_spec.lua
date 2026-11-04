@@ -8,7 +8,7 @@ function RunCustomBlockUITests(customChunk,toolChunk)
     local f={vars={vm_custom_block=1,vm_show_zone=1},hooks={},commands={},panels={},sent={},mouse=false,ui=false,
         start=Vector(800,800,250),direction=Vector(-1,-1,0):GetNormalized(),rays=0,boxes=0,notices=0}
     local weapon={GetClass=function() return "weapon_voxel_crowbar" end,GetBrushRadius=function() return 48 end}
-    local ply={GetActiveWeapon=function() return weapon end,Alive=function() return true end,KeyDown=function() return false end,
+    local ply={IsAdmin=function() return true end,GetActiveWeapon=function() return weapon end,Alive=function() return true end,KeyDown=function() return false end,
         GetShootPos=function() return f.start end,GetAimVector=function() return f.direction end,ChatPrint=function() f.notices=f.notices+1 end}
     IsValid=function(e) return type(e)=="table" and e.valid~=false end
     LocalPlayer=function() return ply end RealTime=function() return 100 end
