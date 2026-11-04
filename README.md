@@ -6,11 +6,9 @@
 
 **Dig through walls, reshape the terrain, and open new paths in your Garry’s Mod maps.**
 
-GVoxel is a Lua addon that scans a selected section of a map’s BSP geometry and rebuilds it as editable voxel terrain, with reconstructed surfaces, textures, and collisions.
+GVoxel is a Lua addon that scans a selected section of a map’s BSP geometry and rebuilds it as editable voxel terrain, with reconstructed surfaces, textures, and collisions. Create tunnels, excavate the ground, breach buildings, and interact with the resulting openings using players, props, supported vehicles, and explosives.
 
-Create tunnels, excavate the ground, breach buildings, and interact with the resulting openings using players, props, supported vehicles, and explosives.
-
-**One persistent zone per map · Admin-only editing tools · Vehicle and explosive integrations · Multiplayer validation in progress**
+**One persistent zone per map · Admin-only editing tools · Six interface languages · Vehicle and explosive integrations · Multiplayer validation in progress**
 
 ## How It Works
 
@@ -53,8 +51,6 @@ NPC navigation uses local adaptations. It does not replace every map navigation 
 
 ## Vehicle Support
 
-GVoxel includes integrations for these vehicle systems:
-
 | Vehicle system | Integration |
 | --- | --- |
 | **Native HL2 / GMod vehicles** | Jeep, Jalopy, and wheel-contact adaptations for voxel terrain. |
@@ -64,15 +60,11 @@ GVoxel includes integrations for these vehicle systems:
 
 These integrations are designed to let vehicles drive on voxel surfaces, fall into excavations, and pass through destroyed walls when sufficient clearance is available. They also address wheel visibility and preservation of vehicle appearance.
 
-Compatibility is implemented at the vehicle-system level rather than individually for every model. Custom suspension, constraints, dimensions, and controllers can still require additional testing.
-
-The Airboat retains its native controller and is distinct from the wheeled-vehicle adaptations.
+Compatibility is implemented at the vehicle-system level rather than individually for every model. Custom suspension, constraints, dimensions, and controllers can still require additional testing. The Airboat retains its native controller and is distinct from the wheeled-vehicle adaptations.
 
 ## Explosions and Weapons
 
 Supported explosive events use a shared destruction system, with hole dimensions based on the available explosion information.
-
-Integrations include:
 
 - **Standard Garry’s Mod RPG.**
 - **HL2 fragmentation grenades.**
@@ -81,9 +73,7 @@ Integrations include:
 - **Glide P-996 Lazer and B-11 Strikeforce aircraft:** supported guided and unguided missiles.
 - **Other explosive weapon addons** that emit recognized blast-damage events.
 
-Destruction remains limited to the voxel zone. Thick walls, small selections, and custom projectile implementations may limit the resulting opening.
-
-Purely visual explosions without a detectable event cannot automatically trigger terrain destruction.
+Destruction remains limited to the voxel zone. Thick walls, small selections, and custom projectile implementations may limit the resulting opening. Purely visual explosions without a detectable event cannot automatically trigger terrain destruction.
 
 ## Persistent Zone and Administration
 
@@ -94,27 +84,38 @@ GVoxel supports **one active, saved zone per map**.
 - Boundary and dimension previews before scanning.
 - Automatic saving after scanning and committed edits.
 - Automatic restoration when starting another session on the same map.
-- Management through **Utilities → GVoxel → Zones persistantes**.
+- Management through **Utilities → GVoxel → Persistent zone** when using English.
 - **Administrator-only** creation, editing, and management tools.
 
-The cache avoids repeating the full terrain sampling process. Meshes, visual captures, and physics objects still require preparation when loading.
+The cache avoids repeating the full terrain sampling process. Meshes, visual captures, and physics objects still require preparation when loading. Invalid or incompatible caches are rejected.
 
-Server saves are stored in:
-
-`garrysmod/data/gvoxel/zones/<map>/`
-
-Runtime saves are not included in this source repository.
+Server saves are stored in `garrysmod/data/gvoxel/zones/<map>/`. Runtime saves are not included in this source repository.
 
 ## Installation
 
-1. Place the runtime **gvoxel** folder inside `garrysmod/addons/`.
-2. Restart the game or server.
-3. As an administrator, enter `vm_give` in the console to obtain the tool.
-4. Select an area, scan it, and start editing.
+For a ready-to-install runtime package, extract its **gvoxel** folder into `garrysmod/addons/` and restart the game or server.
 
-The vehicle frameworks listed above are optional. Install the frameworks and content required for the vehicles you want to use.
+This repository is the development source project. In the reference workspace, place it under `garrysmod/addons/all source file/gvoxel_sources/` and run:
 
-GWater integration is not included in this active version.
+```powershell
+python -B tools/deploy_runtime.py --write
+```
+
+This deploys the runtime files to `garrysmod/addons/gvoxel/`.
+
+As an administrator, enter `vm_give` in the console to obtain the tool, select an area, scan it, and start editing.
+
+Vehicle frameworks are optional. Install the frameworks and content required for the vehicles you want to use. GWater integration is not included in this active version.
+
+## Languages
+
+The interface uses **English by default**. Open **Utilities → GVoxel → Language** to choose:
+
+**English · Français · Русский · Español · Italiano · Deutsch**
+
+Each player’s choice is saved locally. Menus, tool hints, HUD status, and usage notifications update with the selected language. Server notifications use the recipient’s language preference.
+
+Custom save names and console command names remain unchanged. Technical diagnostic logs are not translated. Language selection does not grant access to administrator-only tools.
 
 ## Tool Controls
 
@@ -131,9 +132,7 @@ GWater integration is not included in this active version.
 
 **Multiplayer synchronization is implemented, but complete testing with multiple players is still pending.**
 
-The server manages the zone, terrain modifications, and collisions. Clients receive the initial state and ordered edits. Players joining an existing session receive the information needed to reconstruct the current zone.
-
-The zone remains active when its creator disconnects.
+The server manages the zone, terrain modifications, and collisions. Clients receive the initial state and ordered edits. Players joining an existing session receive the information needed to reconstruct the current zone. The zone remains active when its creator disconnects.
 
 Client Lua files are distributed through Garry’s Mod’s server download mechanism, so other players do not need to copy the script manually. Required maps and external vehicle content must still be available to clients.
 
@@ -147,52 +146,32 @@ GVoxel spreads preparation work across ticks and prioritizes local rebuilding. R
 
 Performance depends on the map, zone size, materials, vehicles, installed addons, and hardware. No fixed FPS or excavation-time guarantee is provided.
 
-Automated tests cover geometry, collision adaptations, caches, permissions, and network logic. They do not replace in-game testing of rendering, driving, NPC behavior, performance, or real multiplayer sessions.
+Automated tests cover geometry, collision adaptations, caches, permissions, localization, and network logic. They do not replace in-game testing of rendering, driving, NPC behavior, performance, or real multiplayer sessions.
 
-Diagnostic commands include:
-
-- `vm_diagnose`
-- `vm_geometry_stats`
-- `vm_edit_stats`
-- `vm_render_stats`
+Diagnostic commands include `vm_diagnose`, `vm_geometry_stats`, `vm_edit_stats`, and `vm_render_stats`.
 
 ## Development
-
-Repository structure:
 
 - `lua/` — Shared, server, and client addon code.
 - `tools/` — Deployment and packaging utilities.
 - `tests/` — Automated checks and engine adapters.
-- `docs/images/` — README images.
+- `docs/images/` — README images and square project icon.
 
-In the reference workspace, development sources live under:
-
-`garrysmod/addons/all source file/gvoxel_sources/`
-
-Deployed runtime files live under:
-
-`garrysmod/addons/gvoxel/`
-
-Development commands:
-
-    python -B tests/run_tests.py
-    python -B tests/run_tests.py --zones
-    python -B tools/deploy_runtime.py --write
-    python -B tools/build_workshop.py
+```powershell
+python -B tests/run_tests.py
+python -B tests/run_tests.py --zones
+python -B tests/run_tests.py --custom-block
+python -B tools/deploy_runtime.py --write
+python -B tools/build_workshop.py
+python -B tools/build_github.py
+```
 
 Tests use LuaJIT supplied with the Garry’s Mod installation. Some optional checks require the corresponding maps or Workshop addons.
 
-The build generates `dist/gvoxel.gma` and `dist/gvoxel-workshop.zip` without publishing automatically.
+The Workshop build generates `dist/gvoxel.gma` and `dist/gvoxel-workshop.zip`. The GitHub export generates `dist/GVoxel-sources.zip` and an unpacked `dist/GVoxel/` directory. Neither command publishes automatically.
 
 ## Reporting Issues
 
-Please include:
-
-- The map name.
-- Zone dimensions and location.
-- Steps to reproduce the issue.
-- Relevant vehicle or weapon addons.
-- Console errors and diagnostic results.
-- Before-and-after measurements for performance reports.
+Please include the map name, zone dimensions and location, reproduction steps, relevant vehicle or weapon addons, and console errors. For performance reports, include before-and-after measurements.
 
 Clearly distinguish automated test results from behavior observed directly in the game.
