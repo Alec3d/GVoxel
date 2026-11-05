@@ -299,9 +299,25 @@ function V.Normal(r, p)
 	return normal
 end
 
-function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ)
+function V.ValidRemovalPlane(plane)
+	local valid=type(plane)=="table" and (plane.axis==1 or plane.axis==2 or plane.axis==3)
+		and (plane.sign==1 or plane.sign==-1) and type(plane.distance)=="number"
+		and plane.distance==plane.distance and math.abs(plane.distance)<1e7
+	if not valid then return false end
+	if plane.cell then
+		if type(plane.cell)~="table" or #plane.cell~=3 then return false end
+		for i=1,3 do
+			local n=plane.cell[i]
+			if type(n)~="number" or n~=n or n<0 or n>31 or n~=math.floor(n) then return false end
+		end
+	end
+	return true
+end
+
+function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
+	if plane and (adding or not r.bsp or not V.ValidRemovalPlane(plane)) then return {},false end
 	seed = seed and seed ~= 0 and seed or nil
-	if r.bsp and V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ) then
+	if r.bsp and V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane) then
 		return {}, false
 	end
 	if r.bsp then
@@ -310,6 +326,7 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 	local nx, ny, nz = V.RegionCells(r, "x") or nx, V.RegionCells(r, "y") or ny, V.RegionCells(r, "z") or nz
 	local step = r.step or V.Step
 	local q = center - r.origin
+	local planeAxis = plane and ({"x","y","z"})[plane.axis]
 	local localFloor = floorZ ~= nil and floorZ - r.origin.z or nil
 	local lo = {
 		max(1, floor((q.x - radius) / step)),
@@ -331,7 +348,10 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 				local d = sqrt((x * step - q.x) ^ 2 + (y * step - q.y) ^ 2 + (z * step - q.z) ^ 2)
 				-- Preserve the outer lattice: scanned borders must keep matching the BSP.
 				local sample = d - radius
-				if seed and d < radius then
+				if plane then
+					local value=plane.axis==1 and x or plane.axis==2 and y or z
+					sample=plane.sign*(r.origin[planeAxis]+value*step)-plane.distance
+				elseif seed and d < radius then
 					sample = V.BrushSample(Vector(x * step, y * step, z * step), q, radius, seed, localFloor)
 				elseif localFloor ~= nil then
 					sample = max(sample, localFloor - z * step)
@@ -387,7 +407,7 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 		end
 		r.modifiedChunks = modified
 		if V.RecordBSPBrush then
-			V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ)
+			V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
 		end
 		local low, high
 		low =
@@ -668,7 +688,7 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 				local normal = normalCache[p]
 				if not normal then
 					normal = brush
-							and ((brush.seed or brush.floorZ ~= nil) and faceNormal or (p - brush.center):GetNormalized() * (brush.adding and 1 or -1))
+							and ((brush.seed or brush.floorZ ~= nil or brush.plane) and faceNormal or (p - brush.center):GetNormalized() * (brush.adding and 1 or -1))
 						or (r.bsp and not curved and faceNormal or V.Normal(r, world))
 					normalCache[p] = normal
 				end
@@ -676,7 +696,7 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 				vertexCache[p] = data
 			end
 			local world, normal = data.world, data.normal
-			if brush and (brush.seed or brush.floorZ ~= nil) then
+			if brush and (brush.seed or brush.floorZ ~= nil or brush.plane) then
 				normal = faceNormal
 			end
 			if r.bsp and curved ~= "density" then

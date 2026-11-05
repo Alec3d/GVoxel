@@ -321,9 +321,11 @@ net.Receive("vm_scan_edit", function()
 	local id, revision = net.ReadUInt(16), net.ReadUInt(16)
 	local center, radius, adding, seed = net.ReadVector(), net.ReadUInt(16), net.ReadBool(), net.ReadUInt(16)
 	local floorZ = net.ReadBool() and net.ReadFloat() or nil
+	local plane = V.ReadEditPlane()
 	if not scan or scan.region.id ~= id then
 		return
 	end
+	if plane and not V.ValidRemovalPlane(plane) then buildFailed("Invalid fragment plane: vm_resync") return end
 	if revision ~= (scan.receivedRevision or 0) + 1 then
 		buildFailed("Modification hors sequence : vm_resync pour retenter")
 		return
@@ -341,6 +343,7 @@ net.Receive("vm_scan_edit", function()
 		adding = adding,
 		seed = seed,
 		floorZ = floorZ,
+		plane = plane,
 		receivedAt = SysTime(),
 	}
 end)
@@ -349,6 +352,7 @@ net.Receive("vm_scan_prepare", function()
 	local id, revision = net.ReadUInt(16), net.ReadUInt(16)
 	local center, radius, adding, seed = net.ReadVector(), net.ReadUInt(16), net.ReadBool(), net.ReadUInt(16)
 	local floorZ = net.ReadBool() and net.ReadFloat() or nil
+	local plane = V.ReadEditPlane()
 	if
 		not scan
 		or scan.region.id ~= id
@@ -361,6 +365,7 @@ net.Receive("vm_scan_prepare", function()
 		return
 	end
 	scan.preparingRevision = revision
+	if plane and not V.ValidRemovalPlane(plane) then buildFailed("Invalid fragment plane: vm_resync") return end
 	editQueue[1] = {
 		revision = revision,
 		center = center,
@@ -368,6 +373,7 @@ net.Receive("vm_scan_prepare", function()
 		adding = adding,
 		seed = seed,
 		floorZ = floorZ,
+		plane = plane,
 		receivedAt = SysTime(),
 	}
 end)
@@ -530,7 +536,7 @@ hook.Add("Think", "GVoxel.ScanMeshes", function()
 						if SysTime() >= job.deadline then
 							coroutine.yield()
 						end
-					end, edit.floorZ)
+					end, edit.floorZ, edit.plane)
 				end)
 				editWork.applyJob = job
 				meshStats.strokes = meshStats.strokes + 1

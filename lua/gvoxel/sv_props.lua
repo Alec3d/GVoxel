@@ -400,6 +400,7 @@ local function release(ent, record, pos)
 			remove(pair)
 		end
 		ent:CollisionRulesChanged()
+        if V.RefreshHL2NativeContacts then V.RefreshHL2NativeContacts(ent) end
 		eachBody(ent, function(phys)
 			phys:Wake()
 		end)

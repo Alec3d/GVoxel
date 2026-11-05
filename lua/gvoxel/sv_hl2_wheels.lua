@@ -6,6 +6,19 @@ if V.ReleaseHL2WheelSimulation then
 	V.ReleaseHL2WheelSimulation()
 end
 local states = {}
+local returning = setmetatable({}, { __mode = "k" })
+local function refreshContacts(root)
+    if V.EachVoxelBody then
+        V.EachVoxelBody(root, function(body)
+            if body.RecheckCollisionFilter then body:RecheckCollisionFilter() end
+            if body.RecheckContactPoints then body:RecheckContactPoints() end
+            body:Wake()
+        end)
+    end
+end
+function V.RefreshHL2NativeContacts(root)
+    if returning[root] and IsValid(root) then refreshContacts(root) end
+end
 local fields = {
 	"suspension_springConstant",
 	"suspension_springDamping",
@@ -34,6 +47,7 @@ local function restore(root)
 			return false
 		end
 	end
+	if IsValid(root) then returning[root] = { saved = state.saved, ticks = 3 } end
 	states[root] = nil
 	return true
 end
@@ -57,6 +71,11 @@ local function prepare(root, region)
 	if count < 2 or count > 16 then
 		return
 	end -- Seats, airboats and aircraft.
+	local handoff = returning[root]
+    if handoff then
+        pcall(root.SetVehicleParams, root, {axles=handoff.saved})
+        returning[root]=nil
+    end
 	local params = root:GetVehicleParams()
 	if
 		not params
@@ -133,6 +152,7 @@ local function prepare(root, region)
 			}
 		end
 	end
+	returning[root] = nil
 	-- Save before changing anything, including partial setter failures.
 	states[root] = state
 	local ok = pcall(root.SetVehicleParams, root, patch)
@@ -190,6 +210,8 @@ end
 local function simulate(root, state, dt)
 	state.contacts = 0
 	state.queries = 0
+	state.startsSolid = 0
+	state.recoveries = 0
 	local phys = root:GetPhysicsObject()
 	if not IsValid(phys) or not phys:IsMotionEnabled() then
 		return
@@ -203,10 +225,6 @@ local function simulate(root, state, dt)
 		return
 	end
 	local up = root:GetUp()
-	if up.z < 0.25 then
-		state.contacts = 0
-		return
-	end
 	local forward = (root:LocalToWorld(state.forward) - root:GetPos()):GetNormalized()
 	local right = forward:Cross(up):GetNormalized()
 	local steering, throttle, brake = 0, 0, false
@@ -253,7 +271,30 @@ local function simulate(root, state, dt)
 		trace.endpos = finish
 		local hit = nativeTrace(trace)
 		state.queries = state.queries + 1
-		if hit.Hit and not hit.StartSolid and hit.HitNormal:Dot(up) >= 0.25 then
+		if hit.StartSolid or hit.AllSolid then
+			-- A transition/step can put the short probe's origin inside a
+			-- cooked shape. Rejecting that result forever only recovers when
+			-- the chassis is manually lifted. Retry ONCE from above this
+			-- wheel's bounded suspension envelope, against the same active
+			-- shapes. No BSP fallback, teleports or remembered phantom floor.
+			state.startsSolid = state.startsSolid + 1
+			trace.start = hub + up * (wheel.radius + wheel.travel + 2)
+			hit = nativeTrace(trace)
+			state.queries = state.queries + 1
+			if hit.Hit and not hit.StartSolid and not hit.AllSolid then
+				local distance = (hub - hit.HitPos):Dot(up)
+				if
+					distance >= -wheel.radius
+					and distance <= wheel.radius + wheel.travel
+					and hit.HitNormal:Dot(up) >= 0.25
+				then
+					state.recoveries = state.recoveries + 1
+				else
+					hit = { Hit = false }
+				end
+			end
+		end
+		if hit.Hit and not hit.StartSolid and not hit.AllSolid and hit.HitNormal:Dot(up) >= 0.25 then
 			local distance = (hub - hit.HitPos):Dot(up)
 			local compression = wheel.travel * 0.5 - (distance - wheel.radius)
 			local support = hit.Entity
@@ -309,6 +350,35 @@ hook.Add("StartCommand", "GVoxel.HL2WheelInput", function(ply, cmd)
 	state.input.time = CurTime()
 end)
 hook.Add("Tick", "GVoxel.HL2Wheels", function()
+    -- Let world NoCollide removal settle, then rebuild the native contacts.
+    -- A short verified handoff replaces the manual Physgun lift/drop cycle.
+    for root, entry in pairs(returning) do
+        if not IsValid(root) or states[root] then returning[root] = nil
+        else
+            local params = root:GetVehicleParams()
+            local matches = true
+            for index, axle in ipairs(entry.saved) do
+                for field, value in pairs(axle) do
+                    local actual = params and params.axles and params.axles[index] and params.axles[index][field]
+                    if type(actual) ~= "number" or math.abs(actual-value) > 0.0001 then matches=false end
+                end
+            end
+            if not matches then
+                pcall(root.SetVehicleParams, root, {axles=entry.saved})
+                params=root:GetVehicleParams() matches=true
+                for index,axle in ipairs(entry.saved) do for field,value in pairs(axle) do
+                    local actual=params and params.axles and params.axles[index] and params.axles[index][field]
+                    if type(actual)~="number" or math.abs(actual-value)>0.0001 then matches=false end
+                end end
+            end
+            refreshContacts(root)
+            entry.ticks=entry.ticks-1
+            if entry.ticks<=0 then
+                if not matches then root.VMHL2WheelError="native suspension restoration not confirmed" end
+                returning[root]=nil
+            end
+        end
+    end
 	for root, state in pairs(states) do
 		local assembly = IsValid(root) and V.VehicleStates[root.VMVehicleRoot or root]
 		if not IsValid(root) or not assembly or assembly.region ~= state.region then
@@ -342,11 +412,13 @@ concommand.Add("vm_hl2_wheel_stats", function(ply)
 	for root, state in pairs(states) do
 		print(
 			string.format(
-				"[GVoxel] Roues HL2 %s : %d / %d contacts ; %d sondes/tick ; %.3f ms (pic %.3f)",
+				"[GVoxel] Roues HL2 %s : %d / %d contacts ; %d sondes/tick ; %d departs solides / %d appuis recuperes ; %.3f ms (pic %.3f)",
 				tostring(root),
 				state.contacts,
 				#state.wheels,
 				state.queries,
+				state.startsSolid or 0,
+				state.recoveries or 0,
 				state.ms or 0,
 				state.maxMs or 0
 			)

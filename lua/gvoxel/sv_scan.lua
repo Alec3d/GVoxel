@@ -129,17 +129,22 @@ function V.RestoreCachedZone(record, ply)
     V.BeginScanSession(scan)
     return scan
 end
-net.Receive("vm_scan_request", function(_, ply)
+net.Receive("vm_scan_request", function(length, ply)
+	if length ~= 6 or not V.CanManageScan(ply) then return end
 	V.PlaceRegion(ply, net.ReadUInt(6))
 end)
-net.Receive("vm_scan_custom", function(_, ply)
+net.Receive("vm_scan_custom", function(length, ply)
+	-- WriteVector uses variable-width coordinate compression, unlike floats.
+	if length < 6 or length > 192 or not V.CanManageScan(ply) then return end
 	local low, high = net.ReadVector(), net.ReadVector()
 	V.PlaceRegion(ply, 0, low, high)
 end)
-net.Receive("vm_scan_cancel", function(_, ply)
+net.Receive("vm_scan_cancel", function(length, ply)
+	if length ~= 0 or not V.CanManageScan(ply) then return end
 	V.CancelScan(ply)
 end)
-net.Receive("vm_scan_settings", function(_, ply)
+net.Receive("vm_scan_settings", function(length, ply)
+	if length ~= 13 or not V.CanManageScan(ply) then return end
 	local metres, radius = net.ReadUInt(6), net.ReadUInt(7)
 	if not V.ValidScanSize(metres) or radius < 24 or radius > 80 or not V.CanEdit(ply, V.GetServerScanRegion()) then
 		return
@@ -196,6 +201,7 @@ function V.CommitScanEdit(scan)
 		floorZ = work.floorZ,
 	}
 	scan.editWork = nil
+    if V.ScheduleDetachedCleanup then V.ScheduleDetachedCleanup(scan,work) end
     if V.MarkZoneCacheDirty then V.MarkZoneCacheDirty(scan) end
 end
 local function startEdit(scan, work, prepare)
@@ -232,13 +238,14 @@ local function startEdit(scan, work, prepare)
 		checkpoint()
 		nextPhase("brush")
 		local dirty, changed =
-			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ)
+			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ, work.plane)
 		if not changed then
 			scan.editWork = nil
 			return
 		end
 		work.field.revision = scan.region.revision + 1
 		work.dirty = dirty
+        if not work.adding and V.EmitBlastDust then V.EmitBlastDust(scan,work) end
 		account()
 		if V.PrepareScanEdit then
 			V.PrepareScanEdit(scan, work)
@@ -303,6 +310,8 @@ function V.QueueTerrainExplosion(ply, work)
 	if r.revision >= V.MaxEdits then
 		return false
 	end
+	if work.plane and (not work.system or work.source~="collapse" or not r.bsp
+		or work.seed~=0 or work.floorZ~=nil or not V.ValidRemovalPlane(work.plane)) then return false end
 	local center = work.center
 	local radius = math.ceil(work.radius)
 	if radius < 1 or radius > 65535 then
@@ -325,6 +334,7 @@ function V.QueueTerrainExplosion(ply, work)
 	work.adding = false
 	work.author = ply
 	scan.explosions[#scan.explosions + 1] = work
+    if V.EmitBlastDust and work.source~="collapse" then V.EmitBlastDust(scan,work) end
 	return true
 end
 function V.QueueExplosionCrater(ply, center, radius, seed, source, zoneID, system)
@@ -412,8 +422,16 @@ local function sample(scan, deadline)
         scan.cacheThread=scan.cacheThread or coroutine.create(function()
             local record=scan.cachedRecord
             for i,value in ipairs(record.values) do
-                scan.region.values[i-1]=value
+                scan.region.values[i]=value
                 if i%128==0 and SysTime()>=scan.deadline then coroutine.yield() end
+            end
+            if record.legacyTail then
+                local p,x,y,z=V.ScanPoint(scan.region,33^3-1)
+                local cells=scan.region.cells
+                if not cells or (x<=cells.x and y<=cells.y and z<=cells.z) then
+                    local solid=bit.band(util.PointContents(p),16395)~=0
+                    scan.region.values[33^3]=V.ScanDensity(scan.region,p,solid,worldTrace)
+                end
             end
             scan.initialValues=scan.region.values
             scan.region.featurePlanes={}
@@ -425,10 +443,10 @@ local function sample(scan, deadline)
                 local checkpoint=function() if SysTime()>=scan.deadline then coroutine.yield() end end
                 local work=V.CloneScanField(scan.region,checkpoint)
                 local center=Vector(unpack(stroke.center))
-                V.ApplyBrush(work,center,stroke.radius,stroke.adding,stroke.seed,checkpoint,stroke.floorZ)
+                V.ApplyBrush(work,center,stroke.radius,stroke.adding,stroke.seed,checkpoint,stroke.floorZ,stroke.plane)
                 work.revision=scan.region.revision+1
                 V.PublishScanField(scan.region,work)
-                scan.history[#scan.history+1]={center=center,radius=stroke.radius,adding=stroke.adding,seed=stroke.seed,floorZ=stroke.floorZ}
+                scan.history[#scan.history+1]={center=center,radius=stroke.radius,adding=stroke.adding,seed=stroke.seed,floorZ=stroke.floorZ,plane=stroke.plane}
             end
         end)
         local ready,err=resume(scan.cacheThread,deadline,scan)
@@ -536,7 +554,7 @@ local function tick(scan)
 					return false
 				end
 				local e = Vector(work.radius, work.radius, work.radius)
-				return V.TraceVoxelHull(r, work.center, work.center, -e, e, checkpoint).StartSolid
+				return V.VoxelHullOverlaps(r, work.center, -e, e, checkpoint)
 			end)
 		end
 	end

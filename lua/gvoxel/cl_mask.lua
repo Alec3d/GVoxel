@@ -7,7 +7,7 @@ if V.ReleaseClientScan then
 elseif V.SetVisualRegion then
 	V.SetVisualRegion(nil)
 end
-local enabled = CreateClientConVar("vm_replace_visual", "1", true, false, "Remplacement visuel du BSP scanne", 0, 1)
+local enabled = CreateClientConVar("vm_replace_visual", "1", true, false, "Preview unedited terrain; edited zones always replace the BSP visually", 0, 1)
 local stats = { passes = 0, ms = 0, terrain = 0, openings = 0, chunks = 0, culled = 0, reused = 0, native = 0 }
 function V.GetVoxelRenderStats()
 	return table.Copy(stats)
@@ -94,7 +94,10 @@ function V.SetVisualRegion(r)
 end
 
 function V.VisualReplacementEnabled()
-	return enabled:GetBool() and region ~= nil and prepared and not failure
+	-- A saved preview preference must not leave the original wall visible over
+	-- a hole that already exists in server/client collision. Keep the toggle
+	-- useful for inspecting the initial scan, but never hide committed edits.
+	return region ~= nil and prepared and not failure and (region.revision > 0 or enabled:GetBool())
 end
 
 -- Compile the aperture meshes once. Brush edits preserve the outer lattice,

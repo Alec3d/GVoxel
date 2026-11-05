@@ -25,8 +25,11 @@ local function read(key)
     if not size or size<1 or size>maxBytes then return nil,"Cache absent ou trop volumineux." end
     local data=file.Read(path,"DATA")
     local ok,raw=pcall(util.Decompress,data,maxBytes)
-    if not ok or type(raw)~="string" then return nil,"Compression du cache invalide." end
-    local parsed,record=pcall(util.JSONToTable,raw)
+    if not ok or type(raw)~="string" or #raw>maxBytes then return nil,"Compression du cache invalide." end
+    -- One density field already contains 35,937 entries, above GMod's default
+    -- 15,000-key JSON limit. This local cache is byte-bounded above and its
+    -- complete schema/field/journal is validated below before restoration.
+    local parsed,record=pcall(util.JSONToTable,raw,true)
     if not parsed then return nil,"JSON du cache invalide." end
     local valid,err=V.ValidateZoneCache(record,game.GetMap(),signature())
     if not valid then return nil,err or "Cache illisible." end

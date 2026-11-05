@@ -49,7 +49,9 @@ function V.SendScanProgress(scan, phase, ratio)
 	end
 end
 local function attach(scan, ply)
-	scan.peers[ply] = { chunk = 0, sent = -1, acknowledged = -1 }
+	-- Existing participants keep the atomic display/collision barrier. A late
+	-- join replays history without stopping everyone until it catches up.
+	scan.peers[ply] = { chunk = 0, sent = -1, acknowledged = -1, blocking = not scan.everReady }
 	net.Start("vm_scan_begin")
 	net.WriteUInt(scan.region.id, 16)
 	net.WriteVector(scan.region.base)
@@ -130,6 +132,7 @@ local function strokePacket(name, scan, ply, revision, stroke)
 	if stroke.floorZ ~= nil then
 		net.WriteFloat(stroke.floorZ)
 	end
+	V.WriteEditPlane(stroke.plane)
 	net.Send(ply)
 end
 local function edit(scan, ply, peer, revision, stroke)
@@ -165,18 +168,22 @@ function V.PumpScanReplication(scan, deadline)
 	if not scan.snapshot then
 		return
 	end
-	local peers = {}
+	local peers
+	local latest = #scan.history
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) then
-			peers[#peers + 1] = { ply, peer }
+			if not peer.features or peer.chunk < 64 or not peer.done or peer.sent < latest then
+				peers = peers or {}
+				peers[#peers + 1] = { ply, peer }
+			end
 		else
 			scan.peers[ply] = nil
 		end
 	end
-	if #peers == 0 then
+	if not peers then
 		return
 	end
-	local packets = 0
+	local packets, edits = 0, 0
 	local start = (scan.replicationCursor or 0) % #peers
 	for i = 1, #peers do
 		local pair = peers[(start + i - 1) % #peers + 1]
@@ -197,10 +204,11 @@ function V.PumpScanReplication(scan, deadline)
 			end
 			for _ = 1, 8 do
 				local revision = peer.sent + 1
-				if not scan.history[revision] or SysTime() >= deadline then
+				if edits >= 16 or not scan.history[revision] or SysTime() >= deadline then
 					break
 				end
 				edit(scan, ply, peer, revision, scan.history[revision])
+				edits = edits + 1
 			end
 		end
 	end
@@ -209,7 +217,7 @@ end
 function V.ScanPeersReady(scan, revision)
 	local count = 0
 	for ply, peer in pairs(scan.peers) do
-		if IsValid(ply) then
+		if IsValid(ply) and peer.blocking ~= false then
 			count = count + 1
 			if not peer.done or peer.failed or peer.acknowledged < revision then
 				return false
@@ -221,7 +229,7 @@ end
 function V.PublishScanEdit(scan, work)
 	local revision = work.field.revision
 	scan.history[revision] =
-		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ }
+		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ, plane = work.plane }
 	work.sent = true
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) and peer.done and peer.sent == revision - 1 then
@@ -243,23 +251,28 @@ function V.GetServerMovementRegion(ply)
 			and scan.region
 		or nil
 end
-net.Receive("vm_scan_ready", function(_, ply)
-	local id, revision = net.ReadUInt(16), net.ReadUInt(16)
+net.Receive("vm_scan_ready", function(length, ply)
+	if length ~= 32 then return end
 	local scan = session
 	local peer = scan and scan.peers[ply]
+	if not peer or not peer.done then return end
+	local id, revision = net.ReadUInt(16), net.ReadUInt(16)
 	if not peer or not peer.done or scan.region.id ~= id or revision > peer.sent then
 		return
 	end
     if revision<=peer.acknowledged and not peer.failed then return end
 	peer.acknowledged = math.max(peer.acknowledged, revision)
 	peer.failed = nil
+	if revision >= scan.region.revision then peer.blocking = true end
 	scan.movementReady = V.ScanPeersReady(scan, scan.region.revision)
+	if scan.movementReady then scan.everReady = true end
 	if V.CommitScanEdit then
 		V.CommitScanEdit(scan)
 	end
 end)
 -- The client announces itself after installing its receivers, also on refresh.
-net.Receive("vm_scan_sync", function(_, ply)
+net.Receive("vm_scan_sync", function(length, ply)
+	if length ~= 0 then return end
 	if (ply.VMNextSync or 0) > CurTime() then
 		return
 	end
@@ -272,7 +285,8 @@ net.Receive("vm_scan_sync", function(_, ply)
 		attach(session, ply)
 	end
 end)
-net.Receive("vm_scan_failed", function(_, ply)
+net.Receive("vm_scan_failed", function(length, ply)
+	if length ~= 16 then return end
 	local id = net.ReadUInt(16)
 	local peer = session and session.peers[ply]
 	if peer and session.region.id == id and not peer.failed then

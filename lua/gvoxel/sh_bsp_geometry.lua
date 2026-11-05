@@ -1074,7 +1074,8 @@ local function brushNodeSample(r, op, p, key)
 	op.nodeSamples = cached
 	local value = cached[key]
 	if value == nil then
-		value = V.BrushSample(p, op.center, op.radius, op.seed, op.floorZ)
+		value = op.plane and (op.plane.sign*p[names[op.plane.axis]]-op.plane.distance)
+			or V.BrushSample(p, op.center, op.radius, op.seed, op.floorZ)
 		for _, axis in ipairs(names) do
 			if p[axis] < EPS or p[axis] > V.RegionAxisSize(r, axis) - EPS then
 				value = math.max(r.step, value)
@@ -1494,6 +1495,7 @@ local function fillWholeBrushCell(r, low, high, last, result)
 	local key =
 		V.Index(math.floor(low.x / r.step + 0.5), math.floor(low.y / r.step + 0.5), math.floor(low.z / r.step + 0.5), r)
 	if not (last.fullCells and last.fullCells[key]) then
+		if last.plane then return false end
 		if last.floorZ ~= nil and low.z <= last.floorZ + 1 / 64 then
 			return false
 		end
@@ -1831,7 +1833,7 @@ function V.BSPCell(r, x, y, z, checkpoint)
 	return result
 end
 
-function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ)
+function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
 	if not r.bsp then
 		return
 	end
@@ -1844,6 +1846,7 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 		fullCells = {},
 		floorZ = floorZ ~= nil and floorZ - r.origin.z or nil,
 	}
+	if plane then op.plane={axis=plane.axis,sign=plane.sign,distance=plane.distance-plane.sign*r.origin[names[plane.axis]],cell=plane.cell} end
 	r.bspEdits[#r.bspEdits + 1] = op
 	local p, size = op.center, r.step * 8
 	local lowZ = op.floorZ ~= nil and math.max(p.z - radius, op.floorZ) or p.z - radius
@@ -1877,7 +1880,9 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 							)
 							^ 2
 				end
-				if near < (radius - 1 / 128) ^ 2 then
+				local target=op.plane and op.plane.cell
+				if (not target or (x==target[1] and y==target[2] and z==target[3]))
+					and (op.plane or near < (radius - 1 / 128) ^ 2) then
 					-- The actual quantized corner samples define all six
 					-- linear tetrahedra, including procedural explosions.
 					-- Strict signs prove the whole cell is missed or filled;
@@ -1918,9 +1923,10 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ)
 	end
 end
 
-function V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ)
+function V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane)
 	local last = r.bspEdits[#r.bspEdits]
 	local localFloor = floorZ ~= nil and floorZ - r.origin.z or nil
+	if plane or (last and last.plane) then return false end
 	return last
 		and last.radius == radius
 		and last.adding == adding

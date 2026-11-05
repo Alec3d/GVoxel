@@ -303,12 +303,12 @@ local translations = {
         de = "Grabecursor anzeigen",
     },
     ["Remplacer visuellement le BSP"] = {
-        en = "Display voxel replacement",
-        fr = "Remplacer visuellement le BSP",
-        ru = "Показать воксельную замену",
-        es = "Mostrar reemplazo voxel",
-        it = "Mostra la sostituzione voxel",
-        de = "Voxel-Ersatz anzeigen",
+        en = "Show voxel preview before editing",
+        fr = "Afficher l’aperçu voxel avant modification",
+        ru = "Показать воксельный вид до изменений",
+        es = "Mostrar vista voxel antes de editar",
+        it = "Mostra l’anteprima voxel prima delle modifiche",
+        de = "Voxel-Vorschau vor der Bearbeitung anzeigen",
     },
     ["Une zone partagee par serveur. Gauche : creuser ; droite : ajouter. Les modifications attendent la preparation des collisions et des clients."] = {
         en = "One shared zone per server. Left: dig; right: add. Edits wait for collision and client preparation.",

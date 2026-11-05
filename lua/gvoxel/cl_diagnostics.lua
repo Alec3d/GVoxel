@@ -118,3 +118,31 @@ concommand.Add("vm_profile", function(_, _, args)
 	print("[GVoxel] Profil pret : retourne en jeu et attends " .. duration .. " secondes.")
 end)
 concommand.Add("vm_profile_stop", finish)
+
+-- Read-only, on-demand: never reset a player's DSP to diagnose an echo.
+concommand.Add("vm_audio_stats", function()
+	print("[GVoxel] Native audio diagnostics (read-only).")
+	if V.GetVoxelAcousticStats then
+		local stats = V.GetVoxelAcousticStats()
+		print(string.format("[GVoxel] Room repair: %s; %d reload requests; transition armed %s.",
+			stats.status, stats.repairs, tostring(stats.armed)))
+	end
+	for _, name in ipairs({"dsp_room", "dsp_automatic", "dsp_player", "dsp_water", "dsp_spatial", "dsp_off"}) do
+		local value = GetConVar(name)
+		print("[GVoxel] " .. name .. " = " .. (value and value:GetInt() or "unavailable"))
+	end
+	local ply = LocalPlayer()
+	local r = V.GetClientScanRegion()
+	if not IsValid(ply) then return end
+	local pos = ply:EyePos()
+	local leaf = r and r.bsp and V.BSPLeaf(r.bsp, pos)
+	local solid = r and r.bsp and V.BSPSolid(r.bsp, pos)
+	print(string.format("[GVoxel] Listener %.1f %.1f %.1f; zone %s; original solid %s; cluster %s; area %s; voxel movement %s.",
+		pos.x, pos.y, pos.z, r and r.id or "none", tostring(solid), leaf and leaf.cluster or "unknown",
+		leaf and leaf.area or "unknown", tostring(ply:GetNW2Bool("VM_VoxelMovement"))))
+	local view = render.GetViewSetup and render.GetViewSetup(true)
+	if view and view.origin then
+		print(string.format("[GVoxel] Last render origin %.1f %.1f %.1f; move type %s.",
+			view.origin.x, view.origin.y, view.origin.z, tostring(ply:GetMoveType())))
+	end
+end)

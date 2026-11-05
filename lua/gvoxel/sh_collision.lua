@@ -435,6 +435,33 @@ local function cellSolids(r, x, y, z, checkpoint)
 end
 V.DensityCellSolids = cellSolids
 
+-- Connectivity needs vertices only while analyzing fragments. Reuse the
+-- geometry already cached for these hulls rather than retaining another copy
+-- on every movement collider (including on clients).
+function V.CollisionSolidPoints(r, x, y, z, checkpoint)
+	local hulls = cellSolids(r, x, y, z, checkpoint)
+	if #hulls == 0 or (#hulls == 1 and #hulls[1] == 3) then return hulls, emptySolids end
+	local points = {}
+	local key = V.Index(x, y, z, r)
+	local unedited = r.bsp and r.bspCellEditBins and not r.bspCellEditBins[key]
+	if not r.bsp or (unedited and V.BSPCellUsesDensity(r, x, y, z) and not V.BSPCellHasDetail(r, x, y, z)) then
+		local field = r.bsp and V.BSPDensityBase(r) or r
+		for i, shape in ipairs(V.DensityCellGeometry(field, x, y, z)) do points[i] = shape.points end
+	else
+		for i, piece in ipairs(V.BSPCellSolids(r, x, y, z, checkpoint)) do
+			local vertices, seen = {}, {}
+			for _, face in ipairs(piece.faces) do
+				for _, p in ipairs(face.vertices) do
+					if not seen[p] then seen[p] = true vertices[#vertices + 1] = p end
+				end
+				if checkpoint then checkpoint() end
+			end
+			points[i] = vertices
+		end
+	end
+	return hulls, points
+end
+
 -- Run during the initial scan, with a yielding checkpoint. Later movement
 -- queries reuse these immutable cell hulls instead of clipping cold geometry.
 function V.PrepareCollisionChunk(r, cx, cy, cz, checkpoint)
@@ -560,6 +587,27 @@ local function cellEntry(center, extent, delta, x, y, z, step)
 		end
 	end
 	return first
+end
+
+-- Explosion preflight only needs overlap, not a sweep result or candidate list.
+function V.VoxelHullOverlaps(r, position, mins, maxs, checkpoint)
+    local center=position+(mins+maxs)/2-r.origin
+    local extent=(maxs-mins)/2
+    local lo,hi={},{}
+    for _,axis in ipairs(axes) do
+        lo[axis]=math.max(0,math.floor((position[axis]+mins[axis]-r.origin[axis]-EPS)/r.step))
+        hi[axis]=math.min(V.RegionCells(r,axis)-1,math.floor((position[axis]+maxs[axis]-r.origin[axis]+EPS)/r.step))
+    end
+    local zero=Vector()
+    local pointCast=extent:LengthSqr()<1e-16
+    for z=lo.z,hi.z do for y=lo.y,hi.y do for x=lo.x,hi.x do
+        for _,poly in ipairs(cellSolids(r,x,y,z,checkpoint)) do
+            local _,_,inside=sweep(poly,center,extent,zero,pointCast)
+            if inside then return true end
+        end
+        if checkpoint then checkpoint() end
+    end end end
+    return false
 end
 
 function V.TraceVoxelHull(r, start, finish, mins, maxs, checkpoint)

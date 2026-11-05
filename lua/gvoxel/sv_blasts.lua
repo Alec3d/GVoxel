@@ -6,6 +6,10 @@ local enabled=CreateConVar("vm_blast_enabled","1",FCVAR_ARCHIVE,"Explosions gene
 local gain=CreateConVar("vm_blast_scale","1",FCVAR_ARCHIVE,"Echelle du creusement par degats d'explosion",0.1,3)
 local state={active=true,depth=0,installed={},recent={}}
 local sequence=0
+local untyped=setmetatable({}, {__mode="k"})
+local function explosive(damage)
+    return damage:IsExplosionDamage() or (damage.GetDamageType and bit.band(damage:GetDamageType(),bit.bor(DMG_BLAST or 64,DMG_BLAST_SURFACE or 134217728))~=0)
+end
 local known={rpg_missile=true,npc_satchel=true,npc_tripmine=true,glide_projectile=true,glide_missile=true}
 local function finite(n) return type(n)=="number" and n==n and math.abs(n)<1e12 end
 function V.BlastCraterRadius(damage,radius,scale)
@@ -70,10 +74,26 @@ install("BlastDamage",function(inflictor,attacker,position,radius,damage,damageT
     observe(inflictor,attacker,position,radius,damage,false)
 end)
 install("BlastDamageInfo",function(damage,position,radius)
-    if damage:IsExplosionDamage() then observe(damage:GetInflictor(),damage:GetAttacker(),position,radius,damage:GetDamage(),false) end
+    if explosive(damage) then observe(damage:GetInflictor(),damage:GetAttacker(),position,radius,damage:GetDamage(),false) end
 end)
-hook.Add("EntityTakeDamage","GVoxel.GenericBlast",function(_,damage)
-    if not damage:IsExplosionDamage() then return end
+hook.Add("EntityTakeDamage","GVoxel.GenericBlast",function(victim,damage)
+    if not state.active or not enabled:GetBool() then return end
+    if not explosive(damage) then
+        -- Some scripted bombs omit DMG_BLAST. Require a genuine multi-victim
+        -- damage area from a non-weapon entity; a large bullet is not a blast.
+        local source=damage:GetInflictor()
+        if not IsValid(source) or source:IsWorld() or source==damage:GetAttacker()
+            or source.IsWeapon and source:IsWeapon() or damage:GetDamage()<40 then return end
+        local now=CurTime()
+        local event=untyped[source]
+        if not event or now-event.time>0.05 then
+            untyped[source]={time=now,victim=victim,damage=damage:GetDamage(),pos=source:GetPos()}
+        elseif event.victim~=victim and not event.sent then
+            event.sent=true
+            observe(source,damage:GetAttacker(),event.pos,nil,math.max(event.damage,damage:GetDamage()),true)
+        end
+        return
+    end
     local inflictor=damage:GetInflictor()
     local position
     if IsValid(inflictor) and not (inflictor.IsWeapon and inflictor:IsWeapon()) and not inflictor:IsWorld() then
@@ -85,10 +105,10 @@ hook.Add("EntityTakeDamage","GVoxel.GenericBlast",function(_,damage)
     observe(inflictor,damage:GetAttacker(),position,nil,damage:GetDamage(),true)
 end)
 hook.Add("AcceptInput","GVoxel.GenericExplosionInput",function(ent,input)
-    if input:lower()~="explode" or ent:GetClass()~="env_explosion" then return end
+    if input:lower()~="explode" or (ent:GetClass()~="env_explosion" and ent:GetClass()~="env_physexplosion") then return end
     local inflictor=ent:GetInternalVariable("m_hInflictor")
-    local damage=tonumber(ent:GetInternalVariable("m_iMagnitude")) or 100
-    local radius=tonumber(ent:GetInternalVariable("m_iRadiusOverride"))
+    local damage=tonumber(ent:GetInternalVariable("m_iMagnitude")) or tonumber(ent:GetInternalVariable("m_magnitude")) or 100
+    local radius=tonumber(ent:GetInternalVariable("m_iRadiusOverride")) or tonumber(ent:GetInternalVariable("m_radius"))
     observe(IsValid(inflictor) and inflictor or ent,ent:GetOwner(),ent:GetPos(),radius,damage,true)
 end)
 hook.Add("EntityEmitSound","GVoxel.FragExplosion",function(data)
@@ -103,5 +123,5 @@ function V.ReleaseGenericBlasts()
     state.active=false
     for _,entry in ipairs(state.installed) do if util[entry.name]==entry.wrapper then util[entry.name]=entry.original end end
 end
-hook.Add("PostCleanupMap","GVoxel.ClearGenericBlasts",function() state.recent={} end)
+hook.Add("PostCleanupMap","GVoxel.ClearGenericBlasts",function() state.recent={} untyped=setmetatable({}, {__mode="k"}) end)
 hook.Add("ShutDown","GVoxel.ReleaseGenericBlasts",V.ReleaseGenericBlasts)

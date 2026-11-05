@@ -91,3 +91,22 @@ function V.ReloadGesture(state, down, now, allowed)
 		return action
 	end
 end
+
+-- Optional server-authored separating plane for subcell fragment cleanup.
+-- No client request accepts this payload; it travels only in the edit journal.
+function V.WriteEditPlane(plane)
+    net.WriteBool(plane~=nil)
+    if plane then
+        net.WriteUInt(plane.axis-1,2)
+        net.WriteBool(plane.sign==1)
+        net.WriteFloat(plane.distance)
+        net.WriteBool(plane.cell~=nil)
+        if plane.cell then for i=1,3 do net.WriteUInt(plane.cell[i],5) end end
+    end
+end
+function V.ReadEditPlane()
+    if not net.ReadBool() then return end
+    local plane={axis=net.ReadUInt(2)+1,sign=net.ReadBool() and 1 or -1,distance=net.ReadFloat()}
+    if net.ReadBool() then plane.cell={net.ReadUInt(5),net.ReadUInt(5),net.ReadUInt(5)} end
+    return plane
+end

@@ -26,6 +26,7 @@ local shared = {
 	"sh_sculpt",
 	"sh_custom_block",
 	"sh_collision",
+	"sh_detached",
 	"sh_vehicle_world",
 	"sh_vehicle_methods",
 	"sh_ballistics",
@@ -33,6 +34,7 @@ local shared = {
 	"sh_move",
 }
 local client = {
+	"cl_dust",
 	"cl_mesh",
 	"cl_terrain",
 	"cl_surface",
@@ -42,15 +44,18 @@ local client = {
 	"cl_sky",
 	"cl_mask",
 	"cl_scan",
+	"cl_acoustics",
 	"cl_custom_block",
 	"cl_tool",
 	"cl_diagnostics",
 	"cl_utilities",
 }
 local server = {
+	"sv_dust",
 	"sv_terrain",
 	"sv_session",
 	"sv_scan",
+	"sv_detached",
 	"sv_visibility",
 	"sv_tank",
 	"sv_explosions",
