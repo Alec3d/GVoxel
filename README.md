@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/images/GVoxel%20Logo.png" alt="GVoxel 2" width="760">
+  <img src="./docs/images/Gvoxel 2.png" alt="GVoxel 2" width="760">
 </p>
 
 # GVoxel
