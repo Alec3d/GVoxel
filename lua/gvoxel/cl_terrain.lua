@@ -28,10 +28,10 @@ function V.DrawBrushPreview(onTop)
 	if radius < 24 then
 		radius = 48
 	end
-	if tr.VoxelScan then
-		radius = V.ScanBrushRadius(region, radius)
-	end
 	local adding = ply:KeyDown(IN_ATTACK2)
+	if tr.VoxelScan then
+		radius = V.ScanBrushRadius(region, radius, adding and V.GetAddPower and V.GetAddPower())
+	end
 	local center = V.BrushCenter(tr, radius, adding)
 	if tr.VoxelScan then
 		center = V.SnapScanPosition(center)

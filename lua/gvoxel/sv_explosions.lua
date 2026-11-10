@@ -33,9 +33,6 @@ local function commonCrater(attacker, position, source)
 end
 
 local function crater(rocket, attacker, position)
-	if not IsValid(rocket) or rocket:GetClass() ~= "rpg_missile" or seen[rocket] then
-		return
-	end
 	seen[rocket] = true
 	if not IsValid(attacker) or not attacker:IsPlayer() then
 		return
@@ -44,9 +41,6 @@ local function crater(rocket, attacker, position)
 	V.QueueRPGCrater(attacker, position, radius:GetFloat(), sequence)
 end
 local function slamCrater(mine, attacker, position)
-	if not IsValid(mine) or not slamClasses[mine:GetClass()] or seen[mine] then
-		return
-	end
 	-- Satchels deliberately clear GetOwner after throwing. The saved thrower
 	-- remains the player responsible for the native blast and permissions.
 	if not player(attacker) and mine.GetInternalVariable then
@@ -67,9 +61,11 @@ hook.Add("AcceptInput", "GVoxel.RPGExplosion", function(ent, input)
 		return
 	end
 	local rocket = ent:GetInternalVariable("m_hInflictor")
-	if IsValid(rocket) and rocket:GetClass() == "rpg_missile" then
+	if not IsValid(rocket) or seen[rocket] then return end
+	local class = rocket:GetClass()
+	if class == "rpg_missile" then
 		crater(rocket, ent:GetOwner(), ent:GetPos())
-	elseif IsValid(rocket) and slamClasses[rocket:GetClass()] then
+	elseif slamClasses[class] then
 		slamCrater(rocket, ent:GetOwner(), ent:GetPos())
 	end
 	-- No return: native damage, effects and other input handlers continue.
@@ -83,9 +79,11 @@ hook.Add("EntityTakeDamage", "GVoxel.RPGBlastDamage", function(_, damage)
 		return
 	end
 	local rocket = damage:GetInflictor()
-	if IsValid(rocket) and rocket:GetClass() == "rpg_missile" then
+	if not IsValid(rocket) or seen[rocket] then return end
+	local class = rocket:GetClass()
+	if class == "rpg_missile" then
 		crater(rocket, damage:GetAttacker(), rocket:GetPos())
-	elseif IsValid(rocket) and slamClasses[rocket:GetClass()] then
+	elseif slamClasses[class] then
 		slamCrater(rocket, damage:GetAttacker(), rocket:GetPos())
 	end
 end)
@@ -95,7 +93,7 @@ end)
 -- Never infer a blast from removal/pickup, arming or the remote detonator sound.
 hook.Add("EntityEmitSound", "GVoxel.SLAMExplosion", function(data)
 	local mine = data.Entity
-	if not IsValid(mine) or not slamClasses[mine:GetClass()] then
+	if not IsValid(mine) or seen[mine] or not slamClasses[mine:GetClass()] then
 		return
 	end
 	if (data.OriginalSoundName or data.SoundName or ""):lower() ~= "basegrenade.explode" then
@@ -111,11 +109,11 @@ end)
 -- Glide shells/missiles call CreateExplosion
 -- directly, without env_explosion or a guaranteed damage victim. Observe that
 -- exact event; removal alone also means sky contact/cleanup, not an explosion.
-local function glideCrater(projectile, attacker, position)
+local function glideCrater(projectile, attacker, position, class)
 	if not IsValid(projectile) or glideSeen[projectile] or not IsValid(attacker) or not attacker:IsPlayer() then
 		return
 	end
-	local class = projectile:GetClass()
+	class = class or projectile:GetClass()
 	if class ~= "glide_projectile" and class ~= "glide_missile" then
 		return
 	end
@@ -147,10 +145,10 @@ local function glideCrater(projectile, attacker, position)
 	end
 	V.QueueGlideTankCrater(attacker, vehicle, position, direction:GetNormalized())
 end
-local function safelyQueueGlide(projectile, attacker, position)
+local function safelyQueueGlide(projectile, attacker, position, class)
 	-- A failed edit must never suppress Glide's damage/effects or replace an
 	-- error raised by its original explosion function.
-	local ok, err = pcall(glideCrater, projectile, attacker, position)
+	local ok, err = pcall(glideCrater, projectile, attacker, position, class)
 	if not ok and ErrorNoHalt then
 		ErrorNoHalt("[GVoxel] Glide crater: " .. tostring(err) .. "\n")
 	end
@@ -180,7 +178,8 @@ function V.InstallGlideTankExplosionAdapter()
 	local state = { api = api, original = original, active = true }
 	state.wrapper = function(...)
 		if state.active then
-			safelyQueueGlide(...)
+			local projectile, attacker, position = ...
+			safelyQueueGlide(projectile, attacker, position)
 		end
 		-- Tail call preserves every argument/return, including nil, and the
 		-- original error without wrapping it in another protected call.
@@ -206,11 +205,10 @@ hook.Add("EntityTakeDamage", "GVoxel.GlideTankBlastDamage", function(_, damage)
 		return
 	end
 	local projectile = damage:GetInflictor()
-	if
-		IsValid(projectile)
-		and (projectile:GetClass() == "glide_projectile" or projectile:GetClass() == "glide_missile")
-	then
-		safelyQueueGlide(projectile, damage:GetAttacker(), projectile:GetPos())
+	if not IsValid(projectile) or glideSeen[projectile] then return end
+	local class = projectile:GetClass()
+	if class == "glide_projectile" or class == "glide_missile" then
+		safelyQueueGlide(projectile, damage:GetAttacker(), projectile:GetPos(), class)
 	end
 end)
 

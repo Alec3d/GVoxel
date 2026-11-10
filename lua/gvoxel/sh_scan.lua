@@ -1,16 +1,29 @@
 local V = GVoxel
 local axes = { Vector(1, 0, 0), Vector(-1, 0, 0), Vector(0, 1, 0), Vector(0, -1, 0), Vector(0, 0, 1), Vector(0, 0, -1) }
+local rayStep, rayStarts, rayDeltas
+
+local function scanRays(step)
+	if rayStep ~= step then
+		local reach = step * 1.75
+		rayStarts, rayDeltas = {}, {}
+		for i, axis in ipairs(axes) do
+			rayStarts[i], rayDeltas[i] = axis * reach, axis * (-2 * reach)
+		end
+		rayStep = step
+	end
+	return rayStarts, rayDeltas
+end
 
 -- Sample the volume, not just a height map: six local ray directions refine
 -- brush occupancy and detect displacement surfaces near each lattice point.
 -- Providers are injected so this numerical part can be tested without a map.
 function V.ScanDensity(r, p, solid, trace, terrainSign)
-	local reach = r.step * 1.75
+	local starts, deltas = scanRays(r.step)
 	local distance, displacementDistance, displacementSign = r.step, math.huge, 1
-	local planeHits = {}
-	for _, axis in ipairs(axes) do
-		local start = p + axis * reach
-		local delta = axis * (-2 * reach)
+	local planeHits
+	for i = 1, #starts do
+		local start = p + starts[i]
+		local delta = deltas[i]
 		local hit = trace(start, start + delta)
 		if hit.StartSolid and not hit.AllSolid and (hit.FractionLeftSolid or 0) > 0 then
 			local exit = start + delta * hit.FractionLeftSolid
@@ -28,6 +41,7 @@ function V.ScanDensity(r, p, solid, trace, terrainSign)
 			local planeDistance = (p - hit.HitPos):Dot(hit.HitNormal)
 			local d = math.abs(planeDistance)
 			if V.RecordScanPlane and r.analysis and hit.HitTexture ~= "**displacement**" then
+				planeHits = planeHits or {}
 				planeHits[#planeHits + 1] = { hit = hit, distance = d }
 			end
 			distance = math.min(distance, d)
@@ -48,7 +62,7 @@ function V.ScanDensity(r, p, solid, trace, terrainSign)
 	end
 	-- Record only planes supporting the sampled surface. An underlying brush
 	-- must not flatten a displacement that is actually closer to this point.
-	if displacementDistance > distance + 0.001 then
+	if planeHits and displacementDistance > distance + 0.001 then
 		for _, candidate in ipairs(planeHits) do
 			if candidate.distance <= distance + 0.001 then
 				V.RecordScanPlane(r, candidate.hit)

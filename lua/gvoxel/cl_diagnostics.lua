@@ -3,6 +3,7 @@ if V.StopFrameProfile then
 	V.StopFrameProfile()
 end
 local session
+local HOOK_PREFIX = "GVoxel."
 local function finish()
 	if not session then
 		return
@@ -25,7 +26,12 @@ local function finish()
 	end
 	local count = #s.frames
 	s.meanMS = sum / math.max(1, count)
+	local rate = count > 0 and string.format("%.0f FPS", 1000 / math.max(0.001, s.meanMS)) or "aucune image"
 	s.p95MS = s.frames[math.max(1, math.ceil(count * 0.95))] or 0
+	s.p99MS = s.frames[math.max(1, math.ceil(count * 0.99))] or 0
+	s.maxMS = s.frames[count] or 0
+	s.luaEndKiB = collectgarbage("count")
+	s.luaPeakKiB = math.max(s.luaPeakKiB, s.luaEndKiB)
 	s.render = V.GetVoxelRenderStats and V.GetVoxelRenderStats()
 	local r = V.GetClientScanRegion()
 	s.revision = r and r.revision
@@ -34,12 +40,14 @@ local function finish()
 	file.Write(path, util.TableToJSON(s, true))
 	print(
 		string.format(
-			"[GVoxel] Profil %s : %d images | moyenne %.2f ms (%.0f FPS) | p95 %.2f ms | data/%s",
+			"[GVoxel] Profil %s : %d images | moyenne %.2f ms (%s) | p95 %.2f / p99 %.2f / max %.2f ms | data/%s",
 			s.label,
 			count,
 			s.meanMS,
-			1000 / math.max(0.001, s.meanMS),
+			rate,
 			s.p95MS,
+			s.p99MS,
+			s.maxMS,
 			path
 		)
 	)
@@ -58,13 +66,16 @@ concommand.Add("vm_profile", function(_, _, args)
 		return
 	end
 	local duration = math.Clamp(tonumber(args[1]) or 5, 2, 30)
+	local luaStart = collectgarbage("count")
 	local s = {
-		label = (args[2] or "terrain"):gsub("[^%w_-]", ""),
+		label = (args[2] or "terrain"):gsub("[^%w_-]", ""):sub(1, 48),
 		duration = duration,
 		map = game.GetMap(),
 		width = ScrW(),
 		height = ScrH(),
 		frames = {},
+		luaStartKiB = luaStart,
+		luaPeakKiB = luaStart,
 		hooks = {},
 		wrapped = {},
 		returnToMenu = args[3] == "menu",
@@ -79,7 +90,7 @@ concommand.Add("vm_profile", function(_, _, args)
 	-- nested RenderView work; frame intervals also expose GPU/engine stalls.
 	for event, entries in pairs(hook.GetTable()) do
 		for name, fn in pairs(entries) do
-			if isstring(name) and name:sub(1, 11) == "GVoxel." then
+			if type(name) == "string" and name:sub(1, #HOOK_PREFIX) == HOOK_PREFIX then
 				local key = event .. "/" .. name
 				local row = { calls = 0, totalMS = 0, maxMS = 0 }
 				s.hooks[key] = row
@@ -111,6 +122,7 @@ concommand.Add("vm_profile", function(_, _, args)
 			s.frames[#s.frames + 1] = (now - s.previous) * 1000
 		end
 		s.previous = now
+		s.luaPeakKiB = math.max(s.luaPeakKiB, collectgarbage("count"))
 		if now - s.started >= duration then
 			finish()
 		end

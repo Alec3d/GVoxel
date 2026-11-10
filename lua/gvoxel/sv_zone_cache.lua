@@ -7,20 +7,21 @@ end
 local function xyz(p) return {p.x,p.y,p.z} end
 function V.MakeZoneCache(scan,name,signature,checkpoint)
     if not scan.completed or not scan.snapshot or scan.editWork then return nil,"Zone non prete ou modification en cours." end
-    local r=scan.region
+    local r,values=scan.region,scan.snapshot.values
+    local revision=r.revision
     local record={schema=2,map=game.GetMap(),signature=signature,name=name,metres=r.metres,
         base=xyz(r.base),origin=xyz(r.origin),step=r.step,cells=xyz(r.cells or Vector(32,32,32)),
-        values={},planes={},history={}}
+        values=values,planes={},history={}}
+    -- Edits publish a different values array. The original scan is immutable
+    -- and can be serialized directly while a newer revision is being prepared.
     for index=1,33^3 do
-        local value=scan.snapshot.values[index]
-        if value==nil then return nil,"Densite initiale incomplete." end
-        record.values[index]=value
+        if values[index]==nil then return nil,"Densite initiale incomplete." end
         if checkpoint and index%128==0 then checkpoint() end
     end
     for _,p in ipairs(r.featurePlanes or {}) do
         record.planes[#record.planes+1]={normal=xyz(V.FeaturePlaneNormal(p)),distance=V.FeaturePlaneDistance(p),low=xyz(p.low),high=xyz(p.high)}
     end
-    for i=1,r.revision do
+    for i=1,revision do
         local stroke=scan.history[i]
         if not stroke then return nil,"Journal de zone incomplet." end
         record.history[i]={center=xyz(stroke.center),radius=stroke.radius,adding=stroke.adding,
@@ -29,7 +30,7 @@ function V.MakeZoneCache(scan,name,signature,checkpoint)
     end
     return record
 end
-function V.ValidateZoneCache(record,map,signature)
+function V.ValidateZoneCache(record,map,signature,checkpoint)
     if type(signature)~="string" or type(record)~="table" or (record.schema~=1 and record.schema~=2) or record.map~=map or record.signature~=signature then
         return nil,"Cache obsolete : carte ou version differente."
     end
@@ -51,13 +52,17 @@ function V.ValidateZoneCache(record,map,signature)
     end
     if type(record.values)~="table" or #record.values~=33^3 or type(record.history)~="table"
         or #record.history>V.MaxEdits or type(record.planes)~="table" or #record.planes>128 then return nil,"Charge de cache invalide." end
-    for index=1,33^3 do if not finite(record.values[index],513) then return nil,"Densite invalide." end end
+    for index=1,33^3 do
+        if not finite(record.values[index],513) then return nil,"Densite invalide." end
+        if checkpoint and index%128==0 then checkpoint() end
+    end
     for index=1,#record.history do
         local s=record.history[index]
         if type(s)~="table" or not point(s.center) or not finite(s.radius,65536) or s.radius<1 or s.radius~=math.floor(s.radius) or type(s.adding)~="boolean"
             or not finite(s.seed,65536) or s.seed<0 or s.seed~=math.floor(s.seed)
             or (s.floorZ~=nil and not finite(s.floorZ))
             or (s.plane~=nil and (s.adding or s.seed~=0 or s.floorZ~=nil or not V.ValidRemovalPlane(s.plane))) then return nil,"Operation invalide." end
+        if checkpoint and index%32==0 then checkpoint() end
     end
     for index=1,#record.planes do
         local p=record.planes[index]
@@ -71,7 +76,10 @@ function V.ValidateZoneCache(record,map,signature)
         local migrated={}
         for key,value in pairs(record) do migrated[key]=value end
         migrated.schema=2 migrated.values={} migrated.legacyTail=true
-        for index=1,33^3 do migrated.values[index]=record.values[index+1] or record.step end
+        for index=1,33^3 do
+            migrated.values[index]=record.values[index+1] or record.step
+            if checkpoint and index%128==0 then checkpoint() end
+        end
         return migrated
     end
     return record

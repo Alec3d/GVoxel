@@ -8,7 +8,7 @@ for _, name in ipairs({
 	"custom",
 	"begin",
 	"progress",
-	"chunk",
+	"density",
 	"cancel",
 	"settings",
 	"edit",
@@ -51,7 +51,7 @@ end
 local function attach(scan, ply)
 	-- Existing participants keep the atomic display/collision barrier. A late
 	-- join replays history without stopping everyone until it catches up.
-	scan.peers[ply] = { chunk = 0, sent = -1, acknowledged = -1, blocking = not scan.everReady }
+	scan.peers[ply] = { nextLayer = 0, sent = -1, acknowledged = -1, blocking = not scan.everReady }
 	net.Start("vm_scan_begin")
 	net.WriteUInt(scan.region.id, 16)
 	net.WriteVector(scan.region.base)
@@ -101,24 +101,60 @@ local function features(scan, ply)
 	end
 	net.Send(ply)
 end
-local function chunk(scan, ply, peer)
-	local index = peer.chunk
-	local x, y, z = index % 4, math.floor(index / 4) % 4, math.floor(index / 16)
-	local r = scan.snapshot
-	net.Start("vm_scan_chunk")
-	net.WriteUInt(r.id, 16)
-	net.WriteUInt(x, 2)
-	net.WriteUInt(y, 2)
-	net.WriteUInt(z, 2)
-	for zz = z * 8 - 1, z * 8 + 9 do
-		for yy = y * 8 - 1, y * 8 + 9 do
-			for xx = x * 8 - 1, x * 8 + 9 do
-				net.WriteInt(math.Clamp(math.floor(V.Sample(r, xx, yy, zz) * 64 + 0.5), -32767, 32767), 16)
-			end
+-- Each lattice point is sent once, as a little-endian signed 16-bit
+-- density. A two-byte payload represents a uniform horizontal layer.
+local function densityWord(value)
+	local word = math.Clamp(math.floor(value * 64 + 0.5), -32767, 32767) % 65536
+	return word % 256, math.floor(word / 256)
+end
+local function uniformLayer(values, r, z, maxX, maxY)
+	local first = values[V.Index(0, 0, z, r)]
+	for y = 0, maxY do
+		local start = V.Index(0, y, z, r)
+		for i = start, start + maxX do
+			if values[i] ~= first then return end
 		end
 	end
+	return string.char(densityWord(first))
+end
+local function densityLayer(scan, z)
+	local r = scan.region
+	scan.densityLayers = scan.densityLayers or {}
+	local data = scan.densityLayers[z]
+	if not data then
+		local values = scan.snapshot.values
+		local maxX, maxY = V.RegionCells(r, "x"), V.RegionCells(r, "y")
+		data = uniformLayer(values, r, z, maxX, maxY)
+		if not data then
+			local rows, bytes = {}, {}
+			local last, low, high
+			for y = 0, maxY do
+				local start = V.Index(0, y, z, r)
+				local j = 1
+				for i = start, start + maxX do
+					local value = values[i]
+					if value ~= last then
+						last = value
+						low, high = densityWord(value)
+					end
+					bytes[j], bytes[j + 1] = low, high
+					j = j + 2
+				end
+				rows[y + 1] = string.char(unpack(bytes))
+			end
+			data = table.concat(rows)
+		end
+		scan.densityLayers[z] = data
+	end
+	return data
+end
+local function sendDensity(scan, ply, peer, data)
+	net.Start("vm_scan_density")
+	net.WriteUInt(scan.region.id, 16)
+	net.WriteUInt(peer.nextLayer, 8)
+	net.WriteData(data, #data)
 	net.Send(ply)
-	peer.chunk = index + 1
+	peer.nextLayer = peer.nextLayer + 1
 end
 local function strokePacket(name, scan, ply, revision, stroke)
 	net.Start(name)
@@ -142,73 +178,108 @@ end
 -- Prepare privately while the server builds SAT/native collision. The normal
 -- edit packet remains the publication permit, sent only after physics is ready.
 -- Joins replay committed history as before; speculative work is never journaled.
-function V.PrepareScanEdit(scan, work)
-	for ply, peer in pairs(scan.peers) do
-		if IsValid(ply) and peer.done and not peer.failed and peer.acknowledged == scan.region.revision then
-			strokePacket("vm_scan_prepare", scan, ply, work.field.revision, work)
-		end
-	end
+local function preparePeer(scan, work, ply, peer)
+	if not peer.done or peer.failed or peer.acknowledged ~= scan.region.revision then return end
+	work.previewPeers = work.previewPeers or {}
+	if work.previewPeers[ply] == peer then return end
+	strokePacket("vm_scan_prepare", scan, ply, work.revision, work)
+	work.previewPeers[ply] = peer
 	work.previewSent = true
 end
+function V.PrepareScanEdit(scan, work)
+	work.revision = work.revision or work.field.revision
+	work.previewReady = true
+	for ply, peer in pairs(scan.peers) do
+		if IsValid(ply) then preparePeer(scan, work, ply, peer) end
+	end
+end
 function V.AbortScanPreparation(scan, work)
-	if not work or not work.previewSent then
+	if not work or not work.previewPeers then
 		return
 	end
-	for ply in pairs(scan.peers) do
-		if IsValid(ply) then
+	local recipients = work.previewPeers
+	work.previewPeers = nil
+	for ply, peer in pairs(recipients) do
+		if IsValid(ply) and scan.peers[ply] == peer and not peer.failed then
 			net.Start("vm_scan_abort")
 			net.WriteUInt(scan.region.id, 16)
-			net.WriteUInt(work.field.revision, 16)
+			net.WriteUInt(work.revision, 16)
 			net.Send(ply)
 		end
 	end
 end
--- Two density packets globally per tick. Rotate peers so joins share bandwidth.
+-- Budget catch-up traffic as a group. Full layers retain the two-packet cap;
+-- uniform layers can advance in the same tick without a dense-layer burst.
+local REPLICATION_BYTES = 8 * 1024
+local REPLICATION_PACKETS = 32
+local EDIT_PACKET_BYTES = 40 -- Upper bound including the optional clip plane and cell.
+local PROGRESS_PACKET_BYTES = 17
 function V.PumpScanReplication(scan, deadline)
 	if not scan.snapshot then
 		return
 	end
-	local peers
+	local peers, count = scan.replicationPeers, 0
 	local latest = #scan.history
+	local layers = V.RegionCells(scan.region, "z") + 1
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) then
-			if not peer.features or peer.chunk < 64 or not peer.done or peer.sent < latest then
-				peers = peers or {}
-				peers[#peers + 1] = { ply, peer }
+			if not peer.failed and (not peer.features or peer.nextLayer < layers
+				or (scan.completed and (not peer.done or peer.sent < latest))) then
+				if not peers then peers = {} scan.replicationPeers = peers end
+				count = count + 1
+				peers[count] = ply
 			end
 		else
 			scan.peers[ply] = nil
 		end
 	end
-	if not peers then
+	if peers then for i = #peers, count + 1, -1 do peers[i] = nil end end
+	if count == 0 then
 		return
 	end
-	local packets, edits = 0, 0
-	local start = (scan.replicationCursor or 0) % #peers
-	for i = 1, #peers do
-		local pair = peers[(start + i - 1) % #peers + 1]
-		local ply, peer = pair[1], pair[2]
-		if not peer.features and SysTime() < deadline then
+	local bytes, packets = REPLICATION_BYTES, REPLICATION_PACKETS
+	local density, dense, metadata, edits = 0, 0, 0, 0
+	local planes = scan.region.featurePlanes
+	local planeBytes = 7 + (planes and #planes or 0) * 40
+	local start = (scan.replicationCursor or 0) % count
+	local layersPerPeer = count == 1 and 8 or 4
+	for i = 1, count do
+		if bytes < 7 or packets == 0 or SysTime() >= deadline then break end
+		local ply = peers[(start + i - 1) % count + 1]
+		local peer = scan.peers[ply]
+		if not peer.features and metadata < 2 and bytes >= planeBytes then
 			features(scan, ply)
 			peer.features = true
+			metadata = metadata + 1
+			bytes, packets = bytes - planeBytes, packets - 1
 		end
-		while peer.features and peer.chunk < 64 and packets < 2 and SysTime() < deadline do
-			chunk(scan, ply, peer)
-			packets = packets + 1
+		for _ = 1, layersPerPeer do
+			if not peer.features or peer.nextLayer >= layers or density >= 8 or dense >= 2
+				or bytes < 8 or packets == 0 or SysTime() >= deadline then break end
+			local data = densityLayer(scan, peer.nextLayer)
+			local packetBytes = #data + 6
+			if bytes < packetBytes or SysTime() >= deadline then break end
+			sendDensity(scan, ply, peer, data)
+			density = density + 1
+			if #data > 2 then dense = dense + 1 end
+			bytes, packets = bytes - packetBytes, packets - 1
 		end
-		if peer.chunk == 64 and scan.completed then
-			if not peer.done then
+		if peer.nextLayer == layers and scan.completed and SysTime() < deadline then
+			if not peer.done and bytes >= PROGRESS_PACKET_BYTES and packets > 0 then
 				peer.done = true
 				peer.sent = 0
 				progress(scan, ply, 2, 1)
+				bytes, packets = bytes - PROGRESS_PACKET_BYTES, packets - 1
 			end
 			for _ = 1, 8 do
 				local revision = peer.sent + 1
-				if edits >= 16 or not scan.history[revision] or SysTime() >= deadline then
+				if not peer.done or edits >= 16 or not scan.history[revision]
+					or bytes < EDIT_PACKET_BYTES or packets == 0 or SysTime() >= deadline then
 					break
 				end
 				edit(scan, ply, peer, revision, scan.history[revision])
 				edits = edits + 1
+				bytes, packets = bytes - EDIT_PACKET_BYTES, packets - 1
 			end
 		end
 	end
@@ -232,7 +303,7 @@ function V.PublishScanEdit(scan, work)
 		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ, plane = work.plane }
 	work.sent = true
 	for ply, peer in pairs(scan.peers) do
-		if IsValid(ply) and peer.done and peer.sent == revision - 1 then
+		if IsValid(ply) and not peer.failed and peer.done and peer.sent == revision - 1 then
 			edit(scan, ply, peer, revision, work)
 		end
 	end
@@ -266,6 +337,8 @@ net.Receive("vm_scan_ready", function(length, ply)
 	if revision >= scan.region.revision then peer.blocking = true end
 	scan.movementReady = V.ScanPeersReady(scan, scan.region.revision)
 	if scan.movementReady then scan.everReady = true end
+	local work = scan.editWork
+	if work and work.previewReady and not work.sent then preparePeer(scan, work, ply, peer) end
 	if V.CommitScanEdit then
 		V.CommitScanEdit(scan)
 	end
@@ -298,6 +371,15 @@ hook.Add("PlayerDisconnected", "GVoxel.SessionDisconnect", function(ply)
 	clients[ply] = nil
 	if session then
 		session.peers[ply] = nil
+		local waiting = session.replicationPeers
+		for i = waiting and #waiting or 0, 1, -1 do
+			if waiting[i] == ply then
+				table.remove(waiting, i)
+				break
+			end
+		end
+		local previews = session.editWork and session.editWork.previewPeers
+		if previews then previews[ply] = nil end
 		if session.ply == ply then
 			session.ply = nil
 		end

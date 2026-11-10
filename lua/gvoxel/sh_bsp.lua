@@ -72,7 +72,7 @@ function V.ForDisplacementTriangles(face, emit, checkpoint)
 	end
 end
 
-function V.ReadBSP(stream, checkpoint)
+function V.ReadBSP(stream, checkpoint, readLighting)
 	local size = stream:Size()
 	assert(stream:Read(4) == "VBSP", "signature BSP inconnue")
 	local version = stream:ReadLong()
@@ -293,9 +293,14 @@ function V.ReadBSP(stream, checkpoint)
 			facesID, lighting = 58, 53
 		end
 	end
-	section(lighting)
-	data.lighting = lumps[lighting].length > 0 and stream:Read(lumps[lighting].length) or ""
-	data.lightingHDR = lighting == 53
+	-- The runtime server keeps the same face records, without copying a
+	-- render-only byte lump into its Lua heap for the lifetime of the map.
+	data.lighting = ""
+	if readLighting ~= false and lumps[lighting].length > 0 then
+		section(lighting)
+		data.lighting = stream:Read(lumps[lighting].length)
+	end
+	data.lightingHDR = readLighting ~= false and lighting == 53
 	local count = section(facesID, 56)
 	assert(firstFace >= 0 and firstFace + faceCount <= count, "modele monde invalide")
 	local faceIDs = {}
@@ -618,7 +623,7 @@ local function start()
 	state.thread = coroutine.create(function()
 		local stream = assert(file.Open("maps/" .. game.GetMap() .. ".bsp", "rb", "GAME"), "BSP introuvable")
 		state.stream = stream
-		local data = V.ReadBSP(stream, coroutine.yield)
+		local data = V.ReadBSP(stream, coroutine.yield, not SERVER)
 		stream:Close()
 		state.stream = nil
 		return data

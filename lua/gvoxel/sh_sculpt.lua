@@ -5,14 +5,28 @@ function V.SnapScanPosition(p)
 	return Vector(math.floor(p.x * 8 + 0.5) / 8, math.floor(p.y * 8 + 0.5) / 8, math.floor(p.z * 8 + 0.5) / 8)
 end
 
-function V.ScanBrushRadius(r, radius)
-	return math.max(math.ceil(r.step), math.min(80, math.max(24, math.floor(radius))))
+function V.ScanBrushRadius(r, radius, addPower)
+	local fullRadius = math.max(math.ceil(r.step), math.min(80, math.max(24, math.floor(radius))))
+	-- Sphere volume grows with the cube of its radius. Keep the committed
+	-- radius integral so the existing edit journal can replay it unchanged.
+	local fraction = math.max(10, math.min(100, tonumber(addPower) or 100)) / 100
+	return math.max(1, math.floor(fullRadius * fraction ^ (1 / 3) + 0.5))
 end
 
-local function triangleDistance(start, direction, a, b, c)
-	local ab, ac = b - a, c - a
-	if ab:Cross(ac):LengthSqr() < 0.000001 then
-		return
+local aimEdges = setmetatable({}, { __mode = "k" })
+local function triangleDistance(start, direction, a, b, c, cross)
+	local edges = cross and aimEdges[cross]
+	local ab, ac
+	if edges then
+		ab, ac = edges[1], edges[2]
+	else
+		ab, ac = b - a, c - a
+		if cross then
+			aimEdges[cross] = { ab, ac }
+		else
+			cross = ab:Cross(ac)
+			if cross:LengthSqr() < 0.000001 then return end
+		end
 	end
 	local h = direction:Cross(ac)
 	local determinant = ab:Dot(h)
@@ -29,7 +43,7 @@ local function triangleDistance(start, direction, a, b, c)
 	if v < -1e-7 or u + v > 1 + 1e-7 then
 		return
 	end
-	return ac:Dot(q) / determinant
+	return ac:Dot(q) / determinant, cross
 end
 
 -- Walk lattice cells, intersecting the same tetrahedron triangles as BuildChunk.
@@ -61,32 +75,35 @@ function V.TraceScanRegion(r, start, direction, reach, occlusionOnly, checkpoint
 		end
 	end
 	local localStart = start - r.origin
+	local boundary, best, bestCross, bestOutward, bestCurved, bestBrush
+	local function visit(a, b, c, outward, curved, brush, _, cross)
+		local distance, hitCross = triangleDistance(localStart, direction, a, b, c, cross)
+		if
+			distance
+			and distance >= first - 0.00001
+			and distance >= t - 0.0001
+			and distance <= boundary + 0.0001
+			and (not best or distance < best)
+		then
+			best, bestCross, bestOutward, bestCurved, bestBrush = distance, hitCross, outward, curved, brush
+		end
+	end
 	while t <= last + 0.00001 do
-		local boundary = math.min(nextT.x, nextT.y, nextT.z, last)
-		local best, bestNormal, bestCurved, bestBrush = nil, nil, nil, nil
-		V.ForCellTriangles(r, cell.x, cell.y, cell.z, function(a, b, c, outward, curved, brush)
-			local distance = triangleDistance(localStart, direction, a, b, c)
-			if
-				distance
-				and distance >= first - 0.00001
-				and distance >= t - 0.0001
-				and distance <= boundary + 0.0001
-				and (not best or distance < best)
-			then
-				best = distance
-				bestNormal = (b - a):Cross(c - a):GetNormalized()
-				bestCurved = curved
-				bestBrush = brush
-				if bestNormal:Dot(outward) < 0 then
-					bestNormal = bestNormal * -1
-				end
-			end
-		end, checkpoint)
+		boundary = math.min(nextT.x, nextT.y, nextT.z, last)
+		best = nil
+		-- Use the same BSP surface rejection as the visible mesh.
+		if not r.bspFaceBins or not r.bspCellEditBins or V.BSPCellMayHaveSurface(r, cell.x, cell.y, cell.z) then
+			V.ForCellTriangles(r, cell.x, cell.y, cell.z, visit, checkpoint)
+		end
 		if best then
 			if occlusionOnly then
 				return true
 			end
 			local p = start + direction * best
+			local bestNormal = bestCross:GetNormalized()
+			if bestNormal:Dot(bestOutward) < 0 then
+				bestNormal = bestNormal * -1
+			end
 			local normal = bestNormal
 			if bestBrush then
 				normal = (bestBrush.seed or bestBrush.floorZ ~= nil or bestBrush.plane) and bestNormal
@@ -313,9 +330,11 @@ function V.CloneScanField(r, checkpoint)
 		for key, value in pairs(r.bspEditBins) do
 			copy.bspEditBins[key] = value
 		end
-		copy.bspCellEditBins = {}
-		for key, value in pairs(r.bspCellEditBins or {}) do
-			copy.bspCellEditBins[key] = value
+		if r.bspCellEditBins then
+			copy.bspCellEditBins = {}
+			for key, value in pairs(r.bspCellEditBins) do
+				copy.bspCellEditBins[key] = value
+			end
 		end
 	end
 	return copy

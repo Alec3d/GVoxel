@@ -32,7 +32,7 @@ function V.ValidScanSize(metres)
 	return metres == 16 or metres == 32
 end
 
--- The lattice keeps its fixed 33-node stride / 64 transport chunks. A custom
+-- The lattice keeps its fixed 33-node stride. A custom
 -- box activates only the cells within its rectangular bounds, with uniform
 -- voxel spacing; inactive cells never sample, render or collide.
 function V.RegionSize(r)
@@ -260,7 +260,8 @@ end
 -- yield while their private scratch vectors are live. Native in-place vector
 -- operations preserve Source's float rounding without temporary userdata.
 local densityPoint, normalPoint = Vector(), Vector()
-local normalOffsets = {}
+local normalOffsets = { Vector(), Vector(), Vector() }
+local normalOffsetStep
 function V.Density(r, p)
 	local q = densityPoint
 	q:Set(p)
@@ -268,10 +269,21 @@ function V.Density(r, p)
 	q:Div(r.step or V.Step)
 	local x, y, z = floor(q.x), floor(q.y), floor(q.z)
 	local u, v, w = q.x - x, q.y - y, q.z - z
-	local function row(yy, zz)
-		return V.Sample(r, x, yy, zz) * (1 - u) + V.Sample(r, x + 1, yy, zz) * u
-	end
-	return (row(y, z) * (1 - v) + row(y + 1, z) * v) * (1 - w) + (row(y, z + 1) * (1 - v) + row(y + 1, z + 1) * v) * w
+	-- The eight samples share two coordinates per axis. Clamp and compute
+	-- each stride once while keeping the same interpolation and float input.
+	local sx, sy, sz = V.RegionCells(r, "x"), V.RegionCells(r, "y"), V.RegionCells(r, "z")
+	local row = (r.nx or nx) + 1
+	local slice = row * ((r.ny or ny) + 1)
+	local left, right = 1 + max(0, min(sx, x)), 1 + max(0, min(sx, x + 1))
+	local y0, y1 = row * max(0, min(sy, y)), row * max(0, min(sy, y + 1))
+	local z0, z1 = slice * max(0, min(sz, z)), slice * max(0, min(sz, z + 1))
+	local values, oneMinusU = r.values, 1 - u
+	local a, b, c, d = y0 + z0, y1 + z0, y0 + z1, y1 + z1
+	local ab = (values[a + left] * oneMinusU + values[a + right] * u) * (1 - v)
+		+ (values[b + left] * oneMinusU + values[b + right] * u) * v
+	local cd = (values[c + left] * oneMinusU + values[c + right] * u) * (1 - v)
+		+ (values[d + left] * oneMinusU + values[d + right] * u) * v
+	return ab * (1 - w) + cd * w
 end
 
 local function normalSample(r, p, offset, negative)
@@ -285,15 +297,15 @@ local function normalSample(r, p, offset, negative)
 end
 function V.Normal(r, p)
 	local e = (r.step or V.Step) / 8
-	local offsets = normalOffsets[e]
-	if not offsets then
-		offsets = { Vector(e, 0, 0), Vector(0, e, 0), Vector(0, 0, e) }
-		normalOffsets[e] = offsets
+	if normalOffsetStep ~= e then
+		normalOffsets[1].x, normalOffsets[2].y, normalOffsets[3].z = e, e, e
+		normalOffsetStep = e
 	end
+	local x, y, z = normalOffsets[1], normalOffsets[2], normalOffsets[3]
 	local normal = Vector(
-		normalSample(r, p, offsets[1]) - normalSample(r, p, offsets[1], true),
-		normalSample(r, p, offsets[2]) - normalSample(r, p, offsets[2], true),
-		normalSample(r, p, offsets[3]) - normalSample(r, p, offsets[3], true)
+		normalSample(r, p, x) - normalSample(r, p, x, true),
+		normalSample(r, p, y) - normalSample(r, p, y, true),
+		normalSample(r, p, z) - normalSample(r, p, z, true)
 	)
 	normal:Normalize()
 	return normal
@@ -342,19 +354,32 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 		min(nz - 1, ceil((q.z + radius) / step)),
 	}
 	local dirty, changed = {}, false
+	local chunkWidth, chunkDepth = ceil(nx / 8), ceil(ny / 8)
+	local marked = {}
+	local function markChunk(cx, cy, cz)
+		local index = cx + chunkWidth * (cy + chunkDepth * cz)
+		if not marked[index] then
+			marked[index] = true
+			dirty[V.ChunkKey(cx, cy, cz)] = { cx, cy, cz }
+		end
+	end
 	for z = lo[3], hi[3] do
+		local dz2 = (z * step - q.z) ^ 2
 		for y = lo[2], hi[2] do
+			local dy2 = (y * step - q.y) ^ 2
 			for x = lo[1], hi[1] do
-				local d = sqrt((x * step - q.x) ^ 2 + (y * step - q.y) ^ 2 + (z * step - q.z) ^ 2)
-				-- Preserve the outer lattice: scanned borders must keep matching the BSP.
-				local sample = d - radius
+				local sample
 				if plane then
-					local value=plane.axis==1 and x or plane.axis==2 and y or z
-					sample=plane.sign*(r.origin[planeAxis]+value*step)-plane.distance
-				elseif seed and d < radius then
-					sample = V.BrushSample(Vector(x * step, y * step, z * step), q, radius, seed, localFloor)
-				elseif localFloor ~= nil then
-					sample = max(sample, localFloor - z * step)
+					local value = plane.axis == 1 and x or plane.axis == 2 and y or z
+					sample = plane.sign * (r.origin[planeAxis] + value * step) - plane.distance
+				else
+					local d = sqrt((x * step - q.x) ^ 2 + dy2 + dz2)
+					sample = d - radius
+					if seed and d < radius then
+						sample = V.BrushSample(Vector(x * step, y * step, z * step), q, radius, seed, localFloor)
+					elseif localFloor ~= nil then
+						sample = max(sample, localFloor - z * step)
+					end
 				end
 				if sample < 0 then
 					local index = V.Index(x, y, z, r)
@@ -370,7 +395,7 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 						for cz = max(0, floor((z - 2) / 8)), min(floor((nz - 1) / 8), floor((z + 1) / 8)) do
 							for cy = max(0, floor((y - 2) / 8)), min(floor((ny - 1) / 8), floor((y + 1) / 8)) do
 								for cx = max(0, floor((x - 2) / 8)), min(floor((nx - 1) / 8), floor((x + 1) / 8)) do
-									dirty[V.ChunkKey(cx, cy, cz)] = { cx, cy, cz }
+									markChunk(cx, cy, cz)
 								end
 							end
 						end
@@ -389,7 +414,7 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 		for cz = max(0, floor(lowZ / step / 8)), min(floor((nz - 1) / 8), floor((q.z + radius) / step / 8)) do
 			for cy = max(0, floor((q.y - radius) / step / 8)), min(floor((ny - 1) / 8), floor((q.y + radius) / step / 8)) do
 				for cx = max(0, floor((q.x - radius) / step / 8)), min(floor((nx - 1) / 8), floor((q.x + radius) / step / 8)) do
-					dirty[V.ChunkKey(cx, cy, cz)] = { cx, cy, cz }
+					markChunk(cx, cy, cz)
 					changed = true
 				end
 			end
@@ -425,6 +450,41 @@ local offsets =
 local tetrahedra = { { 1, 2, 3, 7 }, { 1, 3, 4, 7 }, { 1, 4, 8, 7 }, { 1, 8, 5, 7 }, { 1, 5, 6, 7 }, { 1, 6, 2, 7 } }
 V.CellOffsets, V.CellTetrahedra = offsets, tetrahedra
 local scanColor = Color(255, 255, 255)
+local densityCases = {}
+for ti, tetrahedron in ipairs(tetrahedra) do
+	local cases = {}
+	densityCases[ti] = cases
+	for mask = 1, 14 do
+		local inside, outside = {}, {}
+		for corner, index in ipairs(tetrahedron) do
+			local list = floor(mask / 2 ^ (corner - 1)) % 2 == 1 and inside or outside
+			list[#list + 1] = index
+		end
+		cases[mask] = { inside = inside, outside = outside }
+	end
+end
+
+function V.DensityEdgePoint(r, edges, first, second, a, b, da, db)
+	if first > second then
+		first, second, a, b, da, db = second, first, b, a, db, da
+	end
+	local key = da == 0 and -first or db == 0 and -second or first * 40000 + second
+	local point = edges[key]
+	if point then
+		return point, edges.refined and edges.refined[key]
+	end
+	local raw = a + (b - a) * (da / (da - db))
+	point = V.RefineSurfacePoint and V.RefineSurfacePoint(r, raw) or raw
+	edges[key] = point
+	-- Collision tetrahedralizes a sharpened cut to follow the same
+	-- triangulated boundary instead of bridging its non-planar diagonal.
+	if point ~= raw and point:DistToSqr(raw) > 0.00000001 then
+		edges.refined = edges.refined or {}
+		edges.refined[key] = true
+		return point, true
+	end
+	return point
+end
 
 local function buildCellTriangles(r, x, y, z, emit)
 	local step = r.step or V.Step
@@ -443,44 +503,42 @@ local function buildCellTriangles(r, x, y, z, emit)
 	if not hasSolid or not hasAir then
 		return
 	end
-	for i, o in ipairs(offsets) do
-		positions[i] = Vector(x + o[1], y + o[2], z + o[3]) * step
+	-- Source rounds the scalar step before multiplying the lattice vector.
+	local vectorStep = r.densityVectorStep
+	if not vectorStep then
+		vectorStep = Vector(step, 0, 0).x
+		r.densityVectorStep = vectorStep
 	end
-	local edges = V.TerrainCellCache(r, "edgePoints", x, y, z)
+	for i, o in ipairs(offsets) do
+		positions[i] = Vector((x + o[1]) * vectorStep, (y + o[2]) * vectorStep, (z + o[3]) * vectorStep)
+	end
+	local edges = V.TerrainCellCache(r, "densityEdges", x, y, z)
 	local function edge(i, j)
-		if indices[i] > indices[j] then
-			i, j = j, i
-		end
 		-- Shared tetrahedron/cell edges interpolate and refine only once per
 		-- chunk. Canonical node order also makes the floating-point result
 		-- identical on either side of a lattice face.
-		local key = indices[i] * 40000 + indices[j]
-		if densities[i] == 0 then
-			key = -indices[i]
-		elseif densities[j] == 0 then
-			key = -indices[j]
-		end
-		if edges[key] then
-			return edges[key]
-		end
-		local p = positions[i] + (positions[j] - positions[i]) * (densities[i] / (densities[i] - densities[j]))
-		p = V.RefineSurfacePoint and V.RefineSurfacePoint(r, p) or p
-		edges[key] = p
-		return p
+		local point = V.DensityEdgePoint(r, edges, indices[i], indices[j], positions[i], positions[j], densities[i], densities[j])
+		return point
 	end
-	for _, t in ipairs(tetrahedra) do
-		local inside, outside = {}, {}
-		for _, i in ipairs(t) do
-			local list = densities[i] < 0 and inside or outside
-			list[#list + 1] = i
-		end
-		if #inside > 0 and #outside > 0 then
+	local delta = Vector()
+	for ti, t in ipairs(tetrahedra) do
+		local mask = (densities[t[1]] < 0 and 1 or 0)
+			+ (densities[t[2]] < 0 and 2 or 0)
+			+ (densities[t[3]] < 0 and 4 or 0)
+			+ (densities[t[4]] < 0 and 8 or 0)
+		local case = densityCases[ti][mask]
+		if case then
+			local inside, outside = case.inside, case.outside
 			local outward = Vector()
 			for _, i in ipairs(outside) do
-				outward = outward + positions[i] / #outside
+				delta:Set(positions[i])
+				delta:Div(#outside)
+				outward:Add(delta)
 			end
 			for _, i in ipairs(inside) do
-				outward = outward - positions[i] / #inside
+				delta:Set(positions[i])
+				delta:Div(#inside)
+				outward:Sub(delta)
 			end
 			if #inside == 1 or #outside == 1 then
 				local singleton = #inside == 1 and inside or outside
@@ -506,8 +564,10 @@ function V.ForCellTriangles(r, x, y, z, emit, checkpoint)
 		return
 	end
 	if r.bsp then
-		for i, t in ipairs(V.BSPCell(r, x, y, z, checkpoint).triangles) do
-			emit(t[1], t[2], t[3], t[4], t[5], t[6], t[7])
+		local cells, key = V.TerrainCellCache(r, "bspCells", x, y, z)
+		local cell = cells[key] or V.BSPCell(r, x, y, z, checkpoint)
+		for i, t in ipairs(cell.triangles) do
+			emit(t[1], t[2], t[3], t[4], t[5], t[6], t[7], t[8])
 			if checkpoint and i % 32 == 0 then
 				checkpoint()
 			end
@@ -587,28 +647,46 @@ function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
 	end
 	local vertices = {}
 	local offset = Vector(cx, cy, cz) * ((r.step or V.Step) * 8)
-	local cells = V.TerrainCellCache(r, "physicsCells", cx * 8, cy * 8, cz * 8)
-	for z = cz * 8, min(cz * 8 + 7, V.RegionCells(r, "z") - 1) do
-		for y = cy * 8, min(cy * 8 + 7, V.RegionCells(r, "y") - 1) do
-			for x = cx * 8, min(cx * 8 + 7, V.RegionCells(r, "x") - 1) do
-				local key = V.Index(x, y, z, r)
+	local x0, y0, z0 = cx * 8, cy * 8, cz * 8
+	local x1 = min(x0 + 7, V.RegionCells(r, "x") - 1)
+	local y1 = min(y0 + 7, V.RegionCells(r, "y") - 1)
+	local z1 = min(z0 + 7, V.RegionCells(r, "z") - 1)
+	local cells = V.TerrainCellCache(r, "physicsCells", x0, y0, z0)
+	local converted = {}
+	local cellVertices
+	local function localPoint(point)
+		local localPosition = converted[point]
+		if not localPosition then
+			localPosition = point - offset
+			converted[point] = localPosition
+		end
+		return localPosition
+	end
+	local function emit(a, b, c, n, _, _, _, cross)
+		cross = cross or (b - a):Cross(c - a)
+		if not V.PhysicsTriangleUsable(a, b, c, cross) then
+			return
+		end
+		if cross:Dot(n) > 0 then
+			b, c = c, b
+		end
+		local length = #cellVertices
+		cellVertices[length + 1] = localPoint(a)
+		cellVertices[length + 2] = localPoint(b)
+		cellVertices[length + 3] = localPoint(c)
+	end
+	for z = z0, z1 do
+		for y = y0, y1 do
+			local first = V.Index(x0, y, z, r)
+			for x = x0, x1 do
+				local key = first + x - x0
 				local cached = cells[key]
 				if not cached then
 					cached = emptyPhysicsCell
 					if mayHaveSurface(r, x, y, z, key) then
-						cached = {}
-						V.ForCellTriangles(r, x, y, z, function(a, b, c, n)
-							local cross = (b - a):Cross(c - a)
-							if not V.PhysicsTriangleUsable(a, b, c, cross) then
-								return
-							end
-							if cross:Dot(n) > 0 then
-								b, c = c, b
-							end
-							cached[#cached + 1] = a - offset
-							cached[#cached + 1] = b - offset
-							cached[#cached + 1] = c - offset
-						end, checkpoint)
+						cellVertices = {}
+						V.ForCellTriangles(r, x, y, z, emit, checkpoint)
+						cached = cellVertices
 					end
 					-- Immutable positions only. A new native mesh can share distant
 					-- cells without repeating tolerance tests or Vector construction.
@@ -617,7 +695,7 @@ function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
 				for _, point in ipairs(cached) do
 					vertices[#vertices + 1] = point
 				end
-				if checkpoint and (x - cx * 8 + 8 * (y - cy * 8) + 64 * (z - cz * 8) + 1) % 32 == 0 then
+				if checkpoint and (x - x0 + 8 * (y - y0) + 1) % 32 == 0 then
 					checkpoint()
 				end
 			end
@@ -630,31 +708,35 @@ local emptyRenderCell = {}
 -- Cheap broad phase for native collision jobs. Uniform chunks without BSP
 -- faces or edited solids cannot contain a surface; no triangulation needed.
 function V.CollisionChunkMayHaveSurface(r, cx, cy, cz)
-	if not V.ActiveRegionCell(r, cx * 8, cy * 8, cz * 8) then
+	local x0, y0, z0 = cx * 8, cy * 8, cz * 8
+	if not V.ActiveRegionCell(r, x0, y0, z0) then
 		return false
 	end
 	if not r.analysis then
 		return true
 	end
-	local first = r.values[V.Index(cx * 8, cy * 8, cz * 8, r)] < 0
-	for z = cz * 8, cz * 8 + 8 do
-		for y = cy * 8, cy * 8 + 8 do
-			for x = cx * 8, cx * 8 + 8 do
-				local key = V.Index(x, y, z, r)
-				if (r.values[key] < 0) ~= first then
+	local x1 = min(x0 + 8, V.RegionCells(r, "x"))
+	local y1 = min(y0 + 8, V.RegionCells(r, "y"))
+	local z1 = min(z0 + 8, V.RegionCells(r, "z"))
+	-- BSP displacement triangles sample the original field, then apply
+	-- brush planes. The edit bins below already cover those brush surfaces.
+	local values = r.bsp and r.bspDensityBase and r.bspDensityBase.values or r.values
+	local first = values[V.Index(x0, y0, z0, r)] < 0
+	local faces, terrain, edits = r.bspFaceBins, r.bspTerrainFaces, r.bspCellEditBins
+	if r.bsp and not edits and r.bspEditBins and r.bspEditBins[V.ChunkKey(cx, cy, cz)] then
+		return true
+	end
+	for z = z0, z1 do
+		for y = y0, y1 do
+			local row = V.Index(x0, y, z, r)
+			local hasCells = r.bsp and y < y1 and z < z1
+			for x = x0, x1 do
+				local key = row + x - x0
+				if (values[key] < 0) ~= first then
 					return true
 				end
-				if x < cx * 8 + 8 and y < cy * 8 + 8 and z < cz * 8 + 8 then
-					if
-						r.bsp
-						and (
-							(r.bspFaceBins and r.bspFaceBins[key])
-							or (r.bspTerrainFaces and r.bspTerrainFaces[key])
-							or (r.bspCellEditBins and r.bspCellEditBins[key])
-						)
-					then
-						return true
-					end
+				if hasCells and x < x1 and ((faces and faces[key]) or (terrain and terrain[key]) or (edits and edits[key])) then
+					return true
 				end
 			end
 		end
@@ -662,49 +744,65 @@ function V.CollisionChunkMayHaveSurface(r, cx, cy, cz)
 	return false
 end
 function V.BuildChunk(r, cx, cy, cz, checkpoint)
-	if not V.ActiveRegionCell(r, cx * 8, cy * 8, cz * 8) then
+	if not V.CollisionChunkMayHaveSurface(r, cx, cy, cz) then
 		return {}
 	end
+	local x0, y0, z0 = cx * 8, cy * 8, cz * 8
+	local x1 = min(x0 + 7, V.RegionCells(r, "x") - 1)
+	local y1 = min(y0 + 7, V.RegionCells(r, "y") - 1)
+	local z1 = min(z0 + 7, V.RegionCells(r, "z") - 1)
 	local vertices = {}
 	local light = not r.analysis and Vector(0.35, -0.25, 0.9):GetNormalized()
 	local chunkOrigin = Vector(cx, cy, cz) * ((r.step or V.Step) * 8)
-	local normalCache = V.TerrainCellCache(r, "smoothNormals", cx * 8, cy * 8, cz * 8)
+	local normalCache
 	local vertexCache = {}
 	local cells = V.TerrainCellCache(r, "renderCells", cx * 8, cy * 8, cz * 8)
 	local currentCell
-	local function emit(a, b, c, outward, curved, brush, nativeFace)
-		local cross = (b - a):Cross(c - a)
-		if cross:LengthSqr() < 0.000001 then
-			return
+	local function emit(a, b, c, outward, curved, brush, nativeFace, cross)
+		if not cross then
+			cross = (b - a):Cross(c - a)
+			if cross:LengthSqr() < 0.000001 then return end
 		end
+		local faceNormal = cross:GetNormalized()
 		if cross:Dot(outward) > 0 then
 			b, c = c, b
+		else
+			faceNormal = -faceNormal
 		end
-		local faceNormal = (b - a):Cross(c - a):GetNormalized() * -1
-		for _, p in ipairs({ a, b, c }) do
+		local flat = r.bsp and not curved or brush and (brush.seed or brush.floorZ ~= nil or brush.plane)
+		for corner = 1, 3 do
+			local p = corner == 1 and a or corner == 2 and b or c
 			local data = vertexCache[p]
 			if not data then
 				local world = r.origin + p
-				local normal = normalCache[p]
-				if not normal then
-					normal = brush
-							and ((brush.seed or brush.floorZ ~= nil or brush.plane) and faceNormal or (p - brush.center):GetNormalized() * (brush.adding and 1 or -1))
-						or (r.bsp and not curved and faceNormal or V.Normal(r, world))
-					normalCache[p] = normal
-				end
-				data = { world = world, pos = p - chunkOrigin, normal = normal, u = world.x / 128, v = world.y / 128 }
+				data = { world = world, pos = p - chunkOrigin, u = world.x / 128, v = world.y / 128 }
 				vertexCache[p] = data
 			end
-			local world, normal = data.world, data.normal
-			if brush and (brush.seed or brush.floorZ ~= nil or brush.plane) then
-				normal = faceNormal
+			local normal = faceNormal
+			if not flat then
+				-- A vertex can belong to several surfaces with different normals.
+				-- Only the sampled field normal is determined by position alone.
+				if brush then
+					if data.brush ~= brush then
+						data.brush = brush
+						data.brushNormal = (p - brush.center):GetNormalized() * (brush.adding and 1 or -1)
+					end
+					normal = data.brushNormal
+				else
+					normalCache = normalCache or V.TerrainCellCache(r, "smoothNormals", x0, y0, z0)
+					normal = normalCache[p]
+					if not normal then
+						normal = V.Normal(r, data.world)
+						normalCache[p] = normal
+					end
+				end
 			end
 			if r.bsp and curved ~= "density" then
-				if not curved or normal:LengthSqr() < 0.5 then
+				if not flat and normal:LengthSqr() < 0.5 then
 					normal = faceNormal
 				end
 			elseif V.FeatureNormal then
-				normal = V.FeatureNormal(r, world, faceNormal, normal)
+				normal = V.FeatureNormal(r, data.world, faceNormal, normal)
 			end
 			local color = scanColor
 			if light then
@@ -720,13 +818,15 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 				v = v,
 				cell = currentCell,
 				nativeFace = nativeFace,
+				freshCut = corner == 1 and brush ~= nil and not nativeFace or nil,
 			}
 		end
 	end
-	for z = cz * 8, min(cz * 8 + 7, V.RegionCells(r, "z") - 1) do
-		for y = cy * 8, min(cy * 8 + 7, V.RegionCells(r, "y") - 1) do
-			for x = cx * 8, min(cx * 8 + 7, V.RegionCells(r, "x") - 1) do
-				currentCell = V.Index(x, y, z, r)
+	for z = z0, z1 do
+		for y = y0, y1 do
+			local first = V.Index(x0, y, z, r)
+			for x = x0, x1 do
+				currentCell = first + x - x0
 				local cached = cells[currentCell]
 				if cached then
 					for _, vertex in ipairs(cached) do
@@ -746,7 +846,7 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 					-- small edits don't resample every full/empty cell in each chunk.
 					cells[currentCell] = cached
 				end
-				if checkpoint and (x - cx * 8 + 8 * (y - cy * 8) + 64 * (z - cz * 8) + 1) % 32 == 0 then
+				if checkpoint and (x - x0 + 8 * (y - y0) + 1) % 32 == 0 then
 					checkpoint()
 				end
 			end
@@ -755,9 +855,13 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 	return vertices
 end
 function V.ForChunks(callback, r)
-	for z = 0, (r and r.nz or nz) / 8 - 1 do
-		for y = 0, (r and r.ny or ny) / 8 - 1 do
-			for x = 0, (r and r.nx or nx) / 8 - 1 do
+	local cells = r and r.cells
+	local xCount = ceil((cells and cells.x or r and r.nx or nx) / 8)
+	local yCount = ceil((cells and cells.y or r and r.ny or ny) / 8)
+	local zCount = ceil((cells and cells.z or r and r.nz or nz) / 8)
+	for z = 0, zCount - 1 do
+		for y = 0, yCount - 1 do
+			for x = 0, xCount - 1 do
 				callback(x, y, z)
 			end
 		end

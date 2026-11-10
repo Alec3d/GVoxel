@@ -1,7 +1,8 @@
 -- Sky backdrop for eyes excavated into original BSP solid, where Source skips
 -- its sky pass. Geometry/depth of the real scene stays in front of this layer.
 local V = GVoxel
-local materials, nameCache, skyTarget, skyMaterial, skyView, rendering, skySettings
+local materials, nameCache, skyMaterial, skyView, rendering, skySettings
+local skyTargets = {}
 local failed = setmetatable({}, { __mode = "k" })
 local stats = { views = 0, cubes = 0, missing = 0 }
 local sides = {
@@ -132,23 +133,26 @@ function V.VoxelSkyView(r, view)
 end
 function V.PrepareVoxelSky(r, view)
 	local sky = V.VoxelSkyView(r, view)
-	if not sky or rendering then
+	if not sky or rendering or failed[r] then
 		return
 	end
-	if not skyTarget or skyTarget.w ~= view.w or skyTarget.h ~= view.h then
-		local tag = view.w .. "x" .. view.h
+	local w, h = V.BackgroundTargetSize(view.w, view.h)
+	sky.w, sky.h = w, h
+	local skyTarget = skyTargets[w]
+	if not skyTarget then
 		local target = GetRenderTargetEx(
-			"vm_sky3d_hdr_" .. tag,
-			view.w,
-			view.h,
+			"vm_sky3d_hdr_" .. w .. "x" .. h,
+			w,
+			h,
 			RT_SIZE_LITERAL,
 			MATERIAL_RT_DEPTH_SEPARATE,
 			12,
 			0,
 			IMAGE_FORMAT_RGBA16161616F or IMAGE_FORMAT_RGBA8888
 		)
-		skyTarget = { target = target, w = view.w, h = view.h }
-		skyMaterial = CreateMaterial("vm_sky3d_hdr_material_" .. tag, "UnlitGeneric", {
+		skyTarget = { target = target }
+		skyTargets[w] = skyTarget
+		skyMaterial = skyMaterial or CreateMaterial("vm_sky3d_hdr_material_v2", "UnlitGeneric", {
 			["$basetexture"] = target:GetName(),
 			["$nofog"] = "1",
 			["$nocull"] = "1",
@@ -156,13 +160,14 @@ function V.PrepareVoxelSky(r, view)
 		})
 	end
 	local frame = FrameNumber()
-	if failed[r] then
-		return
-	end
+	local camera = r.bsp.sky.camera
+	local forward, right = sky.angles:Forward(), sky.angles:Right()
 	if
 		skyTarget.frame == frame
+		and skyTarget.camera == camera
 		and skyTarget.origin:DistToSqr(sky.origin) < 1e-10
-		and skyTarget.forward:DistToSqr(sky.angles:Forward()) < 1e-10
+		and skyTarget.forward:DistToSqr(forward) < 1e-10
+		and skyTarget.right:DistToSqr(right) < 1e-10
 		and skyTarget.fov == view.fov
 		and skyTarget.aspect == view.aspect
 	then
@@ -174,7 +179,7 @@ function V.PrepareVoxelSky(r, view)
 	local pushed = false
 	rendering = true
 	skyView = sky
-	skySettings = r.bsp.sky.camera
+	skySettings = camera
 	V.RenderingReplacement = true
 	local ok, err = xpcall(function()
 		render.SetToneMappingScaleLinear(Vector(1, tone.y, tone.z))
@@ -200,8 +205,10 @@ function V.PrepareVoxelSky(r, view)
 		return
 	end
 	skyTarget.frame = frame
+	skyTarget.camera = camera
 	skyTarget.origin = sky.origin
-	skyTarget.forward = sky.angles:Forward()
+	skyTarget.forward = forward
+	skyTarget.right = right
 	skyTarget.fov = view.fov
 	skyTarget.aspect = view.aspect
 	stats.views = stats.views + 1

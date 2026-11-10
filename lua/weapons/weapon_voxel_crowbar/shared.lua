@@ -82,45 +82,29 @@ function SWEP:Holster()
 end
 
 if CLIENT then
+	local hudBackground = Color(18, 24, 34, 220)
+	local hudAccent = Color(255, 151, 62)
+	local function binding(command, fallback)
+		return string.upper(input.LookupBinding(command) or fallback)
+	end
+
 	function SWEP:DrawHUD()
 		local region = GVoxel.GetClientScanRegion()
-		local tr = GVoxel.TraceSculptPreview(LocalPlayer(), region, GVoxel.Reach)
-		local valid = tr.VoxelScan
-		local radius = region and GVoxel.ScanBrushRadius(region, self:GetBrushRadius()) or self:GetBrushRadius()
-		local message = valid and GVoxel.L("Gauche : creuser    Droite : ajouter")
-			or GVoxel.L("R court : analyser le BSP    |    R maintenu : dimensions")
-		local custom = GVoxel.CustomBlockEnabled()
-		if custom then
-			message = GVoxel.CustomBlockStatus()
+		local action
+		if GVoxel.CustomBlockEnabled() then
+			action = GVoxel.CustomBlockStatus()
+		elseif region then
+			action = binding("+attack", "Mouse1") .. " / " .. binding("+attack2", "Mouse2")
+				.. "  ·  " .. GVoxel.L("Gauche : creuser    Droite : ajouter")
+		else
+			action = binding("+reload", "R") .. "  ·  " .. GVoxel.L("R court : analyser le BSP    |    R maintenu : dimensions")
 		end
-		local x, y = ScrW() / 2, ScrH() - 140
-		draw.SimpleTextOutlined(
-			message,
-			"Trebuchet24",
-			x,
-			y,
-			Color(255, 235, 205),
-			TEXT_ALIGN_CENTER,
-			TEXT_ALIGN_CENTER,
-			1,
-			Color(0, 0, 0, 220)
-		)
-		local detail = custom and GVoxel.L("Custom block | R maintenu : menu / annuler les points")
-			or GVoxel.L("Zone : ")
-				.. GVoxel.SelectedMetres()
-				.. GVoxel.L(" m de cote    |    Rayon : ")
-				.. radius
-				.. GVoxel.L("    |    Zone partagee")
-		draw.SimpleTextOutlined(
-			detail,
-			"Trebuchet18",
-			x,
-			y + 28,
-			color_white,
-			TEXT_ALIGN_CENTER,
-			TEXT_ALIGN_CENTER,
-			1,
-			Color(0, 0, 0, 220)
-		)
+		local hint = GVoxel.L("Ctrl+H avec l'outil en main")
+		surface.SetFont("Trebuchet18")
+		local w = math.max(surface.GetTextSize(action), surface.GetTextSize(hint)) + 30
+		local x, y = math.max(8, (ScrW() - w) / 2), ScrH() - 109
+		draw.RoundedBox(7, x, y, w, 52, hudBackground)
+		draw.SimpleText(action, "Trebuchet18", x + 15, y + 8, color_white)
+		draw.SimpleText(hint, "Trebuchet18", x + 15, y + 29, hudAccent)
 	end
 end

@@ -1,9 +1,25 @@
 local V = GVoxel
+local extraOwners = V.MeshExtraOwners or setmetatable({}, { __mode = "k" })
+V.MeshExtraOwners = extraOwners
+
+function V.RetainMesh(mesh)
+	if not mesh or not mesh:IsValid() then
+		return
+	end
+	extraOwners[mesh] = (extraOwners[mesh] or 0) + 1
+	return mesh
+end
 
 -- Native meshes outlive Lua references and may already have been released.
 -- Clear ownership before releasing: cancellation and refresh can overlap.
 function V.ReleaseMesh(mesh)
-	if mesh and mesh:IsValid() then
+	if not mesh then
+		return
+	end
+	local owners = extraOwners[mesh]
+	if owners then
+		extraOwners[mesh] = owners > 1 and owners - 1 or nil
+	elseif mesh:IsValid() then
 		mesh:Destroy()
 	end
 end
@@ -18,9 +34,12 @@ function V.ReleaseChunkMeshes(chunk)
 	for _, batch in ipairs(batches or {}) do
 		local object = batch.mesh
 		batch.mesh = nil
+		if mesh == object then
+			mesh = nil
+		end
 		V.ReleaseMesh(object)
 	end
-	-- chunk.mesh usually aliases the first batch. IsValid avoids a double free.
+	-- chunk.mesh is normally an alias, not another owner of the first batch.
 	V.ReleaseMesh(mesh)
 end
 

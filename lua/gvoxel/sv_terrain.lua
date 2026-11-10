@@ -42,7 +42,9 @@ concommand.Add("vm_give", function(ply)
 	if not V.CanEdit(ply, V.GetServerScanRegion and V.GetServerScanRegion()) then
 		return
 	end
-	ply:Give("weapon_voxel_crowbar")
+	if not ply:HasWeapon("weapon_voxel_crowbar") then
+		ply:Give("weapon_voxel_crowbar")
+	end
 	ply:SelectWeapon("weapon_voxel_crowbar")
 end)
 concommand.Add("vm_clear", function(ply)

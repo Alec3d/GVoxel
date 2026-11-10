@@ -1,6 +1,6 @@
 local V=GVoxel
 local panels=setmetatable({},{__mode="k"})
-local languagePanels=setmetatable({},{__mode="k"})
+local savedWindow
 local entries={}
 local function refresh()
     net.Start("vm_zones_list") net.SendToServer()
@@ -36,18 +36,15 @@ end)
 local function buildZones(panel)
     local oldName=IsValid(panel.ZoneName) and panel.ZoneName:GetValue() or ""
     local row=IsValid(panel.ZoneList) and panel.ZoneList:GetSelectedLine()
-    panel.LanguageSelection=row and panel.ZoneList:GetLine(row).Zone
+    local line=row and panel.ZoneList:GetLine(row)
+    panel.LanguageSelection=line and line.Zone
     panels[panel]=true
-    if not IsValid(LocalPlayer()) or not LocalPlayer():IsAdmin() then
-        panel:ClearControls() panel.ZoneList=nil panel.ZoneName=nil panel.Think=nil
+    panel:Clear()
+    local ply=LocalPlayer()
+    if not IsValid(ply) or not ply:IsAdmin() then
+        panel.ZoneList=nil panel.ZoneName=nil panel.Think=nil
         panel:Help(V.L("Outils reserves aux administrateurs.")) return
     end
-    panel:ClearControls()
-    panel:Help(V.L("Une seule zone par map. Calcul et sauvegarde automatiques, puis restauration aux parties suivantes. Outils reserves aux administrateurs."))
-    panel:Button(V.L("Obtenir l'outil de selection"),"vm_give")
-    panel:Button(V.L("Dimensions / boite personnalisee"),"vm_menu")
-    panel:Button(V.L("Analyser une nouvelle zone (R court)"),"vm_scan")
-    panel:Help(V.L("Viser avec l'outil, fermer le menu puis appuyer sur R pour creer une zone. Creuser / ajouter : clic gauche / droit."))
     local list=vgui.Create("DListView",panel)
     list:SetTall(180) list:AddColumn(V.L("Zone")) list:AddColumn(V.L("Etat"))
     panel:AddItem(list) panel.ZoneList=list
@@ -55,7 +52,11 @@ local function buildZones(panel)
     panel.ZoneName=name
     name:SetPlaceholderText(V.L("Nom de la sauvegarde")) panel:AddItem(name)
     name:SetText(oldName)
-    local function selected() local row=list:GetSelectedLine() return row and list:GetLine(row).Zone end
+    local function selected()
+        local row=list:GetSelectedLine()
+        local line=row and list:GetLine(row)
+        return line and line.Zone
+    end
     list.OnRowSelected=function(_,_,line) name:SetText(line.Zone.name) end
     local function action(label,kind,needsKey)
         local button=vgui.Create("DButton",panel) button:SetText(label) panel:AddItem(button)
@@ -82,32 +83,37 @@ local function buildZones(panel)
         if self:IsVisible() and RealTime()>=nextPoll then nextPoll=RealTime()+2 refresh() end
     end
 end
-local function buildLanguage(panel)
-    languagePanels[panel]=true
-    panel:ClearControls()
-    panel:Help(V.L("Choose your language. Changes apply immediately."))
-    local choice=vgui.Create("DComboBox",panel)
-    choice:SetTall(28)
-    for _,option in ipairs(V.LanguageOptions) do
-        choice:AddChoice(option[2],option[1],option[1]==V.GetLanguage())
+function V.OpenSavedZones()
+    if not V.GetActiveVoxelTool() then return end
+    if IsValid(savedWindow) then savedWindow:MakePopup() return end
+    local frame = vgui.Create("DFrame")
+    savedWindow = frame
+    frame:SetSize(math.min(465, ScrW() - 16), 440)
+    frame:Center()
+    frame:SetTitle(V.L("Zones sauvegardees"))
+    frame:MakePopup()
+    frame.Think = function(self)
+        if not V.GetActiveVoxelTool() then self:Close() end
     end
-    choice.OnSelect=function(_,_,_,code)
-        RunConsoleCommand("gvoxel_language",V.ValidLanguage(code))
-    end
-    panel:AddItem(choice)
+    local panel = vgui.Create("DForm", frame)
+    panel:Dock(FILL)
+    panel:SetName("")
+    buildZones(panel)
+    refresh()
 end
-hook.Add("GVoxel.LanguageChanged","GVoxel.UtilitiesLanguage",function()
+
+hook.Add("GVoxel.LanguageChanged", "GVoxel.UtilitiesLanguage", function()
+    if IsValid(savedWindow) then savedWindow:SetTitle(V.L("Zones sauvegardees")) end
     for panel in pairs(panels) do
         if IsValid(panel) then buildZones(panel) end
     end
-    for panel in pairs(languagePanels) do
-        if IsValid(panel) then buildLanguage(panel) end
-    end
 end)
-hook.Add("PopulateToolMenu","GVoxel.UtilitiesZones",function()
-    spawnmenu.AddToolMenuOption("Utilities","GVoxel","GVoxelLanguage","#gvoxel.language","","",buildLanguage)
-    spawnmenu.AddToolMenuOption("Utilities","GVoxel","GVoxelZones","#gvoxel.zones","","",function(panel)
-        buildZones(panel)
-        if IsValid(LocalPlayer()) and LocalPlayer():IsAdmin() then refresh() end
+
+hook.Add("PopulateToolMenu", "GVoxel.UtilitiesZones", function()
+    spawnmenu.AddToolMenuOption("Utilities", "GVoxel", "GVoxelZones", "#gvoxel.zones", "", "", function(panel)
+        panel:Help(V.L("Ctrl+H avec l'outil en main"))
+        if LocalPlayer():IsAdmin() then
+            panel:Button(V.L("Nouvelle zone"), "vm_give")
+        end
     end)
 end)

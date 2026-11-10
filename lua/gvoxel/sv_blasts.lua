@@ -4,11 +4,14 @@ local V=GVoxel
 if V.ReleaseGenericBlasts then V.ReleaseGenericBlasts() end
 local enabled=CreateConVar("vm_blast_enabled","1",FCVAR_ARCHIVE,"Explosions generiques sur les zones voxel",0,1)
 local gain=CreateConVar("vm_blast_scale","1",FCVAR_ARCHIVE,"Echelle du creusement par degats d'explosion",0.1,3)
-local state={active=true,depth=0,installed={},recent={}}
+local state={active=true,installed={}}
+local recent,newest,cursor={},{},1
+local nilSource={}
 local sequence=0
 local untyped=setmetatable({}, {__mode="k"})
+local blastFlags=bit.bor(DMG_BLAST or 64,DMG_BLAST_SURFACE or 134217728)
 local function explosive(damage)
-    return damage:IsExplosionDamage() or (damage.GetDamageType and bit.band(damage:GetDamageType(),bit.bor(DMG_BLAST or 64,DMG_BLAST_SURFACE or 134217728))~=0)
+    return damage:IsExplosionDamage() or (damage.GetDamageType and bit.band(damage:GetDamageType(),blastFlags)~=0)
 end
 local known={rpg_missile=true,npc_satchel=true,npc_tripmine=true,glide_projectile=true,glide_missile=true}
 local function finite(n) return type(n)=="number" and n==n and math.abs(n)<1e12 end
@@ -18,26 +21,42 @@ function V.BlastCraterRadius(damage,radius,scale)
     if finite(radius) and radius>0 then size=math.min(size,radius) end
     return math.Clamp(math.floor(size+0.5),8,512)
 end
-local function observe(inflictor,attacker,position,radius,damage,deduplicate)
-    if not state.active or not enabled:GetBool() or not position
-        or not finite(position.x) or not finite(position.y) or not finite(position.z) then return end
-    if IsValid(inflictor) and known[inflictor:GetClass()] then return end
-    local size=V.BlastCraterRadius(damage,radius,gain:GetFloat())
-    if not size then return end
+local function validPosition(position)
+    return position and finite(position.x) and finite(position.y) and finite(position.z)
+end
+local function repeated(inflictor,position,deduplicate)
     local scope=deduplicate and state.current or state.current and state.current.parent
     while scope do
-        if scope.source==inflictor and scope.pos and scope.pos:DistToSqr(position)<16 then return end
+        if scope.source==inflictor and scope.pos and scope.pos:DistToSqr(position)<16 then return true end
         scope=scope.parent
     end
-    if not deduplicate and state.current then state.current.source=inflictor state.current.pos=position end
+    if not deduplicate then return false end
+    local key=inflictor==nil and nilSource or inflictor
+    local last=newest[key]
+    if not last then return false end
     local now=CurTime()
-    if deduplicate then
-        for _,event in ipairs(state.recent) do
-            if event.source==inflictor and now-event.time<=0.05 and event.pos:DistToSqr(position)<16 then return end
-        end
+    if now-last.time<=0.05 and last.pos:DistToSqr(position)<16 then return true end
+    -- A reusable inflictor can trigger two blasts at distinct positions in
+    -- one tick. Check older retained positions when its latest one misses.
+    for _,event in ipairs(recent) do
+        if event~=last and event.key==key and now-event.time<=0.05 and event.pos:DistToSqr(position)<16 then return true end
     end
-    state.recent[#state.recent+1]={source=inflictor,pos=Vector(position.x,position.y,position.z),time=now}
-    if #state.recent>64 then table.remove(state.recent,1) end
+    return false,now
+end
+local function dispatch(inflictor,attacker,position,radius,damage,now,deduplicate)
+    local size=V.BlastCraterRadius(damage,radius,gain:GetFloat())
+    if not size then return end
+    if not deduplicate and state.current then state.current.source=inflictor state.current.pos=position end
+    local key=inflictor==nil and nilSource or inflictor
+    local event=recent[cursor]
+    if not event then
+        event={} recent[cursor]=event
+    elseif newest[event.key]==event then
+        newest[event.key]=nil
+    end
+    event.key,event.pos,event.time=key,Vector(position.x,position.y,position.z),now or CurTime()
+    newest[key]=event
+    cursor=cursor%64+1
     local system=not (IsValid(attacker) and attacker.IsPlayer and attacker:IsPlayer())
     local records=V.GetScanSessions and V.GetScanSessions() or {}
     for id,scan in pairs(records) do
@@ -47,21 +66,26 @@ local function observe(inflictor,attacker,position,radius,damage,deduplicate)
         end
     end
 end
+local function observe(inflictor,attacker,position,radius,damage,deduplicate)
+    if not state.active or not enabled:GetBool() or not validPosition(position) then return end
+    if IsValid(inflictor) and known[inflictor:GetClass()] then return end
+    local duplicate,now=repeated(inflictor,position,deduplicate)
+    if not duplicate then
+        dispatch(inflictor,attacker,position,radius,damage,now,deduplicate)
+    end
+end
 V.ObserveVoxelBlast=observe
 local function pack(...) return {n=select("#",...),...} end
 local function install(name,decode)
     local original=util[name]
     if type(original)~="function" then return end
     local wrapper=function(...)
+        if not state.active then return original(...) end
         local scope={parent=state.current}
         state.current=scope
-        if state.active then
-            local ok,err=pcall(decode,...)
-            if not ok then ErrorNoHalt("[GVoxel] Analyse explosion : "..tostring(err).."\n") end
-        end
-        state.depth=state.depth+1
+        local ok,err=pcall(decode,...)
+        if not ok then ErrorNoHalt("[GVoxel] Analyse explosion : "..tostring(err).."\n") end
         local result=pack(pcall(original,...))
-        state.depth=state.depth-1
         state.current=scope.parent
         if not result[1] then error(result[2],0) end
         return unpack(result,2,result.n)
@@ -70,7 +94,7 @@ local function install(name,decode)
     util[name]=wrapper
 end
 install("BlastDamage",function(inflictor,attacker,position,radius,damage,damageType)
-    if damageType and bit.band(damageType,bit.bor(DMG_BLAST or 64,DMG_BLAST_SURFACE or 134217728))==0 then return end
+    if damageType and bit.band(damageType,blastFlags)==0 then return end
     observe(inflictor,attacker,position,radius,damage,false)
 end)
 install("BlastDamageInfo",function(damage,position,radius)
@@ -82,30 +106,41 @@ hook.Add("EntityTakeDamage","GVoxel.GenericBlast",function(victim,damage)
         -- Some scripted bombs omit DMG_BLAST. Require a genuine multi-victim
         -- damage area from a non-weapon entity; a large bullet is not a blast.
         local source=damage:GetInflictor()
-        if not IsValid(source) or source:IsWorld() or source==damage:GetAttacker()
-            or source.IsWeapon and source:IsWeapon() or damage:GetDamage()<40 then return end
+        if not IsValid(source) or source:IsWorld() or source.IsWeapon and source:IsWeapon() then return end
+        local attacker=damage:GetAttacker()
+        if source==attacker then return end
+        local amount=damage:GetDamage()
+        if amount<40 then return end
         local now=CurTime()
         local event=untyped[source]
         if not event or now-event.time>0.05 then
-            untyped[source]={time=now,victim=victim,damage=damage:GetDamage(),pos=source:GetPos()}
+            untyped[source]={time=now,victim=victim,damage=amount,pos=source:GetPos()}
         elseif event.victim~=victim and not event.sent then
             event.sent=true
-            observe(source,damage:GetAttacker(),event.pos,nil,math.max(event.damage,damage:GetDamage()),true)
+            observe(source,attacker,event.pos,nil,math.max(event.damage,amount),true)
         end
         return
     end
     local inflictor=damage:GetInflictor()
     local position
-    if IsValid(inflictor) and not (inflictor.IsWeapon and inflictor:IsWeapon()) and not inflictor:IsWorld() then
+    local valid=IsValid(inflictor)
+    if valid and known[inflictor:GetClass()] then return end
+    if valid and not (inflictor.IsWeapon and inflictor:IsWeapon()) and not inflictor:IsWorld() then
         position=inflictor:GetPos()
     else
         position=damage.GetReportedPosition and damage:GetReportedPosition()
         if not position or position:LengthSqr()==0 then position=damage:GetDamagePosition() end
     end
-    observe(inflictor,damage:GetAttacker(),position,nil,damage:GetDamage(),true)
+    if not validPosition(position) then return end
+    local duplicate,now=repeated(inflictor,position,true)
+    if not duplicate then
+        dispatch(inflictor,damage:GetAttacker(),position,nil,damage:GetDamage(),now,true)
+    end
 end)
 hook.Add("AcceptInput","GVoxel.GenericExplosionInput",function(ent,input)
-    if input:lower()~="explode" or (ent:GetClass()~="env_explosion" and ent:GetClass()~="env_physexplosion") then return end
+    if input:lower()~="explode" then return end
+    local class=ent:GetClass()
+    if class~="env_explosion" and class~="env_physexplosion" then return end
     local inflictor=ent:GetInternalVariable("m_hInflictor")
     local damage=tonumber(ent:GetInternalVariable("m_iMagnitude")) or tonumber(ent:GetInternalVariable("m_magnitude")) or 100
     local radius=tonumber(ent:GetInternalVariable("m_iRadiusOverride")) or tonumber(ent:GetInternalVariable("m_radius"))
@@ -119,9 +154,16 @@ hook.Add("EntityEmitSound","GVoxel.FragExplosion",function(data)
     local damage=ent.GetInternalVariable and tonumber(ent:GetInternalVariable("m_flDamage")) or 100
     observe(ent,attacker,ent:GetPos(),nil,damage or 100,true)
 end)
+local function clearRecent()
+    recent,newest,cursor={},{},1
+    untyped=setmetatable({}, {__mode="k"})
+end
 function V.ReleaseGenericBlasts()
+    if not state.active then return end
     state.active=false
     for _,entry in ipairs(state.installed) do if util[entry.name]==entry.wrapper then util[entry.name]=entry.original end end
+    state.installed={}
+    clearRecent()
 end
-hook.Add("PostCleanupMap","GVoxel.ClearGenericBlasts",function() state.recent={} untyped=setmetatable({}, {__mode="k"}) end)
+hook.Add("PostCleanupMap","GVoxel.ClearGenericBlasts",clearRecent)
 hook.Add("ShutDown","GVoxel.ReleaseGenericBlasts",V.ReleaseGenericBlasts)

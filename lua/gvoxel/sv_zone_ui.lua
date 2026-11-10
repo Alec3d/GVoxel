@@ -1,7 +1,8 @@
 local V=GVoxel
 util.AddNetworkString("vm_zones_list")
 util.AddNetworkString("vm_zones_action")
-local function sendList(ply)
+function V.SendZoneLibrary(ply)
+    if not V.CanManageScan(ply) then return end
     local entries={}
     for id,scan in pairs(V.GetScanSessions()) do
         entries[#entries+1]={id=id,name=scan.displayName or ("Zone "..id),key=scan.savedKey or "",
@@ -23,7 +24,7 @@ local function sendList(ply)
 end
 net.Receive("vm_zones_list",function(_,ply)
     if not V.CanManageScan(ply) or (ply.VMZoneNextList or 0)>CurTime() then return end
-    ply.VMZoneNextList=CurTime()+0.5 sendList(ply)
+    ply.VMZoneNextList=CurTime()+0.5 V.SendZoneLibrary(ply)
 end)
 net.Receive("vm_zones_action",function(length,ply)
     if length>2048 or not V.CanManageScan(ply) or (ply.VMZoneNextAction or 0)>CurTime() then return end
@@ -34,5 +35,5 @@ net.Receive("vm_zones_action",function(length,ply)
     if #key>80 or #name>64 then return end
     local ok,err=V.ZoneLibraryAction(ply,action,id,key,name)
     if not ok then V.Notify(ply,err or "Action refusee ; verifier que la zone est libre.") end
-    sendList(ply)
+    if action~="load" or not ok then V.SendZoneLibrary(ply) end
 end)

@@ -4,16 +4,25 @@ local V = GVoxel
 local axes = { "x", "y", "z" }
 local basis = { Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1) }
 local EPS = 0.00001
-local emptySolids = {}
+local emptySolids, originalMixedPending = {}, {}
+local function boxPlane(planes, i, cell, step)
+	local slices = planes[i]
+	local plane = slices[cell]
+	if not plane then
+		plane = { n = basis[i], low = cell * step, high = (cell + 1) * step }
+		slices[cell] = plane
+	end
+	return plane
+end
 local function boxHull(r, x, y, z)
 	local step = r.step
-	return {
-		{
-			{ n = basis[1], low = x * step, high = (x + 1) * step },
-			{ n = basis[2], low = y * step, high = (y + 1) * step },
-			{ n = basis[3], low = z * step, high = (z + 1) * step },
-		},
-	}
+	-- All full cells on the same slice use the same immutable interval.
+	local planes = r.collisionBoxPlanes
+	if not planes or planes.step ~= step then
+		planes = { {}, {}, {}, step = step }
+		r.collisionBoxPlanes = planes
+	end
+	return { { boxPlane(planes, 1, x, step), boxPlane(planes, 2, y, step), boxPlane(planes, 3, z, step) } }
 end
 local function topology(points, normals)
 	return { points = points, normals = normals }
@@ -38,6 +47,9 @@ local cubeEdges = {
 local function planarCell(r, x, y, z, points, densities)
 	local normal, distance, valid = nil, nil, true
 	V.ForCellTriangles(r, x, y, z, function(a, b, c, outward)
+		if not valid then
+			return
+		end
 		local n = (b - a):Cross(c - a):GetNormalized()
 		if n:Dot(outward) < 0 then
 			n = -n
@@ -80,16 +92,25 @@ local function planarCell(r, x, y, z, points, densities)
 	return topology(vertices, { basis[1], basis[2], basis[3], normal })
 end
 
-local function polytope(points, normals, edges, checkpoint)
-	local planes = {}
-	-- Native Vector component reads cross into the engine. Extract each
-	-- vertex once, instead of once per SAT axis, retaining the same doubles.
+local edgeDelta = Vector()
+local function polytope(points, normals, edges, checkpoint, indexedEdges)
+	-- Read each Source vertex once. The three mandatory world axes
+	-- are already normalized and need no duplicate search or projections.
 	local coordinates = {}
-	for _, p in ipairs(points) do
-		coordinates[#coordinates + 1] = p.x
-		coordinates[#coordinates + 1] = p.y
-		coordinates[#coordinates + 1] = p.z
+	local lowX, lowY, lowZ = math.huge, math.huge, math.huge
+	local highX, highY, highZ = -math.huge, -math.huge, -math.huge
+	for i, p in ipairs(points) do
+		local x, y, z = p.x, p.y, p.z
+		local index = (i - 1) * 3
+		coordinates[index + 1], coordinates[index + 2], coordinates[index + 3] = x, y, z
+		lowX, lowY, lowZ = math.min(lowX, x), math.min(lowY, y), math.min(lowZ, z)
+		highX, highY, highZ = math.max(highX, x), math.max(highY, y), math.max(highZ, z)
 	end
+	local planes = {
+		{ n = basis[1], low = lowX, high = highX },
+		{ n = basis[2], low = lowY, high = highY },
+		{ n = basis[3], low = lowZ, high = highZ },
+	}
 	local nx, ny, nz = {}, {}, {}
 	local function addAxis(x, y, z)
 		local length = x * x + y * y + z * z
@@ -98,6 +119,9 @@ local function polytope(points, normals, edges, checkpoint)
 		end
 		length = math.sqrt(length)
 		x, y, z = x / length, y / length, z / length
+		if math.abs(x) > 0.9999999 or math.abs(y) > 0.9999999 or math.abs(z) > 0.9999999 then
+			return
+		end
 		for i = 1, #nx do
 			if math.abs(nx[i] * x + ny[i] * y + nz[i] * z) > 0.9999999 then
 				return
@@ -118,20 +142,28 @@ local function polytope(points, normals, edges, checkpoint)
 	local function edgeAxes(x, y, z)
 		-- Cross with the three AABB basis vectors, without allocating six
 		-- temporary Source vectors per edge (cross + normalized copy).
-		addAxis(0, z, -y)
-		addAxis(-z, 0, x)
-		addAxis(y, -x, 0)
+		-- A cross with a world basis is redundant unless the edge
+		-- has both components perpendicular to that basis.
+		if y ~= 0 and z ~= 0 then addAxis(0, z, -y) end
+		if x ~= 0 and z ~= 0 then addAxis(-z, 0, x) end
+		if x ~= 0 and y ~= 0 then addAxis(y, -x, 0) end
 	end
-	addAxis(1, 0, 0)
-	addAxis(0, 1, 0)
-	addAxis(0, 0, 1)
 	if normals == basis then
 		return planes
 	end
 	for _, n in ipairs(normals) do
 		addAxis(n.x, n.y, n.z)
 	end
-	if edges then
+	if indexedEdges then
+		for i = 1, #edges, 2 do
+			-- Retain Source's float subtraction without allocating one
+			-- Vector per edge. Nothing yields while the scratch is live.
+			edgeDelta:Set(points[edges[i + 1]])
+			edgeDelta:Sub(points[edges[i]])
+			edgeAxes(edgeDelta.x, edgeDelta.y, edgeDelta.z)
+			if checkpoint and i % 16 == 15 then checkpoint() end
+		end
+	elseif edges then
 		for i, edge in ipairs(edges) do
 			edgeAxes(edge.x, edge.y, edge.z)
 			if checkpoint and i % 8 == 0 then
@@ -153,9 +185,11 @@ end
 -- renderer's diagonal and creates an invisible bulge. Tetrahedralize its actual
 -- triangulated boundary instead; shared grid faces use a deterministic fan.
 local function refinedSolids(r, p, d, vertices, out, adjustments)
-	local center = Vector()
+	local center, delta = Vector(), Vector()
 	for _, point in ipairs(vertices) do
-		center = center + point / #vertices
+		delta:Set(point)
+		delta:Div(#vertices)
+		center:Add(delta)
 	end
 	local nodes, edges = {}, {}, {}
 	for i = 1, 4 do
@@ -183,11 +217,12 @@ local function refinedSolids(r, p, d, vertices, out, adjustments)
 	end
 	local function triangle(a, b, c)
 		local ab, ac, ad = b - a, c - a, center - a
-		if math.abs(ab:Cross(ac):Dot(ad)) < 0.00000001 then
+		local abc = ab:Cross(ac)
+		if math.abs(abc:Dot(ad)) < 0.00000001 then
 			return
 		end
 		local points = { a, b, c, center }
-		out[#out + 1] = topology(points, { ab:Cross(ac), ab:Cross(ad), ac:Cross(ad), (c - b):Cross(center - b) })
+		out[#out + 1] = topology(points, { abc, ab:Cross(ad), ac:Cross(ad), (c - b):Cross(center - b) })
 	end
 	for _, face in ipairs({ { 1, 2, 3 }, { 1, 2, 4 }, { 1, 3, 4 }, { 2, 3, 4 } }) do
 		local polygon = {}
@@ -238,11 +273,20 @@ function V.DensityCellGeometry(r, x, y, z)
 	if cached then
 		return cached
 	end
-	local points, densities = {}, {}
+	local points, densities, indices = {}, {}, {}
 	local negative, positive = false, false
+	-- Scalar vector multiplication rounds the step to float before use.
+	-- Capture that step once, and construct the same lattice points directly.
+	local step = r.densityVectorStep
+	if not step then
+		step = Vector(r.step, 0, 0).x
+		r.densityVectorStep = step
+	end
 	for i, o in ipairs(V.CellOffsets) do
-		points[i] = Vector(x + o[1], y + o[2], z + o[3]) * r.step
-		local d = V.Sample(r, x + o[1], y + o[2], z + o[3])
+		local px, py, pz = x + o[1], y + o[2], z + o[3]
+		points[i] = Vector(px * step, py * step, pz * step)
+		indices[i] = V.Index(px, py, pz, r)
+		local d = V.Sample(r, px, py, pz)
 		densities[i] = d
 		if d < 0 then
 			negative = true
@@ -260,6 +304,7 @@ function V.DensityCellGeometry(r, x, y, z)
 			cache[key] = { plane }
 			return cache[key]
 		end
+		local edges = V.TerrainCellCache(r, "densityEdges", x, y, z)
 		for _, tet in ipairs(V.CellTetrahedra) do
 			local p, d = {}, {}
 			local hasSolid = false
@@ -280,23 +325,20 @@ function V.DensityCellGeometry(r, x, y, z)
 				for i = 1, 3 do
 					for j = i + 1, 4 do
 						if (d[i] < 0 and d[j] > 0) or (d[j] < 0 and d[i] > 0) then
-							local point = p[i] + (p[j] - p[i]) * (d[i] / (d[i] - d[j]))
-							local adjusted = V.RefineSurfacePoint and V.RefineSurfacePoint(r, point) or point
-							if point:DistToSqr(adjusted) > 0.00000001 then
-								refined = true
-							end
+							local adjusted, moved = V.DensityEdgePoint(r, edges, indices[tet[i]], indices[tet[j]], p[i], p[j], d[i], d[j])
+							refined = refined or moved
 							vertices[#vertices + 1] = adjusted
 							adjustments[i * 4 + j] = adjusted
 						end
 					end
 				end
-				local a, b, c = p[2] - p[1], p[3] - p[1], p[4] - p[1]
-				local gradient = (b:Cross(c) * (d[2] - d[1]) + c:Cross(a) * (d[3] - d[1]) + a:Cross(b) * (d[4] - d[1]))
-					/ a:Dot(b:Cross(c))
-				local normals = { a:Cross(b), b:Cross(c), c:Cross(a), (p[3] - p[2]):Cross(p[4] - p[2]), gradient }
 				if refined then
 					refinedSolids(r, p, d, vertices, cached, adjustments)
 				else
+					local a, b, c = p[2] - p[1], p[3] - p[1], p[4] - p[1]
+					local ab, bc, ca = a:Cross(b), b:Cross(c), c:Cross(a)
+					local gradient = (bc * (d[2] - d[1]) + ca * (d[3] - d[1]) + ab * (d[4] - d[1])) / a:Dot(bc)
+					local normals = { ab, bc, ca, (p[3] - p[2]):Cross(p[4] - p[2]), gradient }
 					cached[#cached + 1] = topology(vertices, normals)
 				end
 			end
@@ -309,8 +351,12 @@ end
 -- Geometry needs supporting face planes, never the extra edge x AABB axes
 -- required by swept player collision. Those axes are prepared separately.
 function V.DensityCellPlanes(r, x, y, z)
+	local geometry = V.DensityCellGeometry(r, x, y, z)
+	if geometry.planes then
+		return geometry.planes
+	end
 	local result = {}
-	for _, shape in ipairs(V.DensityCellGeometry(r, x, y, z)) do
+	for _, shape in ipairs(geometry) do
 		if not shape.planes then
 			local planes = {}
 			for _, n in ipairs(shape.normals) do
@@ -330,7 +376,7 @@ function V.DensityCellPlanes(r, x, y, z)
 							low = math.min(low, d)
 							high = math.max(high, d)
 						end
-						planes[#planes + 1] = { n = n, low = low, high = high }
+						planes[#planes + 1] = { n = n, opposite = -n, low = low, high = high }
 					end
 				end
 			end
@@ -338,6 +384,7 @@ function V.DensityCellPlanes(r, x, y, z)
 		end
 		result[#result + 1] = shape.planes
 	end
+	geometry.planes = result
 	return result
 end
 
@@ -345,13 +392,18 @@ function V.BSPPieceHull(piece, checkpoint)
 	if piece.voxelHull then
 		return piece.voxelHull
 	end
-	local vertices, normals, seen, edges, seenEdges = {}, {}, {}, {}, {}
+	local vertices, normals, seen, edges, seenEdges = piece.points or {}, {}, {}, {}, {}
+	for i, p in ipairs(vertices) do
+		seen[p] = i
+	end
 	for _, face in ipairs(piece.faces) do
 		normals[#normals + 1] = face.normal
-		for _, p in ipairs(face.vertices) do
-			if not seen[p] then
-				vertices[#vertices + 1] = p
-				seen[p] = #vertices
+		if not piece.points then
+			for _, p in ipairs(face.vertices) do
+				if not seen[p] then
+					vertices[#vertices + 1] = p
+					seen[p] = #vertices
+				end
 			end
 		end
 		for i, p in ipairs(face.vertices) do
@@ -363,60 +415,72 @@ function V.BSPPieceHull(piece, checkpoint)
 			local key = high * (high - 1) / 2 + low
 			if not seenEdges[key] then
 				seenEdges[key] = true
-				edges[#edges + 1] = q - p
+				local edge = #edges
+				edges[edge + 1], edges[edge + 2] = seen[p], seen[q]
 			end
 		end
 	end
-	piece.voxelHull = polytope(vertices, normals, edges, checkpoint)
+	piece.voxelHull = polytope(vertices, normals, edges, checkpoint, true)
 	return piece.voxelHull
 end
 
-local function cellSolids(r, x, y, z, checkpoint)
-	if not V.ActiveRegionCell(r, x, y, z) then
-		return emptySolids
+local function densityOccupancy(r, x, y, z)
+	local solid, air = false, false
+	for _, o in ipairs(V.CellOffsets) do
+		local d = V.Sample(r, x + o[1], y + o[2], z + o[3])
+		if d < 0 then
+			solid = true
+		elseif d > 0 then
+			air = true
+		end
+		if solid and air then return 3 end
 	end
-	local cache, key = V.TerrainCellCache(r, "hulls", x, y, z)
-	if cache[key] then
-		return cache[key]
-	end
+	return solid and 1 or 2
+end
+
+local cellSolids
+local function buildCellSolids(r, x, y, z, key, checkpoint, prepare)
 	local unedited = r.bsp and r.bspCellEditBins and not r.bspCellEditBins[key]
 	if not r.bsp then
-		local solid, air = false, false
-		for _, o in ipairs(V.CellOffsets) do
-			local d = V.Sample(r, x + o[1], y + o[2], z + o[3])
-			if d < 0 then
-				solid = true
-			elseif d > 0 then
-				air = true
-			end
-		end
-		if not solid then
-			cache[key] = emptySolids
-			return emptySolids
-		end
-		if not air then
-			cache[key] = boxHull(r, x, y, z)
-			return cache[key]
-		end
-	elseif unedited and not V.BSPCellUsesDensity(r, x, y, z) then
+		local occupancy = densityOccupancy(r, x, y, z)
+		if occupancy == 2 then return emptySolids end
+		if occupancy == 1 then return boxHull(r, x, y, z) end
+	end
+
+	local usesDensity = unedited and V.BSPCellUsesDensity(r, x, y, z)
+	if unedited and not usesDensity then
 		local occupancy = V.BSPCellOccupancy(r, x, y, z, checkpoint)
 		if occupancy == 2 then
-			cache[key] = emptySolids
 			return emptySolids
 		end
 		if occupancy == 1 then
-			cache[key] = boxHull(r, x, y, z)
-			return cache[key]
+			return boxHull(r, x, y, z)
+		end
+		-- Untouched distant architecture remains native until a voxel
+		-- query reaches it. Record its exact occupancy now, and build
+		-- the original convex hulls at most once on that first query.
+		if prepare and r.revision == 0 and not V.BSPCollisionNearFocus(r, x, y, z) then
+			return originalMixedPending
 		end
 	end
-	local cached = {}
-	if unedited and V.BSPCellUsesDensity(r, x, y, z) and not V.BSPCellHasDetail(r, x, y, z) then
+	if usesDensity and not V.BSPCellHasDetail(r, x, y, z) then
 		-- Unedited displacement cells already have the exact density shape.
 		-- Avoid converting it to BSP faces and back into the same SAT axes.
-		cached = cellSolids(V.BSPDensityBase(r), x, y, z, checkpoint)
-	elseif r.bsp then
-		for _, piece in ipairs(V.BSPCellSolids(r, x, y, z, checkpoint)) do
-			cached[#cached + 1] = V.BSPPieceHull(piece, checkpoint)
+		local base = V.BSPDensityBase(r)
+		-- Relief fragments reuse original density geometry when edited. Keep
+		-- a wider warm band so medium/large craters need fewer cold pieces.
+		if prepare and r.revision == 0 and not V.BSPCollisionNearFocus(r, x, y, z, 240) then
+			local occupancy = densityOccupancy(base, x, y, z)
+			if occupancy == 2 then return emptySolids end
+			if occupancy == 1 then return boxHull(r, x, y, z) end
+			return originalMixedPending
+		end
+		return cellSolids(base, x, y, z, checkpoint)
+	end
+	local solids = {}
+	if r.bsp then
+		for _, piece in ipairs(V.BSPCellSolids(r, x, y, z, checkpoint, unedited and not usesDensity)) do
+			solids[#solids + 1] = V.BSPPieceHull(piece, checkpoint)
 			if checkpoint then
 				checkpoint()
 			end
@@ -424,14 +488,26 @@ local function cellSolids(r, x, y, z, checkpoint)
 	else
 		local geometry = V.DensityCellGeometry(r, x, y, z)
 		for i, shape in ipairs(geometry) do
-			cached[#cached + 1] = polytope(shape.points, shape.normals, nil, checkpoint)
+			solids[#solids + 1] = polytope(shape.points, shape.normals, nil, checkpoint)
 			if checkpoint and (i % 4 == 0 or i == #geometry) then
 				checkpoint()
 			end
 		end
 	end
-	cache[key] = cached
-	return cached
+	return solids
+end
+
+cellSolids = function(r, x, y, z, checkpoint)
+	if not V.ActiveRegionCell(r, x, y, z) then
+		return emptySolids
+	end
+	local cache, key = V.TerrainCellCache(r, "hulls", x, y, z)
+	local solids = cache[key]
+	if not solids or solids == originalMixedPending then
+		solids = buildCellSolids(r, x, y, z, key, checkpoint)
+		cache[key] = solids
+	end
+	return solids
 end
 V.DensityCellSolids = cellSolids
 
@@ -465,21 +541,29 @@ end
 -- Run during the initial scan, with a yielding checkpoint. Later movement
 -- queries reuse these immutable cell hulls instead of clipping cold geometry.
 function V.PrepareCollisionChunk(r, cx, cy, cz, checkpoint)
-	if not V.ActiveRegionCell(r, cx * 8, cy * 8, cz * 8) then
+	local x0, y0, z0 = cx * 8, cy * 8, cz * 8
+	if not V.ActiveRegionCell(r, x0, y0, z0) then
 		return
 	end
-	local cells = V.TerrainCellCache(r, "hulls", cx * 8, cy * 8, cz * 8)
-	for z = cz * 8, math.min(cz * 8 + 7, V.RegionCells(r, "z") - 1) do
-		for y = cy * 8, math.min(cy * 8 + 7, V.RegionCells(r, "y") - 1) do
-			for x = cx * 8, math.min(cx * 8 + 7, V.RegionCells(r, "x") - 1) do
-				if not cells[V.Index(x, y, z, r)] then
-					cellSolids(r, x, y, z, checkpoint)
+	local cells = V.TerrainCellCache(r, "hulls", x0, y0, z0)
+	local x1 = math.min(x0 + 7, V.RegionCells(r, "x") - 1)
+	local y1 = math.min(y0 + 7, V.RegionCells(r, "y") - 1)
+	local z1 = math.min(z0 + 7, V.RegionCells(r, "z") - 1)
+	local prewarm = r.bsp and r.bspEdits and #r.bspEdits == 0 and V.PrepareBSPCollisionCell
+	local fallback = r.bspFallback
+	for z = z0, z1 do
+		for y = y0, y1 do
+			local first = V.Index(x0, y, z, r)
+			for x = x0, x1 do
+				local key = first + x - x0
+				if not cells[key] then
+					cells[key] = buildCellSolids(r, x, y, z, key, checkpoint, true)
 					if checkpoint then
 						checkpoint()
 					end
 				end
-				if V.PrepareBSPCollisionCell then
-					V.PrepareBSPCollisionCell(r, x, y, z, checkpoint)
+				if prewarm and fallback and fallback[key] then
+					prewarm(r, x, y, z, checkpoint)
 				end
 			end
 		end
@@ -493,12 +577,13 @@ end
 
 -- Count only on an explicit diagnostic request, never per frame/command.
 function V.CollisionCacheStats(r)
-	local result = { cells = 0, solids = 0, axes = 0 }
+	local result = { cells = 0, solids = 0, axes = 0, pendingOriginal = 0 }
 	local root = r and r.terrainCache
 	if root and root.revision == r.revision then
 		for _, cells in pairs(root.hulls or {}) do
 			for _, solids in pairs(cells) do
 				result.cells = result.cells + 1
+				if solids == originalMixedPending then result.pendingOriginal = result.pendingOriginal + 1 end
 				result.solids = result.solids + #solids
 				for _, planes in ipairs(solids) do
 					result.axes = result.axes + #planes
@@ -511,7 +596,7 @@ end
 
 local function sweep(poly, center, extent, delta, pointCast)
 	local first, last = -math.huge, math.huge
-	local normal = Vector()
+	local normal, reverse
 	local inside = true
 	for _, plane in ipairs(poly) do
 		local n = plane.n
@@ -533,14 +618,13 @@ local function sweep(poly, center, extent, delta, pointCast)
 			end
 		else
 			local enter, exit = (low - p) / d, (high - p) / d
-			local face = n * -1
-			if enter > exit then
+			local swapped = enter > exit
+			if swapped then
 				enter, exit = exit, enter
-				face = n
 			end
 			if enter > first then
 				first = enter
-				normal = face
+				normal, reverse = n, not swapped
 			end
 			last = math.min(last, exit)
 			if first > last + EPS then
@@ -554,7 +638,7 @@ local function sweep(poly, center, extent, delta, pointCast)
 	if first < -EPS or first > 1 or last <= EPS then
 		return
 	end
-	return math.max(0, first), normal, false
+	return math.max(0, first), reverse and normal * -1 or normal, false
 end
 -- Reuse the continuous SAT kernel for the unchanged world around a vehicle's
 -- cage. A triangle has no thickness; the swept hull supplies its contact size.

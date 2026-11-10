@@ -17,8 +17,8 @@ local portals = {}
 local compileFace = 0
 local openingJob
 local nativeBackground
-local prepared = false
-local targets = {}
+local prepared, staged = false, false
+local targets = { hdr = {}, ldr = {} }
 local backgroundPlane, frameViews
 local preparing = false
 local targetPushed, clipPushed, matrixPushed = false, false, false
@@ -27,6 +27,7 @@ local toneState
 local cachedEntities = {}
 local nextEntityRefresh = 0
 local exteriorEntities = {}
+local exteriorCandidates = {}
 local nextExteriorRefresh = 0
 local exteriorProof = setmetatable({}, { __mode = "k" })
 local exteriorFrame, exteriorStart, exteriorCursor, exteriorDeferred = 0, 1, 1, false
@@ -68,7 +69,7 @@ local function freePortals()
 	end
 end
 
-function V.SetVisualRegion(r)
+local function setVisualRegion(r, hidden)
 	region = nil
 	faces = nil
 	frameViews = nil
@@ -76,6 +77,7 @@ function V.SetVisualRegion(r)
 	openingJob = nil
 	prepared = false
 	freePortals()
+	staged = hidden == true
 	region = r
 	faces = r and V.MaskFaces(r) or nil
 	compileFace = r and 1 or 0
@@ -87,23 +89,48 @@ function V.SetVisualRegion(r)
 	cachedEntities = {}
 	nextEntityRefresh = 0
 	exteriorEntities = {}
+	exteriorCandidates = {}
 	nextExteriorRefresh = 0
 	exteriorProof = setmetatable({}, { __mode = "k" })
 	exteriorFrame = -1
 	exteriorCursor = 1
 end
 
+V.SetVisualRegion = setVisualRegion
+function V.StageVisualRegion(r)
+	setVisualRegion(r, true)
+end
+
+function V.ActivateVisualRegion(r)
+	if region ~= r or not prepared or failure then return false end
+	staged = false
+	return true
+end
+
+function V.VisualRegionPrepared(r)
+	if region ~= r then return false end
+	return prepared, failure
+end
+
 function V.VisualReplacementEnabled()
 	-- A saved preview preference must not leave the original wall visible over
 	-- a hole that already exists in server/client collision. Keep the toggle
 	-- useful for inspecting the initial scan, but never hide committed edits.
-	return region ~= nil and prepared and not failure and (region.revision > 0 or enabled:GetBool())
+	return region ~= nil and prepared and not staged and not failure and (region.revision > 0 or enabled:GetBool())
+end
+
+local function openingFailed(err)
+	failure = "Ouvertures annulees : " .. tostring(err)
+	compileFace = 0
+	openingJob = nil
+	freePortals()
+	nativeBackground = nil
 end
 
 -- Compile the aperture meshes once. Brush edits preserve the outer lattice,
 -- so these meshes remain valid while interior terrain chunks are replaced.
-hook.Add("Think", "GVoxel.CompileOpenings", function()
-	if compileFace == 0 or not region then
+local function compileOpenings(deadline)
+	if compileFace == 0 or not region or SysTime() >= deadline then
 		return
 	end
 	local index = compileFace
@@ -112,24 +139,22 @@ hook.Add("Think", "GVoxel.CompileOpenings", function()
 			if index == 1 then
 				nativeBackground = V.BuildNativeBackgroundData(region, coroutine.yield)
 			end
-			local vertices = V.BuildBoundaryOpening(region, faces[index], region.bspFallback and function()
-				coroutine.yield()
-			end or nil)
+			local vertices = V.BuildBoundaryOpening(region, faces[index], coroutine.yield)
 			local sky = V.PortalSkyFlags(region.bsp, vertices, faces[index].normal, coroutine.yield)
-			return vertices, sky
+			if #vertices > 0 then
+				local low, high = V.VertexBounds(vertices, coroutine.yield)
+				return vertices, sky, low, high
+			end
+			return vertices
 		end)
-	local deadline = SysTime() + 0.001
-	local vertices, sky
+	local vertices, sky, low, high
 	repeat
-		local ok, result, flags = coroutine.resume(openingJob)
+		local ok, result, flags, min, max = coroutine.resume(openingJob)
 		if not ok then
-			failure = tostring(result)
-			compileFace = 0
-			openingJob = nil
-			ErrorNoHalt("[GVoxel] Ouvertures annulees : " .. failure .. "\n")
+			openingFailed(result)
 			return
 		end
-		vertices, sky = result, flags
+		vertices, sky, low, high = result, flags, min, max
 	until coroutine.status(openingJob) == "dead" or SysTime() >= deadline
 	if coroutine.status(openingJob) ~= "dead" then
 		return
@@ -137,8 +162,12 @@ hook.Add("Think", "GVoxel.CompileOpenings", function()
 	openingJob = nil
 	if #vertices > 0 then
 		local object = Mesh(maskMaterial)
-		object:BuildFromTriangles(vertices)
-		local low, high = V.VertexBounds(vertices)
+		local ok, err = pcall(object.BuildFromTriangles, object, vertices)
+		if not ok then
+			V.ReleaseMesh(object)
+			openingFailed(err)
+			return
+		end
 		portals[#portals + 1] = {
 			face = faces[index],
 			mesh = object,
@@ -154,6 +183,18 @@ hook.Add("Think", "GVoxel.CompileOpenings", function()
 		prepared = true
 		stats.openings = #portals
 	end
+end
+
+function V.CompileStagedVisualRegion(r, deadline)
+	if staged and region == r then
+		compileOpenings(math.min(deadline, SysTime() + 0.001))
+	end
+end
+
+hook.Add("Think", "GVoxel.CompileOpenings", function()
+	if not staged and compileFace ~= 0 then
+		compileOpenings(SysTime() + 0.001)
+	end
 end)
 
 local function drawFace(face)
@@ -163,8 +204,18 @@ end
 
 local directions =
 	{ Vector(1, 0, 0), Vector(-1, 0, 0), Vector(0, 1, 0), Vector(0, -1, 0), Vector(0, 0, 1), Vector(0, 0, -1) }
+local function drawBatch(chunk, batch)
+	if V.DrawSurfaceBatch then
+		V.DrawSurfaceBatch(region, chunk, batch, true)
+	else
+		render.SetMaterial(V.SurfaceMaterial(batch))
+		V.DrawMesh(batch.mesh)
+	end
+end
+
 local function drawTerrain(frustum)
 	local visible = {}
+	local translucent
 	render.SuppressEngineLighting(true)
 	for _, chunk in pairs(region.chunks) do
 		if chunk.mesh and V.BoundsInView(frustum, chunk.low, chunk.high) then
@@ -188,11 +239,11 @@ local function drawTerrain(frustum)
 			matrixPushed = true
 			if chunk.batches then
 				for _, batch in ipairs(chunk.batches) do
-					if V.DrawSurfaceBatch then
-						V.DrawSurfaceBatch(region, chunk, batch, true)
+					if batch.translucent then
+						translucent = translucent or {}
+						translucent[#translucent + 1] = { chunk = chunk, batch = batch }
 					else
-						render.SetMaterial(V.SurfaceMaterial(batch))
-						V.DrawMesh(batch.mesh)
+						drawBatch(chunk, batch)
 					end
 				end
 			else
@@ -210,10 +261,12 @@ local function drawTerrain(frustum)
 			matrixPushed = true
 			if chunk.batches then
 				for _, batch in ipairs(chunk.batches) do
-					render.SetMaterial(
-						V.SurfaceFlashMaterial and V.SurfaceFlashMaterial(batch) or V.SurfaceMaterial(batch)
-					)
-					V.DrawMesh(batch.mesh)
+					if not batch.translucent then
+						render.SetMaterial(
+							V.SurfaceFlashMaterial and V.SurfaceFlashMaterial(batch) or V.SurfaceMaterial(batch)
+						)
+						V.DrawMesh(batch.mesh)
+					end
 				end
 			else
 				render.SetMaterial(V.ScanSurfaceMaterial)
@@ -227,6 +280,25 @@ local function drawTerrain(frustum)
 	render.ResetModelLighting(1, 1, 1)
 	render.SetLocalModelLights()
 	stats.terrain = stats.terrain + 1
+	return translucent
+end
+
+local function drawTranslucentTerrain(batches, forward)
+	for _, entry in ipairs(batches) do
+		entry.depth = (entry.batch.worldCenter or entry.chunk.lightOrigin):Dot(forward)
+	end
+	table.sort(batches, function(a, b) return a.depth > b.depth end)
+	render.SetStencilTestMask(1)
+	render.SetStencilReferenceValue(1)
+	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
+	render.SuppressEngineLighting(true)
+	for _, entry in ipairs(batches) do
+		cam.PushModelMatrix(entry.chunk.transform)
+		matrixPushed = true
+		drawBatch(entry.chunk, entry.batch)
+		cam.PopModelMatrix()
+		matrixPushed = false
+	end
 end
 
 local function firstPersonModel(ent, me, viewmodel)
@@ -384,9 +456,7 @@ local function exteriorVisible(ent, eye, low, high, observer)
 	return visible
 end
 
--- Native RenderView can omit entities in the old camera PVS. Repair only
--- received, non-dormant models in the exit cone with proven native LOS.
-local function redrawExterior(context)
+local function prepareExterior(frustum)
 	if exteriorFrame ~= FrameNumber() then
 		exteriorFrame = FrameNumber()
 		exteriorRays = 0
@@ -431,6 +501,7 @@ local function redrawExterior(context)
 	local me = LocalPlayer()
 	local viewmodel = me.GetViewModel and me:GetViewModel()
 	local high = region.origin + V.RegionSize(region)
+	local count = 0
 	for offset = 1, #exteriorEntities do
 		local index = (exteriorStart + offset - 2) % #exteriorEntities + 1
 		local ent = exteriorEntities[index]
@@ -443,23 +514,57 @@ local function redrawExterior(context)
 			and not visibilityControllers[ent:GetClass()]
 			and not (ent.IsDormant and ent:IsDormant())
 			and not firstPersonModel(ent, me, viewmodel)
-			and ent:GetModel()
-			and ent:GetModel() ~= ""
 			and (not ent:IsPlayer() or (ent:Alive() and (ent ~= me or me:ShouldDrawLocalPlayer())))
 		then
-			local low, big = ent:WorldSpaceAABB()
-			local contained = low.x >= region.origin.x
-				and low.y >= region.origin.y
-				and low.z >= region.origin.z
-				and big.x <= high.x
-				and big.y <= high.y
-				and big.z <= high.z
-			if
-				not contained
-				and V.BoundsInView(context.frustum, low, big)
-				and (not ent.TestPVS or not ent:TestPVS(context.view.origin))
-			then
-				local visible = exteriorVisible(ent, context.view.origin, low, big, me)
+			local model = ent:GetModel()
+			if model and model ~= "" then
+				stats.exteriorBounds = stats.exteriorBounds + 1
+				local low, big = ent:WorldSpaceAABB()
+				local contained = low.x >= region.origin.x
+					and low.y >= region.origin.y
+					and low.z >= region.origin.z
+					and big.x <= high.x
+					and big.y <= high.y
+					and big.z <= high.z
+				if not contained and V.BoundsInView(frustum, low, big) then
+					count = count + 1
+					local candidate = exteriorCandidates[count] or {}
+					candidate.ent, candidate.index = ent, index
+					candidate.low, candidate.high = low, big
+					candidate.native = nil
+					exteriorCandidates[count] = candidate
+				end
+			end
+		end
+	end
+	for index = #exteriorCandidates, count + 1, -1 do
+		exteriorCandidates[index] = nil
+	end
+	frameViews.exteriorPrepared = true
+	frameViews.observer = me
+	stats.exteriorCandidates = count
+end
+
+-- Native RenderView can omit entities in the old camera PVS. Each exit
+-- needs its own cone and draw, but they all share camera origin and bounds.
+local function redrawExterior(context)
+	if not frameViews.exteriorPrepared then
+		prepareExterior(frameViews.frustum)
+	end
+	local eye = context.view.origin
+	for _, candidate in ipairs(exteriorCandidates) do
+		local ent, low, high = candidate.ent, candidate.low, candidate.high
+		if candidate.native ~= true and IsValid(ent) and V.BoundsInView(context.frustum, low, high) then
+			if candidate.native == nil then
+				if ent.TestPVS then
+					stats.exteriorPVS = stats.exteriorPVS + 1
+					candidate.native = not not ent:TestPVS(eye)
+				else
+					candidate.native = false
+				end
+			end
+			if not candidate.native then
+				local visible = exteriorVisible(ent, eye, low, high, frameViews.observer)
 				if visible then
 					if ent.SetupBones then
 						ent:SetupBones()
@@ -473,10 +578,9 @@ local function redrawExterior(context)
 					end
 				else
 					stats.exteriorHidden = stats.exteriorHidden + 1
-					-- Rotate the first deferred model to the front next frame;
-					-- busy scenery must not starve every later entity forever.
+					-- Rotate the first deferred model to the front next frame.
 					if visible == nil and not exteriorDeferred then
-						exteriorCursor = index
+						exteriorCursor = candidate.index
 						exteriorDeferred = true
 					end
 				end
@@ -582,12 +686,15 @@ local function volumeMask(eye)
 	render.SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_EQUAL)
 end
 
-local function ensureTarget(index, w, h)
-	local slot = targets[index]
-	if slot and slot.w == w and slot.h == h then
+local function ensureTarget(index, w, h, hdr)
+	local modeTargets = targets[hdr and "hdr" or "ldr"]
+	local tiers = modeTargets[index] or {}
+	modeTargets[index] = tiers
+	local slot = tiers[w]
+	if slot then
 		return slot
 	end
-	local name = "vm_background_hdr_v4_" .. index .. "_" .. w .. "x" .. h
+	local name = (hdr and "vm_background_hdr_v4_" or "vm_background_ldr_") .. index .. "_" .. w .. "x" .. h
 	local rt = GetRenderTargetEx(
 		name,
 		w,
@@ -596,37 +703,41 @@ local function ensureTarget(index, w, h)
 		MATERIAL_RT_DEPTH_SEPARATE,
 		12,
 		0,
-		IMAGE_FORMAT_RGBA16161616F or IMAGE_FORMAT_RGBA8888
+		hdr and IMAGE_FORMAT_RGBA16161616F or IMAGE_FORMAT_RGBA8888
 	)
 	slot = {
-		w = w,
-		h = h,
 		target = rt,
 		material = CreateMaterial(name .. "_mat", "UnlitGeneric", {
 			["$basetexture"] = rt:GetName(),
 			["$ignorez"] = "1",
 			["$nocull"] = "1",
-			["$gammacolorread"] = IMAGE_FORMAT_RGBA16161616F and "1" or "0",
+			["$gammacolorread"] = hdr and "1" or "0",
 		}),
 	}
-	targets[index] = slot
+	tiers[w] = slot
+	stats.backgroundTargetBytes = (stats.backgroundTargetBytes or 0) + w * h * (hdr and 8 or 4)
 	return slot
 end
 
+local function inBackgroundView()
+	if backgroundContext then
+		local target = render.GetRenderTarget()
+		return target and target:GetName() == backgroundContext.targetName
+	end
+end
+
 local function activateWorldClip()
-	if not backgroundPlane or clipPushed or V.MaskInSkybox then
+	if not inBackgroundView() or clipPushed or V.MaskInSkybox then
 		return
 	end
 	render.PushCustomClipPlane(backgroundPlane.normal, backgroundPlane.distance)
 	clipPushed = true
 end
 hook.Add("PreDrawSkyBox", "GVoxel.BackgroundSkyBegin", function()
-	if not backgroundPlane then
+	if not inBackgroundView() then
 		return
 	end
-	if backgroundContext then
-		backgroundContext.nativeSky = true
-	end
+	backgroundContext.nativeSky = true
 	if clipPushed then
 		render.PopCustomClipPlane()
 		clipPushed = false
@@ -634,22 +745,22 @@ hook.Add("PreDrawSkyBox", "GVoxel.BackgroundSkyBegin", function()
 	V.MaskInSkybox = true
 end)
 hook.Add("PostDrawSkyBox", "GVoxel.BackgroundSkyEnd", function()
-	if not backgroundPlane then
+	if not inBackgroundView() then
 		return
 	end
 	V.MaskInSkybox = false
 	activateWorldClip()
 end)
 hook.Add("PostDraw2DSkyBox", "GVoxel.Background2DSky", function()
-	if backgroundContext then
+	if inBackgroundView() then
 		backgroundContext.nativeSky = true
+		activateWorldClip()
 	end
-	activateWorldClip()
 end)
 hook.Add("SetupWorldFog", "GVoxel.BackgroundWorldClip", activateWorldClip)
 
 hook.Add("PostDrawOpaqueRenderables", "GVoxel.ExteriorMissingContent", function(depth, _, sky3D)
-	if not backgroundContext or depth or sky3D then
+	if depth or sky3D or not inBackgroundView() then
 		return
 	end
 	if not backgroundContext.nativeSky and V.DrawVoxelSky then
@@ -664,10 +775,14 @@ local function renderBackground(portal, view, slot)
 	-- separate depth target must finish before this exit target is pushed.
 	local sky
 	if region.revision > 0 and portal.sky3D and V.PrepareVoxelSky then
-		local leaf = region.bsp and V.BSPLeaf(region.bsp, view.origin)
-		if not leaf or leaf.solid or bit.band(leaf.flags or 0, 5) == 0 then
-			sky = V.PrepareVoxelSky(region, view)
+		if frameViews.sky == nil then
+			frameViews.sky = false
+			local leaf = region.bsp and V.BSPLeaf(region.bsp, view.origin)
+			if not leaf or leaf.solid or bit.band(leaf.flags or 0, 5) == 0 then
+				frameViews.sky = V.PrepareVoxelSky(region, view) or false
+			end
 		end
+		sky = frameViews.sky
 	end
 	if render.GetToneMappingScaleLinear and render.SetToneMappingScaleLinear then
 		toneState = render.GetToneMappingScaleLinear()
@@ -682,8 +797,12 @@ local function renderBackground(portal, view, slot)
 	-- Start with NO world plane: 2D/3D skyboxes use a different coordinate
 	-- space. Hooks install it only after the sky has finished drawing.
 	backgroundPlane = { normal = portal.face.normal, distance = portal.face.normal:Dot(portal.face.point) + 0.02 }
-	backgroundContext =
-		{ view = view, sky = sky, frustum = V.PortalFrustum(V.ViewFrustum(view, view.w, view.h), portal) }
+	-- Source can nest its own glass and water views inside RenderView. The
+	-- aperture clip belongs only to this target; those views own other planes.
+	backgroundContext = {
+		targetName = slot.target:GetName(), view = view, sky = sky,
+		frustum = V.PortalFrustum(frameViews.frustum, portal, true),
+	}
 	render.RenderView(view)
 	backgroundContext = nil
 	if clipPushed then
@@ -702,6 +821,7 @@ local function renderBackground(portal, view, slot)
 	end
 	V.RenderingReplacement = false
 	stats.passes = stats.passes + 1
+	stats.backgroundPixels = stats.backgroundPixels + view.w * view.h
 	slot.origin = Vector(view.origin.x, view.origin.y, view.origin.z)
 	slot.forward = view.angles:Forward()
 	slot.right = view.angles.Right and view.angles:Right() or nil
@@ -747,19 +867,28 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 	stats.culled = 0
 	stats.reused = 0
 	stats.native = 0
+	stats.backgroundPixels = 0
+	stats.exteriorBounds = 0
+	stats.exteriorPVS = 0
+	stats.exteriorCandidates = 0
 	local started = SysTime()
 	local ok, err = xpcall(function()
 		local setup = render.GetViewSetup(true)
 		local w, h = ScrW(), ScrH()
+		local captureW, captureH = V.BackgroundTargetSize(w, h)
+		local aspect = setup.aspect or setup.aspectratio
+		if not aspect or aspect <= 0 then
+			aspect = w / h
+		end
 		local view = {
 			origin = origin,
 			angles = angles,
 			fov = fov,
-			aspect = setup.aspect or setup.aspectratio or w / h,
+			aspect = aspect,
 			x = 0,
 			y = 0,
-			w = w,
-			h = h,
+			w = captureW,
+			h = captureH,
 			znear = setup.znear,
 			zfar = setup.zfar,
 			viewmodelfov = setup.fovviewmodel or setup.viewmodelfov,
@@ -782,12 +911,14 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 			origin = origin,
 			angles = angles,
 			fov = fov,
+			frustum = frustum,
 			slots = {},
 			native = {},
 		}
 		if not V.BoundsInView(frustum, region.origin, region.origin + V.RegionSize(region)) then
 			return
 		end
+		local hdr = IMAGE_FORMAT_RGBA16161616F and render.GetHDREnabled and render.GetHDREnabled()
 		for _, portal in ipairs(portals) do
 			if V.MaskFaceIsExit(portal.face, origin) then
 				if V.BoundsInView(frustum, portal.low, portal.high) then
@@ -795,7 +926,7 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 						frameViews.native[portal] = true
 						stats.native = stats.native + 1
 					else
-						local slot = ensureTarget(portal.slot, w, h)
+						local slot = ensureTarget(portal.slot, captureW, captureH, hdr)
 						if cachedBackground(slot, portal, view) then
 							stats.reused = stats.reused + 1
 						else
@@ -903,7 +1034,7 @@ local function renderNative()
 	-- Both 1 (cleared solid) and 3 (native air) receive new voxel geometry.
 	-- In particular, adding matter must still occlude preserved scenery.
 	render.SetStencilTestMask(1)
-	drawTerrain(frustum)
+	local translucent = drawTerrain(frustum)
 	redrawEntities()
 	render.SetStencilTestMask(255)
 	for _, portal in ipairs(portals) do
@@ -926,6 +1057,11 @@ local function renderNative()
 				render.PerformFullScreenStencilOperation()
 			end
 		end
+	end
+	if translucent then
+		-- A pane blends with the finished exit and opaque terrain. It must
+		-- not contribute to aperture depth or the projected light pass.
+		drawTranslucentTerrain(translucent, setup.angles:Forward())
 	end
 end
 
@@ -1027,4 +1163,12 @@ concommand.Add("vm_render_stats", function()
 			stats.exteriorDeferred or 0
 		)
 	)
+	print(string.format(
+		"[GVoxel] Ouvertures : %d pixels captures | %.2f MiB couleurs de cibles | %d boites / %d candidats / %d tests PVS",
+		stats.backgroundPixels or 0,
+		(stats.backgroundTargetBytes or 0) / 1048576,
+		stats.exteriorBounds or 0,
+		stats.exteriorCandidates or 0,
+		stats.exteriorPVS or 0
+	))
 end)

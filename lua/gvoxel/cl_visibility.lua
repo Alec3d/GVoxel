@@ -1,6 +1,17 @@
 -- Conservative opening frustums, plus bounded native LOS checks for models
 -- missing from the camera PVS. No GPU readbacks or world-wide visibility bypass.
 local V = GVoxel
+
+-- Named targets live in the material system. Keep a finite set across
+-- window resizes. Both tiers fill the entire texture, and callers keep the
+-- main camera's aspect so sampling the whole texture preserves projection.
+function V.BackgroundTargetSize(w, h)
+	if w >= 1024 and h >= 512 then
+		return 1024, 512
+	end
+	return 512, 256
+end
+
 function V.ViewFrustum(view, w, h)
 	local f = view.angles:Forward()
 	local right = view.angles.Right and view.angles:Right() or f:Cross(Vector(0, 0, 1)):GetNormalized()
@@ -8,7 +19,10 @@ function V.ViewFrustum(view, w, h)
 		right = Vector(1, 0, 0)
 	end
 	local up = view.angles.Up and view.angles:Up() or right:Cross(f):GetNormalized()
-	local aspect = view.aspect or view.aspectratio or w / h
+	local aspect = view.aspect or view.aspectratio
+	if not aspect or aspect <= 0 then
+		aspect = w / h
+	end
 	-- Source may report the reference 4:3 FOV or the adjusted horizontal FOV.
 	-- The larger cone is conservative for either representation.
 	local horizontal = math.tan(math.rad(view.fov or 90) / 2) * math.max(1, aspect / (4 / 3))
@@ -35,13 +49,13 @@ function V.BoundsInView(frustum, low, high)
 	return true
 end
 
-function V.VertexBounds(vertices)
+function V.VertexBounds(vertices, checkpoint)
 	local low, high = Vector(math.huge, math.huge, math.huge), Vector(-math.huge, -math.huge, -math.huge)
-	for _, v in ipairs(vertices) do
-		for _, axis in ipairs({ "x", "y", "z" }) do
-			low[axis] = math.min(low[axis], v.pos[axis])
-			high[axis] = math.max(high[axis], v.pos[axis])
-		end
+	for i, vertex in ipairs(vertices) do
+		local p = vertex.pos
+		low.x, low.y, low.z = math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z)
+		high.x, high.y, high.z = math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z)
+		if checkpoint and i % 128 == 0 then checkpoint() end
 	end
 	return low, high
 end
@@ -97,16 +111,18 @@ local function portalCorners(portal)
 	end
 	return { a, b, c, d }
 end
-function V.PortalFrustum(frustum, portal)
+function V.PortalFrustum(frustum, portal, portalOnly)
 	local eye = frustum.eye
 	local f = portal.face
+	local result = { eye = eye, planes = {} }
+	if not portalOnly then
+		for _, n in ipairs(frustum.planes) do
+			result.planes[#result.planes + 1] = n
+		end
+	end
 	-- A camera on the exit plane has a degenerate cone; keep the wider view.
 	if math.abs((eye - f.point):Dot(f.normal)) < 0.01 then
-		return frustum
-	end
-	local result = { eye = eye, planes = {} }
-	for _, n in ipairs(frustum.planes) do
-		result.planes[#result.planes + 1] = n
+		return result
 	end
 	local corners = portalCorners(portal)
 	local center = (portal.low + portal.high) * 0.5 - eye

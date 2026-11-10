@@ -2,15 +2,16 @@
 -- aiming and collision consume the same cell geometry. Work is cached per chunk.
 local V = GVoxel
 local names = { "x", "y", "z" }
+local boxNormals = { Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1) }
+local oppositeBoxNormals = { -boxNormals[1], -boxNormals[2], -boxNormals[3] }
+local tangentZ, tangentY = boxNormals[3], boxNormals[2]
+local tangentBases = setmetatable({}, { __mode = "k" })
 local EPS = 0.0000001
 -- Keep plane classification in Lua doubles: Vector:Dot rounds to a float in Source.
-local function planeValue(p, n, d)
-	return p.x * n.x + p.y * n.y + p.z * n.z - d
-end
-local function polygonDistance(p, n, d, distances)
+local function polygonDistance(p, nx, ny, nz, d, distances)
 	local value = distances and distances[p]
 	if value == nil then
-		value = planeValue(p, n, d)
+		value = p.x * nx + p.y * ny + p.z * nz - d
 		if distances then
 			distances[p] = value
 		end
@@ -18,34 +19,64 @@ local function polygonDistance(p, n, d, distances)
 	return value
 end
 
+local polygonZero, polygonCenter, polygonDelta = Vector(), Vector(), Vector()
+local function orderPolygon(polygon, n)
+	local center, delta = polygonCenter, polygonDelta
+	center:Set(polygonZero)
+	for _, p in ipairs(polygon) do
+		delta:Set(p)
+		delta:Div(#polygon)
+		center:Add(delta)
+	end
+	local nx, ny, nz = n.x, n.y, n.z
+	local frame = tangentBases[n]
+	if not frame or frame.x ~= nx or frame.y ~= ny or frame.z ~= nz then
+		local u = n:Cross(math.abs(nz) < 0.9 and tangentZ or tangentY):GetNormalized()
+		frame = { x = nx, y = ny, z = nz, u = u, v = n:Cross(u) }
+		tangentBases[n] = frame
+	end
+	local u, v = frame.u, frame.v
+	local angles = {}
+	for _, p in ipairs(polygon) do
+		delta:Set(p)
+		delta:Sub(center)
+		angles[p] = math.atan2(delta:Dot(v), delta:Dot(u))
+	end
+	table.sort(polygon, function(a, b)
+		return angles[a] < angles[b]
+	end)
+end
+
 function V.ClipBSPPolygon(polygon, n, d, shared)
-	if n.x == 0 and n.y == 0 and n.z == 0 then
+	local nx, ny, nz = n.x, n.y, n.z
+	if nx == 0 and ny == 0 and nz == 0 then
 		return d >= -EPS and polygon or {}
 	end
 	-- A polytope's faces share endpoints. Classify each endpoint once and
 	-- keep the same intersection object on both incident faces. The context
 	-- belongs to one plane/clip only, never to a mutable global scratch area.
 	local distances = shared and shared.distances
-	local minimum, maximum = math.huge, -math.huge
-	for _, p in ipairs(polygon) do
-		local q = polygonDistance(p, n, d, distances)
-		minimum = math.min(minimum, q)
-		maximum = math.max(maximum, q)
-	end
-	if maximum <= EPS then
-		return polygon
-	end
-	if minimum > EPS then
-		return {}
-	end
-	local out, cuts = {}, {}
 	local a = polygon[#polygon]
 	if not a then
-		return out
+		return polygon
 	end
-	local da = polygonDistance(a, n, d, distances)
+	local da = distances and distances[a] or polygonDistance(a, nx, ny, nz, d, distances)
+	local outside = da > EPS
+	local straddles = false
+	for i = 1, #polygon - 1 do
+		local p = polygon[i]
+		local db = distances and distances[p] or polygonDistance(p, nx, ny, nz, d, distances)
+		if (db > EPS) ~= outside then
+			straddles = true
+			break
+		end
+	end
+	if not straddles then
+		return outside and {} or polygon
+	end
+	local out, cuts = {}, {}
 	for _, b in ipairs(polygon) do
-		local db = polygonDistance(b, n, d, distances)
+		local db = distances and distances[b] or polygonDistance(b, nx, ny, nz, d, distances)
 		if (da > EPS) ~= (db > EPS) then
 			-- Canonical order makes shared cell/face intersections identical.
 			local p, q, dp, dq = a, b, da, db
@@ -78,90 +109,191 @@ function V.ClipBSPPolygon(polygon, n, d, shared)
 	return out, cuts
 end
 
-local function clip(poly, n, d, tag)
-	if n.x == 0 and n.y == 0 and n.z == 0 then
+-- Plane classification is synchronous. Only a real split needs its own
+-- endpoint map, since the following face clips share those projections.
+local clipDistances = {}
+local function clip(poly, n, d, tag, band, shared)
+	local nx, ny, nz = n.x, n.y, n.z
+	if nx == 0 and ny == 0 and nz == 0 then
 		if d >= -EPS then
 			return poly
 		end
 		return
 	end
-	local shared = { distances = {}, edges = {} }
-	local min, max = math.huge, -math.huge
-	for _, face in ipairs(poly.faces) do
-		for _, p in ipairs(face.vertices) do
-			local v = polygonDistance(p, n, d, shared.distances)
-			min = math.min(min, v)
-			max = math.max(max, v)
+	if not shared then
+		local distances
+		local inside, outside = false, false
+		local insideLower, outsideLower = false, false
+		local points = poly.points
+		if points then
+			for i, p in ipairs(points) do
+				local dot = p.x * nx + p.y * ny + p.z * nz
+				local v = dot - d
+				clipDistances[i] = v
+				inside = inside or v < -EPS
+				outside = outside or v > EPS
+				if band then
+					local lower = dot - band.low
+					insideLower = insideLower or lower > EPS
+					outsideLower = outsideLower or lower < -EPS
+				end
+			end
+		else
+			distances = {}
+			for _, face in ipairs(poly.faces) do
+				for _, p in ipairs(face.vertices) do
+					if distances[p] == nil then
+						local dot = p.x * nx + p.y * ny + p.z * nz
+						local v = dot - d
+						distances[p] = v
+						inside = inside or v < -EPS
+						outside = outside or v > EPS
+						if band then
+							local lower = dot - band.low
+							insideLower = insideLower or lower > EPS
+							outsideLower = outsideLower or lower < -EPS
+						end
+					end
+				end
+			end
 		end
-	end
-	if max <= EPS then
-		return poly
-	end
-	if min >= -EPS then
-		return
-	end
-	local faces, cap, keys, seen = {}, {}, {}, {}
-	local function addCap(p)
-		if seen[p] then
+		if not outside then
+			-- A support interval has two opposing faces. If the upper face
+			-- left the piece intact, the same projections classify the lower.
+			if outsideLower then
+				if insideLower then
+					return clip(poly, band.opposite or -n, -band.low)
+				end
+				return
+			end
+			return poly
+		end
+		if not inside then
 			return
 		end
-		seen[p] = true
-		local key = string.format("%.7f:%.7f:%.7f", p.x, p.y, p.z)
-		if not keys[key] then
-			keys[key] = true
-			cap[#cap + 1] = p
+		if points then
+			distances = {}
+			for i, p in ipairs(points) do distances[p] = clipDistances[i] end
 		end
+		shared = { distances = distances, edges = {} }
+	end
+	local distances = shared.distances
+	local faces, points, cap, seen = {}, {}, {}, {}
+	local function addCap(p)
+		local state = seen[p] or 0
+		if state >= 2 then
+			return
+		end
+		seen[p] = state + 2
+		local x, y, z = p.x, p.y, p.z
+		local key
+		for _, q in ipairs(cap) do
+			local qx = q.x
+			if math.abs(x - qx) <= 2 * EPS then
+				local qy, qz = q.y, q.z
+				if math.abs(y - qy) <= 2 * EPS and math.abs(z - qz) <= 2 * EPS then
+					-- Preserve the original decimal key for nearby points,
+					-- including coordinates that differ only by signed zero.
+					key = key or string.format("%.7f:%.7f:%.7f", x, y, z)
+					if key == string.format("%.7f:%.7f:%.7f", qx, qy, qz) then
+						return
+					end
+				end
+			end
+		end
+		cap[#cap + 1] = p
 	end
 	for _, face in ipairs(poly.faces) do
 		local polygon, intersections = V.ClipBSPPolygon(face.vertices, n, d, shared)
 		if #polygon >= 3 then
-			faces[#faces + 1] =
-				{ vertices = polygon, normal = face.normal, tag = face.tag, appearance = face.appearance }
+			faces[#faces + 1] = polygon == face.vertices and face
+				or { vertices = polygon, normal = face.normal, tag = face.tag, appearance = face.appearance }
 			-- Keep the intersections explicitly: their stored float coordinates
 			-- need not lie within 1e-5 of the plane after rounding.
-			for _, p in ipairs(intersections or {}) do
-				addCap(p)
+			if intersections then
+				for _, p in ipairs(intersections) do
+					addCap(p)
+				end
 			end
 			for _, p in ipairs(polygon) do
-				if math.abs(polygonDistance(p, n, d, shared.distances)) <= EPS then
+				local state = seen[p] or 0
+				if state == 0 or state == 2 then
+					points[#points + 1] = p
+					seen[p] = state + 1
+				end
+				if state < 2 and math.abs(polygonDistance(p, nx, ny, nz, d, distances)) <= EPS then
 					addCap(p)
 				end
 			end
 		end
 	end
 	if #cap >= 3 then
-		local center, delta = Vector(), Vector()
-		for _, p in ipairs(cap) do
-			delta:Set(p)
-			delta:Div(#cap)
-			center:Add(delta)
-		end
-		local u = n:Cross(math.abs(n.z) < 0.9 and Vector(0, 0, 1) or Vector(0, 1, 0)):GetNormalized()
-		local v = n:Cross(u)
-		local angles = {}
-		for _, p in ipairs(cap) do
-			delta:Set(p)
-			delta:Sub(center)
-			angles[p] = math.atan2(delta:Dot(v), delta:Dot(u))
-		end
-		table.sort(cap, function(a, b)
-			return angles[a] < angles[b]
-		end)
+		orderPolygon(cap, n)
 		faces[#faces + 1] = { vertices = cap, normal = n, tag = tag, appearance = poly.appearance }
 	end
 	if #faces < 4 then
 		return
 	end
-	return { faces = faces, solid = poly.solid, loose = poly.loose, appearance = poly.appearance }
+	local result = { faces = faces, points = points, solid = poly.solid, loose = poly.loose, appearance = poly.appearance }
+	if band then
+		return clip(result, band.opposite or -n, -band.low)
+	end
+	return result
 end
 V.ClipBSPPolytope = clip
 
+-- An addition needs both sides of the same plane. Share projections and
+-- the canonical edge intersections instead of clipping the same edges twice.
+local function clipPair(poly, n, opposite, d, tag)
+	local points = poly.points
+	if not points then
+		return clip(poly, n, d, tag), clip(poly, opposite, -d, tag)
+	end
+	local nx, ny, nz = n.x, n.y, n.z
+	local below, above = false, false
+	for i, p in ipairs(points) do
+		local q = p.x * nx + p.y * ny + p.z * nz - d
+		clipDistances[i] = q
+		below = below or q < -EPS
+		above = above or q > EPS
+	end
+	if not above then return poly, not below and poly or nil end
+	if not below then return nil, poly end
+	local distances, reverse, edges = {}, {}, {}
+	for i, p in ipairs(points) do
+		local q = clipDistances[i]
+		distances[p], reverse[p] = q, -q
+	end
+	return clip(poly, n, d, tag, nil, { distances = distances, edges = edges }),
+		clip(poly, opposite, -d, tag, nil, { distances = reverse, edges = edges })
+end
+
+local maskBoxNormals = {
+	oppositeBoxNormals[1], boxNormals[1], oppositeBoxNormals[2], boxNormals[2],
+	oppositeBoxNormals[3], boxNormals[3],
+}
 local function box(low, high)
 	local r = { origin = low, side = high.x - low.x }
-	local faces = V.MaskFaces(r)
-	return { faces = faces }
+	local faces = V.MaskFaces(r, maskBoxNormals)
+	local a, b = faces[1].vertices, faces[2].vertices
+	return { faces = faces, points = { a[1], a[2], a[3], a[4], b[1], b[2], b[3], b[4] } }
 end
-local function splitWorld(data, poly, origin, index, out, depth, checkpoint)
+local function localPlaneDistance(r, plane)
+	local distances = r.bspLocalDistances
+	if not distances then
+		distances = {}
+		r.bspLocalDistances = distances
+	end
+	local distance = distances[plane]
+	if distance == nil then
+		distance = plane.distance - plane.normal:Dot(r.origin)
+		distances[plane] = distance
+	end
+	return distance
+end
+
+local function splitWorld(r, poly, index, out, depth, checkpoint, keepAir, points)
+	local data = r.bsp
 	if not poly then
 		return
 	end
@@ -170,28 +302,56 @@ local function splitWorld(data, poly, origin, index, out, depth, checkpoint)
 		checkpoint()
 	end
 	if index < 0 then
-		poly = { faces = poly.faces, solid = data.leaves[-index].solid }
+		local solid = data.leaves[-index].solid
+		if not solid and not keepAir then return end
+		poly = { faces = poly.faces, points = poly.points or points, solid = solid }
 		out[#out + 1] = poly
 		return
 	end
 	local node = data.nodes[index + 1]
 	local plane = data.planes[node.plane]
-	local n, d = plane.normal, plane.distance - plane.normal:Dot(origin)
-	local min, max = math.huge, -math.huge
-	for _, face in ipairs(poly.faces) do
-		for _, p in ipairs(face.vertices) do
-			local q = p:Dot(n) - d
-			min = math.min(min, q)
-			max = math.max(max, q)
+	local n, d = plane.normal, localPlaneDistance(r, plane)
+	points = points or poly.points
+	if not points then
+		local seen = {}
+		points = {}
+		for _, face in ipairs(poly.faces) do
+			for _, p in ipairs(face.vertices) do
+				if not seen[p] then
+					seen[p] = true
+					points[#points + 1] = p
+				end
+			end
 		end
 	end
-	if min >= -EPS then
-		splitWorld(data, poly, origin, node.front, out, depth + 1, checkpoint)
-	elseif max <= EPS then
-		splitWorld(data, poly, origin, node.back, out, depth + 1, checkpoint)
+	-- BSP traversal commonly visits several nodes before the first split.
+	-- Classify the same unique vertices until the polytope actually changes.
+	local front, back = false, false
+	for _, p in ipairs(points) do
+		local q = p:Dot(n) - d
+		front = front or q > EPS
+		back = back or q < -EPS
+		if front and back then
+			break
+		end
+	end
+	if not back then
+		splitWorld(r, poly, node.front, out, depth + 1, checkpoint, keepAir, points)
+	elseif not front then
+		splitWorld(r, poly, node.back, out, depth + 1, checkpoint, keepAir, points)
 	else
-		splitWorld(data, clip(poly, -n, -d), origin, node.front, out, depth + 1, checkpoint)
-		splitWorld(data, clip(poly, n, d), origin, node.back, out, depth + 1, checkpoint)
+		local front = keepAir or node.front >= 0 or data.leaves[-node.front].solid
+		local back = keepAir or node.back >= 0 or data.leaves[-node.back].solid
+		local backPiece, frontPiece
+		if front and back then
+			backPiece, frontPiece = clipPair(poly, n, -n, d)
+		elseif front then
+			frontPiece = clip(poly, -n, -d)
+		elseif back then
+			backPiece = clip(poly, n, d)
+		end
+		splitWorld(r, frontPiece, node.front, out, depth + 1, checkpoint, keepAir)
+		splitWorld(r, backPiece, node.back, out, depth + 1, checkpoint, keepAir)
 	end
 end
 
@@ -350,8 +510,10 @@ local function indexDisplacement(r, face, checkpoint)
 					-- boundary. Rendering still assigns it to just one cell.
 					for c = contactLow, contactHigh do
 						local k = key(c)
-						r.bspTerrainCells[k] = r.bspTerrainCells[k] or {}
-						r.bspTerrainCells[k][#r.bspTerrainCells[k] + 1] = tri
+						local cell = r.bspTerrainCells[k] or {}
+						cell[#cell + 1] = tri
+						cell.curved = cell.curved or not flat
+						r.bspTerrainCells[k] = cell
 					end
 					for c = shellLow, shellHigh do
 						local k = key(c)
@@ -402,6 +564,12 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	r.bspTerrainCells = {}
 	r.bspFallbackUnknown = {}
 	r.bspDensityChoice = {}
+	r.bspDensityNodeSigns = {}
+	r.bspOccupancyRoots = {}
+	r.bspOccupancy = {}
+	r.bspCellClipRoots = {}
+	r.bspLocalDistances = {}
+	r.bspBrushNodes = {}
 	r.bspTerrainColumns = columnSampling ~= false and { {}, {}, {} } or nil
 	local high = r.origin + V.RegionSize(r)
 	-- Displacements have a separate collision representation. Keep the ray
@@ -409,9 +577,9 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	-- underlying flat Hammer brush as if it were the displaced surface.
 	for index, face in ipairs(data.faces) do
 		local faceLow, faceHigh = face.dispLow or face.low, face.dispHigh or face.high
-		local sheet = openTerrainFace(data, face)
-		local terrain = face.displacement or sheet
 		if V.BoundsOverlap(faceLow, faceHigh, r.origin, high) then
+			local sheet = openTerrainFace(data, face)
+			local terrain = face.displacement or sheet
 			local fallback = terrain or bit.band(face.tex.flags, 6) ~= 0
 			if not fallback then
 				r.bspFaces[#r.bspFaces + 1] = face
@@ -519,7 +687,15 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	return true
 end
 
+local function latticePoint(r, x, y, z)
+	local point = Vector(x, y, z)
+	point:Mul(r.step)
+	point:Add(r.origin)
+	return point
+end
+
 local EMPTY = {}
+local EMPTY_BRUSH_CELL = { all = EMPTY, detail = EMPTY }
 local function cellBrushes(r, x, y, z, detail)
 	if not r.bspBrushCells then
 		return EMPTY
@@ -527,21 +703,26 @@ local function cellBrushes(r, x, y, z, detail)
 	local key = V.Index(x, y, z, r)
 	local entry = r.bspBrushCells[key]
 	if not entry then
-		entry = { all = {}, detail = {} }
-		local low = r.origin + Vector(x, y, z) * r.step
-		local high = low + Vector(1, 1, 1) * r.step
 		local bin = r.bspBrushBins[V.ChunkKey(math.floor(x / 8), math.floor(y / 8), math.floor(z / 8))]
-		for _, brush in ipairs(bin or EMPTY) do
-			if V.BoundsOverlap(low, high, brush.low, brush.high) then
-				entry.all[#entry.all + 1] = brush
-				-- Structural displacement support is already represented by
-				-- the terrain field. Detail/window/grate volumes must survive
-				-- even when thinner than the sampling lattice.
-				if bit.band(brush.contents, 134217738) ~= 0 then
-					entry.detail[#entry.detail + 1] = brush
+		if bin then
+			local low = latticePoint(r, x, y, z)
+			local high = Vector(r.step, r.step, r.step)
+			high:Add(low)
+			for _, brush in ipairs(bin) do
+				if V.BoundsOverlap(low, high, brush.low, brush.high) then
+					entry = entry or { all = {}, detail = EMPTY }
+					entry.all[#entry.all + 1] = brush
+					-- Structural displacement support is already represented by
+					-- the terrain field. Detail/window/grate volumes must survive
+					-- even when thinner than the sampling lattice.
+					if bit.band(brush.contents, 134217738) ~= 0 then
+						if entry.detail == EMPTY then entry.detail = {} end
+						entry.detail[#entry.detail + 1] = brush
+					end
 				end
 			end
 		end
+		entry = entry or EMPTY_BRUSH_CELL
 		r.bspBrushCells[key] = entry
 	end
 	return detail and entry.detail or entry.all
@@ -589,17 +770,17 @@ local function unionBrushes(pieces, brushes, origin, checkpoint)
 				local remaining = piece
 				for _, plane in ipairs(brush.planes) do
 					local n, d = plane.normal, plane.distance - plane.normal:Dot(origin)
-					local outside = clip(remaining, -n, -d)
+					local outside
+					remaining, outside = clipPair(remaining, n, -n, d)
 					if outside then
 						output[#output + 1] = outside
 					end
-					remaining = clip(remaining, n, d)
 					if not remaining then
 						break
 					end
 				end
 				if remaining then
-					output[#output + 1] = { faces = remaining.faces, solid = true }
+				output[#output + 1] = { faces = remaining.faces, points = remaining.points, solid = true }
 				end
 			end
 		end
@@ -668,59 +849,95 @@ end
 
 -- Local face provenance also identifies displacement materials: engine traces
 -- return a displacement marker instead of its VMT name. No map-wide searches.
+local faceLookup = setmetatable({}, { __mode = "k" })
+
+local function faceLookupGeometry(r, face)
+	local tex = face.tex or (face.source and face.source.tex)
+	local material = tex and r.bsp and r.bsp.textures and r.bsp.textures[tex.texture]
+	local vertices = face.vertices
+	if #vertices < 3 or (tex and bit.band(tex.flags or 0, 134) ~= 0)
+		or (material and material.name:sub(1, 6) == "tools/")
+	then
+		return false
+	end
+	local n = (vertices[2] - vertices[1]):Cross(vertices[3] - vertices[1]):GetNormalized()
+	if n:Dot(face.normal) < 0 then
+		n = -n
+	end
+	local anchor = vertices[1]
+	local result = { face = face.source or face, nx = n.x, ny = n.y, nz = n.z, x = anchor.x, y = anchor.y, z = anchor.z }
+	for i, p in ipairs(vertices) do
+		local edge = n:Cross(vertices[i % #vertices + 1] - p)
+		result[i] = { x = edge.x, y = edge.y, z = edge.z, px = p.x, py = p.y, pz = p.z }
+	end
+	return result
+end
+
+local function faceLookupCell(r, cache, x, y, z)
+	local result, seen = {}, {}
+	local function add(faces)
+		if not faces then return end
+		for _, face in ipairs(faces) do
+			if not seen[face] then
+				seen[face] = true
+				local geometry = cache.faces[face]
+				if geometry == nil then
+					geometry = faceLookupGeometry(r, face)
+					cache.faces[face] = geometry
+				end
+				if geometry then result[#result + 1] = geometry end
+			end
+		end
+	end
+	for iz = math.max(0, z - 1), math.min(31, z + 1) do
+		for iy = math.max(0, y - 1), math.min(31, y + 1) do
+			for ix = math.max(0, x - 1), math.min(31, x + 1) do
+				local key = V.Index(ix, iy, iz, r)
+				add(r.bspFaceBins[key])
+				add(r.bspTerrainFaces and r.bspTerrainFaces[key])
+			end
+		end
+	end
+	return result
+end
+
 function V.BSPFaceAt(r, point, normal, maxDistance)
 	if not r.bspFaceBins then
 		return
 	end
 	local q = (point - r.origin) / r.step
-	local best, distance = nil, maxDistance or r.step * 2
-	local seen = {}
-	local function consider(face)
-		if seen[face] then
-			return
-		end
-		seen[face] = true
-		local tex=face.tex or (face.source and face.source.tex)
-        local material=tex and r.bsp and r.bsp.textures and r.bsp.textures[tex.texture]
-        if tex and bit.band(tex.flags or 0,134)~=0 then return end -- NODRAW / SKY / SKY2D
-        if material and material.name:sub(1,6)=="tools/" then return end
-		local vertices = face.vertices
-		if #vertices < 3 then
-			return
-		end
-		local n = (vertices[2] - vertices[1]):Cross(vertices[3] - vertices[1]):GetNormalized()
-		if n:Dot(face.normal) < 0 then
-			n = -n
-		end
-		if n:Dot(normal) < 0.5 then
-			return
-		end
-		local d = (point - vertices[1]):Dot(n)
-		if math.abs(d) > distance then
-			return
-		end
-		local projected = point - n * d
-		local positive, negative = false, false
-		for i, p in ipairs(vertices) do
-			local edge = vertices[i % #vertices + 1] - p
-			local side = edge:Cross(projected - p):Dot(n)
-			positive = positive or side > EPS
-			negative = negative or side < -EPS
-			if positive and negative then
-				return
-			end
-		end
-		best, distance = face.source or face, math.abs(d)
+	local x, y, z = math.floor(q.x), math.floor(q.y), math.floor(q.z)
+	if x < -1 or x > 32 or y < -1 or y > 32 or z < -1 or z > 32 then return end
+	local cache = faceLookup[r.bspFaceBins]
+	if not cache then
+		cache = { faces = {}, cells = {} }
+		faceLookup[r.bspFaceBins] = cache
 	end
-	for z = math.max(0, math.floor(q.z) - 1), math.min(31, math.floor(q.z) + 1) do
-		for y = math.max(0, math.floor(q.y) - 1), math.min(31, math.floor(q.y) + 1) do
-			for x = math.max(0, math.floor(q.x) - 1), math.min(31, math.floor(q.x) + 1) do
-				local k = V.Index(x, y, z, r)
-				for _, face in ipairs(r.bspFaceBins[k] or {}) do
-					consider(face)
+	-- Use separate digits for the one-cell halo as well as the 32-cell grid.
+	local key = (x + 1) + 34 * ((y + 1) + 34 * (z + 1))
+	local candidates = cache.cells[key]
+	if not candidates then
+		candidates = faceLookupCell(r, cache, x, y, z)
+		cache.cells[key] = candidates
+	end
+	local best, distance = nil, maxDistance or r.step * 2
+	local px, py, pz = point.x, point.y, point.z
+	local nx, ny, nz = normal.x, normal.y, normal.z
+	for _, face in ipairs(candidates) do
+		if face.nx * nx + face.ny * ny + face.nz * nz >= 0.5 then
+			local d = math.abs(face.nx * (px - face.x) + face.ny * (py - face.y) + face.nz * (pz - face.z))
+			if d <= distance then
+				local positive, negative = false, false
+				for _, edge in ipairs(face) do
+					-- Orthogonal plane projection does not change a
+					-- point's side relative to these edge planes.
+					local side = edge.x * (px - edge.px) + edge.y * (py - edge.py) + edge.z * (pz - edge.pz)
+					positive = positive or side > EPS
+					negative = negative or side < -EPS
+					if positive and negative then break end
 				end
-				for _, face in ipairs(r.bspTerrainFaces and r.bspTerrainFaces[k] or {}) do
-					consider(face)
+				if not (positive and negative) then
+					best, distance = face.face, d
 				end
 			end
 		end
@@ -742,13 +959,30 @@ function V.BSPCellUsesDensity(r, x, y, z)
 	if r.bspDensityChoice[key] ~= nil then
 		return r.bspDensityChoice[key]
 	end
+	local terrain = r.bspTerrainCells and r.bspTerrainCells[key]
+	if terrain and terrain.curved then
+		-- A curved shell requires the sampled path regardless of its
+		-- lattice signs or any neighbouring flat displacement patches.
+		r.bspDensityChoice[key] = true
+		return true
+	end
 	local values = r.bspDensityBase and r.bspDensityBase.values or r.values
+	local signs = r.bspDensityNodeSigns
 	local density = false
 	for _, o in ipairs(V.CellOffsets) do
-		local value = values[V.Index(x + o[1], y + o[2], z + o[3], r)]
+		local px, py, pz = x + o[1], y + o[2], z + o[3]
+		local index = V.Index(px, py, pz, r)
+		local value = values[index]
 		if math.abs(value) > 1 / 32 then
-			local p = r.origin + Vector(x + o[1], y + o[2], z + o[3]) * r.step
-			if (value < 0) ~= V.BSPSolid(r.bsp, p) then
+			local solid = signs and signs[index]
+			if solid == nil then
+				local p = r.origin + Vector(px, py, pz) * r.step
+				solid = V.BSPSolid(r.bsp, p)
+				if signs then
+					signs[index] = solid
+				end
+			end
+			if (value < 0) ~= solid then
 				density = true
 				break
 			end
@@ -756,20 +990,18 @@ function V.BSPCellUsesDensity(r, x, y, z)
 	end
 	-- Keep curved/uncertain terrain on the sampled path. A flat patch can
 	-- use the exact BSP only if its clipped surface really bounds BSP solid.
-	if not density then
+	if not density and terrain then
 		local low = r.origin + Vector(x, y, z) * r.step
 		local high = low + Vector(1, 1, 1) * r.step
-		for _, tri in ipairs(r.bspTerrainCells[key] or {}) do
+		for _, tri in ipairs(terrain) do
 			if not tri.flat then
 				density = true
 				break
 			end
 			local polygon = tri.vertices
-			for _, axis in ipairs(names) do
-				local n = Vector()
-				n[axis] = 1
-				polygon = V.ClipBSPPolygon(polygon, n, high[axis])
-				polygon = V.ClipBSPPolygon(polygon, -n, -low[axis])
+			for i, axis in ipairs(names) do
+				polygon = V.ClipBSPPolygon(polygon, boxNormals[i], high[axis])
+				polygon = V.ClipBSPPolygon(polygon, oppositeBoxNormals[i], -low[axis])
 			end
 			if #polygon >= 3 then
 				local area = Vector()
@@ -802,47 +1034,141 @@ function V.BSPCellUsesDensity(r, x, y, z)
 	return density
 end
 
--- Classify a whole unedited cell without constructing clipped leaf boxes.
--- Most cells are entirely air/solid; only mixed leaves need polyhedra/SAT.
-function V.BSPCellOccupancy(r, x, y, z, checkpoint)
-	local center = r.origin + Vector(x + 0.5, y + 0.5, z + 0.5) * r.step
-	local half = r.step * 0.5
-	local function walk(index, depth)
+local function leafOccupancy(data, index, depth, center, half, checkpoint)
+	assert(depth < 1024, "arbre BSP trop profond")
+	if checkpoint and depth % 8 == 0 then
+		checkpoint()
+	end
+	if index < 0 then
+		return data.leaves[-index].solid and 1 or 2, index, depth
+	end
+	local node = data.nodes[index + 1]
+	local p = data.planes[node.plane]
+	local n = p.normal
+	local d = center:Dot(n) - p.distance
+	local extent = (math.abs(n.x) + math.abs(n.y) + math.abs(n.z)) * half
+	if d - extent >= -EPS then
+		local result, root, rootDepth = leafOccupancy(data, node.front, depth + 1, center, half, checkpoint)
+		if d - extent > 1 / 64 then return result, root, rootDepth end
+		return result, index, depth
+	end
+	if d + extent <= EPS then
+		local result, root, rootDepth = leafOccupancy(data, node.back, depth + 1, center, half, checkpoint)
+		if -d - extent > 1 / 64 then return result, root, rootDepth end
+		return result, index, depth
+	end
+	local front = leafOccupancy(data, node.front, depth + 1, center, half, checkpoint)
+	if front == 3 then
+		return 3, index, depth
+	end
+	local back = leafOccupancy(data, node.back, depth + 1, center, half, checkpoint)
+	return front == back and front or 3, index, depth
+end
+
+local function occupancyRoot(r, x, y, z, half, checkpoint)
+	local roots = r.bspOccupancyRoots
+	if not roots then
+		return r.bsp.head, 0, r.bsp.head, 0
+	end
+	local cx, cy, cz = math.floor(x / 8), math.floor(y / 8), math.floor(z / 8)
+	local key = V.ChunkKey(cx, cy, cz)
+	local cached = roots[key]
+	if cached then
+		return cached.index, cached.depth, cached.clipIndex or r.bsp.head, cached.clipDepth or 0
+	end
+	local x0, y0, z0 = cx * 8, cy * 8, cz * 8
+	local low = latticePoint(r, x0 + 0.5, y0 + 0.5, z0 + 0.5)
+	local high = latticePoint(
+		r,
+		math.min(x0 + 8, V.RegionCells(r, "x")) - 0.5,
+		math.min(y0 + 8, V.RegionCells(r, "y")) - 0.5,
+		math.min(z0 + 8, V.RegionCells(r, "z")) - 0.5
+	)
+	local extreme = Vector()
+	local data = r.bsp
+	local index, depth = data.head, 0
+	local clipIndex, clipDepth = index, 0
+	while index >= 0 do
 		assert(depth < 1024, "arbre BSP trop profond")
 		if checkpoint and depth % 8 == 0 then
 			checkpoint()
 		end
-		if index < 0 then
-			return r.bsp.leaves[-index].solid and 1 or 2
+		local node = data.nodes[index + 1]
+		local plane = data.planes[node.plane]
+		local n = plane.normal
+		local nx, ny, nz = n.x, n.y, n.z
+		local extent = (math.abs(nx) + math.abs(ny) + math.abs(nz)) * half
+		-- Use the extreme cell centres and the same float dot product as
+		-- leafOccupancy. Every centre lies between these projections.
+		extreme.x = nx >= 0 and low.x or high.x
+		extreme.y = ny >= 0 and low.y or high.y
+		extreme.z = nz >= 0 and low.z or high.z
+		local separation = extreme:Dot(n) - plane.distance - extent
+		if separation >= -EPS then
+			index = node.front
+		else
+			extreme.x = nx >= 0 and high.x or low.x
+			extreme.y = ny >= 0 and high.y or low.y
+			extreme.z = nz >= 0 and high.z or low.z
+			local d = extreme:Dot(n) - plane.distance
+			if d + extent > EPS or d - extent >= -EPS then
+				break
+			end
+			index = node.back
+			separation = -d - extent
 		end
-		local node = r.bsp.nodes[index + 1]
-		local p = r.bsp.planes[node.plane]
-		local n = p.normal
-		local d = center:Dot(n) - p.distance
-		local extent = (math.abs(n.x) + math.abs(n.y) + math.abs(n.z)) * half
-		if d - extent >= -EPS then
-			return walk(node.front, depth + 1)
+		-- Clip coordinates are local floats. Only skip a node when the
+		-- entire chunk is safely away from its plane in either representation.
+		if clipDepth == depth and separation > 1 / 64 then
+			clipIndex, clipDepth = index, depth + 1
 		end
-		if d + extent <= EPS then
-			return walk(node.back, depth + 1)
-		end
-		local front = walk(node.front, depth + 1)
-		if front == 3 then
-			return 3
-		end
-		local back = walk(node.back, depth + 1)
-		return front == back and front or 3
+		depth = depth + 1
 	end
-	local result = walk(r.bsp.head, 0)
-	if result == 1 then
-		return result
+	roots[key] = { index = index, depth = depth, clipIndex = clipIndex, clipDepth = clipDepth }
+	return index, depth, clipIndex, clipDepth
+end
+
+-- Classify a whole unedited cell without constructing clipped leaf boxes.
+-- Most cells are entirely air/solid; only mixed leaves need polyhedra/SAT.
+function V.BSPCellOccupancy(r, x, y, z, checkpoint)
+	local cache = r.bspOccupancyRoots and r.bspOccupancy
+	local key = cache and V.Index(x, y, z, r)
+	local cached = key and cache[key]
+	if cached then return cached end
+	local half = r.step * 0.5
+	local index, depth, clipIndex, clipDepth = occupancyRoot(r, x, y, z, half, checkpoint)
+	local center = index >= 0 and latticePoint(r, x + 0.5, y + 0.5, z + 0.5)
+	local result, cellRoot, cellDepth = leafOccupancy(r.bsp, index, depth, center, half, checkpoint)
+	if result ~= 1 then
+		local brushes = cellBrushes(r, x, y, z)
+		if #brushes > 0 then
+			center = center or latticePoint(r, x + 0.5, y + 0.5, z + 0.5)
+			result = brushOccupancy(brushes, center, half, result)
+		end
 	end
-	return brushOccupancy(cellBrushes(r, x, y, z), center, half, result)
+	if cache then
+		cache[key] = result
+		if result == 3 and index == clipIndex and depth == clipDepth then
+			r.bspCellClipRoots[key] = { index = cellRoot, depth = cellDepth }
+		end
+	end
+	return result
+end
+
+local function clipRoot(r, x, y, z, key, checkpoint)
+	local cell = r.bspCellClipRoots and r.bspCellClipRoots[key]
+	if cell then return cell.index, cell.depth end
+	local _, _, index, depth = occupancyRoot(r, x, y, z, r.step / 2, checkpoint)
+	return index, depth
 end
 
 function V.BSPCellMayHaveSurface(r, x, y, z, index)
 	index = index or V.Index(x, y, z, r)
-	if r.bspCellEditBins and r.bspCellEditBins[index] then
+	local edits = r.bspCellEditBins
+	if edits and edits[index] then
+		return true
+	end
+	if not edits and r.bspEditBins and r.bspEditBins[V.ChunkKey(math.floor(x / 8), math.floor(y / 8), math.floor(z / 8))] then
 		return true
 	end
 	if not V.BSPCellUsesDensity(r, x, y, z) then
@@ -980,21 +1306,23 @@ local function densityField(r, solid)
 				air[k] = v
 			end
 		end
-		air.values = {}
-		for i, value in ipairs(base.values) do
-			air.values[i] = -value
-		end
+		-- These cells only read the original field by index. Reversing
+		-- individual samples avoids copying a whole zone for the first fill.
+		air.values = setmetatable({}, {
+			__index = function(_, index)
+				local value = base.values[index]
+				return value and -value
+			end,
+		})
 		base.air = air
 	end
 	return base.air
 end
 
 local function clipBox(polygon, low, high)
-	for _, axis in ipairs(names) do
-		local n = Vector()
-		n[axis] = 1
-		polygon = V.ClipBSPPolygon(polygon, n, high[axis])
-		polygon = V.ClipBSPPolygon(polygon, -n, -low[axis])
+	for i, axis in ipairs(names) do
+		polygon = V.ClipBSPPolygon(polygon, boxNormals[i], high[axis])
+		polygon = V.ClipBSPPolygon(polygon, oppositeBoxNormals[i], -low[axis])
 		if #polygon < 3 then
 			break
 		end
@@ -1006,11 +1334,9 @@ local function cellLeaves(r, x, y, z, needAir, checkpoint)
 	local cache, key = V.TerrainCellCache(r, "bspLeaves", x, y, z)
 	local density = V.BSPCellUsesDensity(r, x, y, z)
 	local brushes = cellBrushes(r, x, y, z, density)
-	if density and #brushes > 0 then
-		needAir = true
-	end
+	needAir = needAir or #brushes > 0
 	local existing = cache[key]
-	if existing and (not density or not needAir or existing.hasAir) then
+	if existing and (not needAir or existing.hasAir) then
 		return existing
 	end
 	do
@@ -1030,24 +1356,24 @@ local function cellLeaves(r, x, y, z, needAir, checkpoint)
 			if needAir then
 				parts[#parts + 1] = { field = densityField(r, false), solid = false }
 			end
+			local cellBox
 			for _, part in ipairs(parts) do
 				for _, hull in ipairs(V.DensityCellPlanes(part.field, x, y, z)) do
-					local piece = box(low, low + Vector(1, 1, 1) * r.step)
+					cellBox = cellBox or box(low, low + Vector(1, 1, 1) * r.step)
+					local piece = cellBox
 					for _, plane in ipairs(hull) do
 						if piece then
-							piece = clip(piece, plane.n, plane.high)
-						end
-						if piece then
-							piece = clip(piece, -plane.n, -plane.low)
+							piece = clip(piece, plane.n, plane.high, nil, plane)
 						end
 					end
 					if piece then
-						pieces[#pieces + 1] = { faces = piece.faces, solid = part.solid }
+						pieces[#pieces + 1] = { faces = piece.faces, points = piece.points, solid = part.solid }
 					end
 				end
 			end
 		else
-			splitWorld(r.bsp, box(low, low + Vector(1, 1, 1) * r.step), r.origin, r.bsp.head, pieces, 0, checkpoint)
+			local index, depth = clipRoot(r, x, y, z, key, checkpoint)
+			splitWorld(r, box(low, low + Vector(1, 1, 1) * r.step), index, pieces, depth, checkpoint, needAir)
 		end
 		pieces = unionBrushes(pieces, brushes, r.origin, checkpoint)
 		pieces.hasAir = needAir
@@ -1070,8 +1396,11 @@ end
 local function brushNodeSample(r, op, p, key)
 	-- Adjacent cells use the same quantized lattice samples. Compute each
 	-- brush/node pair once, for ordinary tools as well as procedural blasts.
-	local cached = op.nodeSamples or {}
-	op.nodeSamples = cached
+	local cached = op.nodeSamples
+	if not cached then
+		cached = {}
+		op.nodeSamples = cached
+	end
 	local value = cached[key]
 	if value == nil then
 		value = op.plane and (op.plane.sign*p[names[op.plane.axis]]-op.plane.distance)
@@ -1087,15 +1416,12 @@ local function brushNodeSample(r, op, p, key)
 	end
 	return value
 end
-local function brushSamples(r, op, points)
-	local values = {}
-	for i, p in ipairs(points) do
-		values[i] = brushNodeSample(
-			r,
-			op,
-			p,
-			V.Index(math.floor(p.x / r.step + 0.5), math.floor(p.y / r.step + 0.5), math.floor(p.z / r.step + 0.5), r)
-		)
+local function brushSamples(r, op, points, key)
+	local values, cached = {}, op.nodeSamples
+	local row, layer = r.nx + 1, (r.nx + 1) * (r.ny + 1)
+	for i, offset in ipairs(V.CellOffsets) do
+		local index = key + offset[1] + offset[2] * row + offset[3] * layer
+		values[i] = cached and cached[index] or brushNodeSample(r, op, points[i], index)
 	end
 	return values
 end
@@ -1113,38 +1439,67 @@ local function tetTemplates(step)
 		end
 		local a, b, c = p[2] - p[1], p[3] - p[1], p[4] - p[1]
 		local det = a:Dot(b:Cross(c))
-		list[i] = { planes = tetPlanes(p), a = b:Cross(c) / det, b = c:Cross(a) / det, c = a:Cross(b) / det }
+		local planes = tetPlanes(p)
+		for _, plane in ipairs(planes) do
+			local n = plane.normal
+			-- Interior lattice planes are x=y, x=z or y=z, with either sign.
+			if n.x ~= 0 and n.y == -n.x and n.z == 0 then
+				plane.diagonal, plane.factor = 1, n.x
+			elseif n.x ~= 0 and n.z == -n.x and n.y == 0 then
+				plane.diagonal, plane.factor = 2, n.x
+			elseif n.y ~= 0 and n.z == -n.y and n.x == 0 then
+				plane.diagonal, plane.factor = 3, n.y
+			end
+		end
+		list[i] = { planes = planes, a = b:Cross(c) / det, b = c:Cross(a) / det, c = a:Cross(b) / det }
 	end
 	templates[step] = list
 	return list
 end
+local constantBrushNormal = Vector()
+local brushGradient, brushTerm = Vector(), Vector()
 local function operationPlane(op, points, values, indices, template)
 	local v1, v2, v3, v4 = values[indices[1]], values[indices[2]], values[indices[3]], values[indices[4]]
 	-- A linear function with four strictly positive/negative vertices cannot
 	-- cross this tetrahedron. Constant classifiers avoid gradient allocation
 	-- and polygon clipping in all of those interior/exterior tetrahedra.
 	if math.min(v1, v2, v3, v4) > 0 then
-		return { normal = Vector(), distance = -1, adding = op.adding, brush = op }
+		return { normal = constantBrushNormal, opposite = constantBrushNormal, distance = -1, adding = op.adding, brush = op, misses = true }
 	end
 	if math.max(v1, v2, v3, v4) < 0 then
-		return { normal = Vector(), distance = 1, adding = op.adding, brush = op }
+		return { normal = constantBrushNormal, opposite = constantBrushNormal, distance = 1, adding = op.adding, brush = op }
 	end
-	local n = template.a * (v2 - v1) + template.b * (v3 - v1) + template.c * (v4 - v1)
-	if n:LengthSqr() < 1e-16 then
-		return { normal = Vector(), distance = -v1, adding = op.adding, brush = op }
+	-- Keep the same float operations as the vector expression. The two
+	-- temporary vectors are never published and this calculation cannot yield.
+	brushGradient:Set(template.a)
+	brushGradient:Mul(v2 - v1)
+	brushTerm:Set(template.b)
+	brushTerm:Mul(v3 - v1)
+	brushGradient:Add(brushTerm)
+	brushTerm:Set(template.c)
+	brushTerm:Mul(v4 - v1)
+	brushGradient:Add(brushTerm)
+	if brushGradient:LengthSqr() < 1e-16 then
+		return { normal = constantBrushNormal, opposite = constantBrushNormal, distance = -v1, adding = op.adding, brush = op, misses = v1 > EPS }
 	end
-	local length = n:Length()
-	n = n / length
-	return { normal = n, distance = n:Dot(points[1]) - v1 / length, adding = op.adding, brush = op }
+	local length = brushGradient:Length()
+	local n = brushGradient / length
+	return { normal = n, opposite = -n, distance = n:Dot(points[1]) - v1 / length, adding = op.adding, brush = op }
 end
+local triangleEdgeA, triangleEdgeB = Vector(), Vector()
 local function triangles(polygon, normal, emit)
 	if #polygon < 3 then
 		return
 	end
 	for i = 2, #polygon - 1 do
 		local a, b, c = polygon[1], polygon[i], polygon[i + 1]
-		if (b - a):Cross(c - a):LengthSqr() > 0.000001 then
-			emit(a, b, c, normal)
+		triangleEdgeA:Set(b)
+		triangleEdgeA:Sub(a)
+		triangleEdgeB:Set(c)
+		triangleEdgeB:Sub(a)
+		local cross = triangleEdgeA:Cross(triangleEdgeB)
+		if cross:LengthSqr() > 0.000001 then
+			emit(a, b, c, normal, cross)
 		end
 	end
 end
@@ -1152,27 +1507,52 @@ end
 -- A tet turns each brush into a halfspace. Latest-first evaluation keeps
 -- only the remaining convex outside; final air never needs storing/splitting.
 function V.ApplyBSPBrushPlanes(pieces, operations, checkpoint)
-	local solids, hasAdd, hasRemove = {}, {}, {}
-	for i, op in ipairs(operations) do
-		hasAdd[i] = hasAdd[i - 1] or op.adding
-		hasRemove[i] = hasRemove[i - 1] or not op.adding
+	local solids = {}
+	local only = operations[1]
+	if #operations == 1 and not only.adding then
+		local opposite = not only.misses and (only.opposite or -only.normal)
+		for _, piece in ipairs(pieces) do
+			if piece.solid then
+				local kept = only.misses and piece or clip(piece, opposite, -only.distance, "cut")
+				if kept then solids[#solids + 1] = kept end
+			end
+			if checkpoint then checkpoint() end
+		end
+		return solids
 	end
+	local firstAdd, firstRemove = math.huge, math.huge
+	for i, op in ipairs(operations) do
+		if not op.misses then
+			if op.adding then
+				firstAdd = math.min(firstAdd, i)
+			else
+				firstRemove = math.min(firstRemove, i)
+			end
+			if firstAdd < math.huge and firstRemove < math.huge then break end
+		end
+	end
+	local opposites = {}
 	for _, piece in ipairs(pieces) do
 		local remaining = piece
 		for i = #operations, 1, -1 do
-			if (piece.solid and not hasRemove[i]) or (not piece.solid and not hasAdd[i]) then
+			if (piece.solid and i < firstRemove) or (not piece.solid and i < firstAdd) then
 				break
 			end
 			local op = operations[i]
-			if op.adding then
-				local inside = clip(remaining, op.normal, op.distance, "cut")
-				if inside then
-					solids[#solids + 1] = { faces = inside.faces, solid = true }
+			if not op.misses then
+				opposites[i] = opposites[i] or op.opposite or -op.normal
+				if op.adding then
+					local inside
+					inside, remaining = clipPair(remaining, op.normal, opposites[i], op.distance, "cut")
+					if inside then
+						solids[#solids + 1] = { faces = inside.faces, points = inside.points, solid = true }
+					end
+				else
+					remaining = clip(remaining, opposites[i], -op.distance, "cut")
 				end
-			end
-			remaining = clip(remaining, -op.normal, -op.distance, "cut")
-			if not remaining then
-				break
+				if not remaining then
+					break
+				end
 			end
 			if checkpoint and i % 8 == 0 then
 				checkpoint()
@@ -1202,9 +1582,13 @@ local function planeSlice(points, n, d)
 		end
 		polygon[#polygon + 1] = p
 	end
+	local distances = {}
+	for i, p in ipairs(points) do
+		distances[i] = p:Dot(n) - d
+	end
 	for _, edge in ipairs(tetEdges) do
 		local a, b = points[edge[1]], points[edge[2]]
-		local da, db = a:Dot(n) - d, b:Dot(n) - d
+		local da, db = distances[edge[1]], distances[edge[2]]
 		if math.abs(da) <= EPS then
 			add(a)
 		end
@@ -1221,23 +1605,7 @@ local function planeSlice(points, n, d)
 	if #polygon < 3 then
 		return {}
 	end
-	local center, delta = Vector(), Vector()
-	for _, p in ipairs(polygon) do
-		delta:Set(p)
-		delta:Div(#polygon)
-		center:Add(delta)
-	end
-	local u = n:Cross(math.abs(n.z) < 0.9 and Vector(0, 0, 1) or Vector(0, 1, 0)):GetNormalized()
-	local v = n:Cross(u)
-	local angles = {}
-	for _, p in ipairs(polygon) do
-		delta:Set(p)
-		delta:Sub(center)
-		angles[p] = math.atan2(delta:Dot(v), delta:Dot(u))
-	end
-	table.sort(polygon, function(a, b)
-		return angles[a] < angles[b]
-	end)
+	orderPolygon(polygon, n)
 	return polygon
 end
 
@@ -1251,7 +1619,7 @@ local function outsideSide(poly, n, d, probe)
 	end
 	return n:Dot(probe) > EPS
 end
-local function clipBrushSurface(polygon, brushes, origin, wantSolid, probe, emit)
+local function clipBrushSurface(polygon, brushes, origin, wantSolid, probe, emit, checkpoint)
 	if #polygon < 3 then
 		return
 	end
@@ -1276,7 +1644,8 @@ local function clipBrushSurface(polygon, brushes, origin, wantSolid, probe, emit
 		high[axis] = high[axis] + EPS
 	end
 	local air = { polygon }
-	for _, brush in ipairs(brushes) do
+	for i, brush in ipairs(brushes) do
+		if checkpoint and i % 16 == 0 then checkpoint() end
 		if V.BoundsOverlap(low, high, brush.low, brush.high) then
 			local remainingAir = {}
 			for _, poly in ipairs(air) do
@@ -1327,20 +1696,24 @@ local function clipBrushSurface(polygon, brushes, origin, wantSolid, probe, emit
 	end
 end
 
-function V.ClipBSPDetailOpening(r, polygon, normal, x, y, z, emit)
-	clipBrushSurface(polygon, cellBrushes(r, x, y, z, true), Vector(), false, normal, emit)
+function V.ClipBSPDetailOpening(r, polygon, normal, x, y, z, emit, checkpoint)
+	clipBrushSurface(polygon, cellBrushes(r, x, y, z, true), Vector(), false, normal, emit, checkpoint)
 end
 
 local function clipDensitySurface(r, x, y, z, polygon, wantSolid, probe, emit)
 	for _, shape in ipairs(V.DensityCellPlanes(densityField(r, wantSolid), x, y, z)) do
 		local part = polygon
 		for _, plane in ipairs(shape) do
-			if outsideSide(part, plane.n, plane.high, probe) or outsideSide(part, -plane.n, -plane.low, probe) then
+			local opposite = plane.opposite or -plane.n
+			if outsideSide(part, plane.n, plane.high, probe) or outsideSide(part, opposite, -plane.low, probe) then
 				part = {}
 				break
 			end
 			part = V.ClipBSPPolygon(part, plane.n, plane.high)
-			part = V.ClipBSPPolygon(part, -plane.n, -plane.low)
+			if #part < 3 then
+				break
+			end
+			part = V.ClipBSPPolygon(part, opposite, -plane.low)
 			if #part < 3 then
 				break
 			end
@@ -1370,13 +1743,13 @@ local function baseOccupancy(r, x, y, z, checkpoint)
 	end
 	return brushOccupancy(
 		cellBrushes(r, x, y, z, true),
-		r.origin + Vector(x + 0.5, y + 0.5, z + 0.5) * r.step,
+		latticePoint(r, x + 0.5, y + 0.5, z + 0.5),
 		r.step / 2,
 		result
 	)
 end
 
-local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occupancy)
+local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occupancy, clipIndex)
 	if #polygon < 3 then
 		return
 	end
@@ -1391,9 +1764,14 @@ local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occu
 		if wantSolid then
 			clipDensitySurface(r, x, y, z, polygon, true, probe, emit)
 		end
-		clipDensitySurface(r, x, y, z, polygon, false, probe, function(part)
-			clipBrushSurface(part, brushes, r.origin, wantSolid, probe, emit)
-		end)
+		-- Displacement air can contribute a solid only through a detail brush.
+		if #brushes > 0 then
+			clipDensitySurface(r, x, y, z, polygon, false, probe, function(part)
+				clipBrushSurface(part, brushes, r.origin, wantSolid, probe, emit)
+			end)
+		elseif not wantSolid then
+			clipDensitySurface(r, x, y, z, polygon, false, probe, emit)
+		end
 		return
 	end
 	local function walk(poly, index)
@@ -1412,7 +1790,8 @@ local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occu
 		end
 		local node = r.bsp.nodes[index + 1]
 		local plane = r.bsp.planes[node.plane]
-		local n, d = plane.normal, plane.distance - plane.normal:Dot(r.origin)
+		local n = plane.normal
+		local d = localPlaneDistance(r, plane)
 		local lo, hi = math.huge, -math.huge
 		for _, p in ipairs(poly) do
 			local q = p:Dot(n) - d
@@ -1430,10 +1809,10 @@ local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occu
 			walk(V.ClipBSPPolygon(poly, n, d), node.back)
 		end
 	end
-	walk(polygon, r.bsp.head)
+	walk(polygon, clipIndex or r.bsp.head)
 end
 
-local function cutSurfaces(r, x, y, z, points, operations, emit, checkpoint, first, occupancy)
+local function cutSurfaces(r, x, y, z, points, operations, emit, checkpoint, first, occupancy, clipIndex)
 	for i = first or 1, #operations do
 		local op = operations[i]
 		local polygon = planeSlice(points, op.normal, op.distance)
@@ -1448,37 +1827,39 @@ local function cutSurfaces(r, x, y, z, points, operations, emit, checkpoint, fir
 				polygon = {}
 				break
 			end
-			polygon = V.ClipBSPPolygon(polygon, -later.normal, -later.distance)
+			polygon = V.ClipBSPPolygon(polygon, later.opposite, -later.distance)
 		end
-		local n = op.adding and op.normal or -op.normal
-		local function surface(poly)
-			triangles(poly, n, function(a, b, c, normal)
-				emit(a, b, c, normal, true, op.brush)
-			end)
-		end
-		-- Earlier brushes are classified latest-first on this 2D slice.
-		-- Never construct or split any 3D collision solid for a visual mesh.
-		for j = i - 1, 1, -1 do
-			if #polygon < 3 then
-				break
+		if #polygon >= 3 then
+			local n = op.adding and op.normal or -op.normal
+			local function surface(poly)
+				triangles(poly, n, function(a, b, c, normal, cross)
+					emit(a, b, c, normal, true, op.brush, nil, cross)
+				end)
 			end
-			local earlier = operations[j]
-			local inside = outsideSide(polygon, earlier.normal, earlier.distance, op.normal) and {}
-				or V.ClipBSPPolygon(polygon, earlier.normal, earlier.distance)
-			if earlier.adding ~= op.adding then
-				surface(inside)
+			-- Earlier brushes are classified latest-first on this 2D slice.
+			-- Never construct or split any 3D collision solid for a visual mesh.
+			for j = i - 1, 1, -1 do
+				if #polygon < 3 then
+					break
+				end
+				local earlier = operations[j]
+				local inside = outsideSide(polygon, earlier.normal, earlier.distance, op.normal) and {}
+					or V.ClipBSPPolygon(polygon, earlier.normal, earlier.distance)
+				if earlier.adding ~= op.adding then
+					surface(inside)
+				end
+				polygon = outsideSide(polygon, earlier.opposite, -earlier.distance, op.normal) and {}
+					or V.ClipBSPPolygon(polygon, earlier.opposite, -earlier.distance)
 			end
-			polygon = outsideSide(polygon, -earlier.normal, -earlier.distance, op.normal) and {}
-				or V.ClipBSPPolygon(polygon, -earlier.normal, -earlier.distance)
+			clipBaseSurface(r, x, y, z, polygon, not op.adding, op.normal, surface, occupancy, clipIndex)
 		end
-		clipBaseSurface(r, x, y, z, polygon, not op.adding, op.normal, surface, occupancy)
 		if checkpoint then
 			checkpoint()
 		end
 	end
 end
 
-local function fillWholeBrushCell(r, low, high, last, result)
+local function fillWholeBrushCell(r, low, high, last, result, key)
 	if
 		not last
 		or low.x <= EPS
@@ -1492,8 +1873,7 @@ local function fillWholeBrushCell(r, low, high, last, result)
 	end
 	-- Strict quantized samples prove containment in the linear field. Older
 	-- journals without this index retain the conservative spherical-core test.
-	local key =
-		V.Index(math.floor(low.x / r.step + 0.5), math.floor(low.y / r.step + 0.5), math.floor(low.z / r.step + 0.5), r)
+
 	if not (last.fullCells and last.fullCells[key]) then
 		if last.plane then return false end
 		if last.floorZ ~= nil and low.z <= last.floorZ + 1 / 64 then
@@ -1534,7 +1914,7 @@ function V.BSPCell(r, x, y, z, checkpoint)
 		high = low + Vector(1, 1, 1) * r.step
 		-- A final interior has no original face left to recover.
 		-- Decide before displacement triangulation/BSP occupancy work.
-		if fillWholeBrushCell(r, low, high, lastIndexed, result) then
+		if fillWholeBrushCell(r, low, high, lastIndexed, result, key) then
 			cache[key] = result
 			return result
 		end
@@ -1558,8 +1938,8 @@ function V.BSPCell(r, x, y, z, checkpoint)
 			end
 		end
 	end
-	local function emit(a, b, c, n, curved, brush, source)
-		result.triangles[#result.triangles + 1] = { a, b, c, n, curved, brush, source }
+	local function emit(a, b, c, n, curved, brush, source, cross)
+		result.triangles[#result.triangles + 1] = { a, b, c, n, curved, brush, source, cross }
 	end
 	low = low or Vector(x, y, z) * r.step
 	high = high or low + Vector(1, 1, 1) * r.step
@@ -1628,37 +2008,29 @@ function V.BSPCell(r, x, y, z, checkpoint)
 			end
 		end
 	end
-	local edits = {}
-	local candidates = r.bspEditBins
-			and r.bspEditBins[V.ChunkKey(math.floor(x / 8), math.floor(y / 8), math.floor(z / 8))]
-		or {}
+	local edits = indexed or EMPTY
 	if not r.bspCellEditBins then
-		for _, op in ipairs(candidates or {}) do
-			local dx = math.max(low.x - op.center.x, 0, op.center.x - high.x)
-			local dy = math.max(low.y - op.center.y, 0, op.center.y - high.y)
-			local dz = math.max(low.z - op.center.z, 0, op.center.z - high.z)
-			if dx * dx + dy * dy + dz * dz < op.radius ^ 2 then
-				local near = 0
-				for _, axis in ipairs(names) do
-					local a = low[axis] > EPS and math.abs(low[axis] - op.center[axis]) or math.huge
-					local b = high[axis] < V.RegionAxisSize(r, axis) - EPS and math.abs(high[axis] - op.center[axis])
-						or math.huge
-					near = near + math.min(a, b) ^ 2
-				end
-				-- No negative brush sample means no tetrahedron can be cut.
-				-- Avoid splitting the BSP merely because the sphere's AABB or
-				-- curved edge grazes a cell between its interpolation samples.
-				if near < (op.radius - 1 / 128) ^ 2 then
-					edits[#edits + 1] = op
+		local candidates = r.bspEditBins
+			and r.bspEditBins[V.ChunkKey(math.floor(x / 8), math.floor(y / 8), math.floor(z / 8))]
+		edits = {}
+		for _, op in ipairs(candidates or EMPTY) do
+			local target = op.plane and op.plane.cell
+			if not target or (x == target[1] and y == target[2] and z == target[3]) then
+				-- Legacy chunk bins have no per-cell membership. Apply the
+				-- same quantized node test, including clipped and planar edits.
+				for _, o in ipairs(V.CellOffsets) do
+					local px, py, pz = x + o[1], y + o[2], z + o[3]
+					local node = V.Index(px, py, pz, r)
+					if brushNodeSample(r, op, Vector(px, py, pz) * r.step, node) <= 0 then
+						edits[#edits + 1] = op
+						break
+					end
 				end
 			end
 		end
 	end
-	if r.bspCellEditBins then
-		edits = r.bspCellEditBins[key] or {}
-	end
 	local last = edits[#edits]
-	if fillWholeBrushCell(r, low, high, last, result) then
+	if fillWholeBrushCell(r, low, high, last, result, key) then
 		cache[key] = result
 		return result
 	end
@@ -1668,8 +2040,8 @@ function V.BSPCell(r, x, y, z, checkpoint)
 			for _, p in ipairs(face.vertices) do
 				polygon[#polygon + 1] = face.localSpace and p or p - r.origin
 			end
-			triangles(clipBox(polygon, low, high), face.normal, function(a, b, c, n)
-				emit(a, b, c, n, face.curved, nil, face.source or (not face.localSpace and face or nil))
+			triangles(clipBox(polygon, low, high), face.normal, function(a, b, c, n, cross)
+				emit(a, b, c, n, face.curved, nil, face.source or (not face.localSpace and face or nil), cross)
 			end)
 		end
 	else
@@ -1688,10 +2060,24 @@ function V.BSPCell(r, x, y, z, checkpoint)
 			end
 		end
 		local nodes = {}
-		for i, o in ipairs(V.CellOffsets) do
-			nodes[i] = Vector(x + o[1], y + o[2], z + o[3]) * r.step
+		local lattice = r.bspBrushNodes
+		if not lattice then
+			lattice = {}
+			r.bspBrushNodes = lattice
 		end
-		local samples = {}
+		local row, layer = r.nx + 1, (r.nx + 1) * (r.ny + 1)
+		for i, o in ipairs(V.CellOffsets) do
+			local index = key + o[1] + o[2] * row + o[3] * layer
+			local point = lattice[index]
+			if not point then
+				point = Vector(x + o[1], y + o[2], z + o[3]) * r.step
+				lattice[index] = point
+			end
+			nodes[i] = point
+		end
+		local samples, localFaces = {}, {}
+		-- The cut slices from this cell use the same BSP in local space.
+		local clipIndex = result.baseOccupancy == 3 and not density and clipRoot(r, x, y, z, key, checkpoint)
 		local templateList = tetTemplates(r.step)
 		for ti, indices in ipairs(V.CellTetrahedra) do
 			local oldTet = parent and parent.tetrahedra and parent.tetrahedra[ti]
@@ -1709,31 +2095,35 @@ function V.BSPCell(r, x, y, z, checkpoint)
 				end
 			end
 			local operations, lookup = {}, {}
+			local tetFirst = 1
 			local unchanged = oldTet ~= nil
 			for i, op in ipairs(edits) do
 				local plane = oldTet and oldTet.operationPlanes and oldTet.operationPlanes[op.index]
 				if not plane then
-					samples[i] = samples[i] or brushSamples(r, op, nodes)
+					samples[i] = samples[i] or brushSamples(r, op, nodes, key)
 					plane = operationPlane(op, points, samples[i], indices, template)
 				end
-				operations[#operations + 1] = plane
+				if not plane.misses then
+					operations[#operations + 1] = plane
+					if i < first then tetFirst = tetFirst + 1 end
+				end
 				lookup[op.index] = plane
 				if i >= first and (plane.normal:LengthSqr() > 1e-16 or plane.distance >= 0) then
 					unchanged = false
 				end
 			end
-			local final = operations[#operations]
-			if final and not final.adding and final.normal:LengthSqr() == 0 and final.distance > 0 then
-				-- All four quantized corners are strictly inside the last
-				-- removal. Its linear tetrahedron is empty regardless of
-				-- the BSP or earlier edits; neither slices nor hulls remain.
+			local final = lookup[edits[#edits].index]
+			if final and final.normal == constantBrushNormal and final.distance > EPS then
+				-- A completely overwritten tetrahedron has no internal
+				-- visible face. For a fill, retain the original convex
+				-- partition when preparing collision contacts.
 				result.tetrahedra[#result.tetrahedra + 1] = {
 					points = points,
 					planes = planes,
 					operations = operations,
 					operationPlanes = lookup,
 					triangles = {},
-					solids = {},
+					solids = not final.adding and {} or nil,
 				}
 			elseif unchanged then
 				-- This stroke misses the entire tetrahedron. Its geometry
@@ -1753,9 +2143,15 @@ function V.BSPCell(r, x, y, z, checkpoint)
 				-- Removal composes directly with the preceding final solid.
 				-- Replaying its entire brush history from the BSP partitions
 				-- the same volumes again. Additions still need original air.
-				if oldTet and oldTet.solids then
+				if oldTet and oldTet.solids and final.adding and not final.misses
+					and tetFirst == #operations and result.baseOccupancy ~= 3 then
+					-- A homogeneous original tetrahedron needs no BSP air
+					-- partition. Replace its added halfspace directly.
+					tet.previousSolids = oldTet.solids
+					tet.addition = final
+				elseif oldTet and oldTet.solids then
 					local removals = {}
-					for i = first, #operations do
+					for i = tetFirst, #operations do
 						if operations[i].adding then
 							removals = nil
 							break
@@ -1773,9 +2169,12 @@ function V.BSPCell(r, x, y, z, checkpoint)
 					if not alreadySplit then
 						for _, plane in ipairs(planes) do
 							polygon = V.ClipBSPPolygon(polygon, plane.normal, plane.distance)
+							if #polygon < 3 then
+								return
+							end
 						end
 					end
-					for i = first, #operations do
+					for i = tetFirst, #operations do
 						local op = operations[i]
 						if op.normal:LengthSqr() > 0.5 then
 							local coplanar = true
@@ -1790,13 +2189,13 @@ function V.BSPCell(r, x, y, z, checkpoint)
 								break
 							end
 						end
-						polygon = V.ClipBSPPolygon(polygon, -op.normal, -op.distance)
+						polygon = V.ClipBSPPolygon(polygon, op.opposite, -op.distance)
 						if #polygon < 3 then
 							break
 						end
 					end
-					triangles(polygon, normal, function(a, b, c, n)
-						emit(a, b, c, n, curved, brush, source)
+					triangles(polygon, normal, function(a, b, c, n, cross)
+						emit(a, b, c, n, curved, brush, source, cross)
 					end)
 				end
 				if parent then
@@ -1804,10 +2203,14 @@ function V.BSPCell(r, x, y, z, checkpoint)
 						retain({ t[1], t[2], t[3] }, t[4], t[5], oldTet ~= nil, t[6], t[7])
 					end
 				else
-					for _, face in ipairs(faces) do
-						local polygon = {}
-						for _, p in ipairs(face.vertices) do
-							polygon[#polygon + 1] = face.localSpace and p or p - r.origin
+					for faceIndex, face in ipairs(faces) do
+						local polygon = face.localSpace and face.vertices or localFaces[faceIndex]
+						if not polygon then
+							polygon = {}
+							for vertexIndex, point in ipairs(face.vertices) do
+								polygon[vertexIndex] = point - r.origin
+							end
+							localFaces[faceIndex] = polygon
 						end
 						retain(
 							polygon,
@@ -1819,7 +2222,7 @@ function V.BSPCell(r, x, y, z, checkpoint)
 						)
 					end
 				end
-				cutSurfaces(r, x, y, z, points, operations, emit, checkpoint, first, result.baseOccupancy)
+				cutSurfaces(r, x, y, z, points, operations, emit, checkpoint, tetFirst, result.baseOccupancy, clipIndex)
 				for i = start, #result.triangles do
 					tet.triangles[#tet.triangles + 1] = result.triangles[i]
 				end
@@ -1831,6 +2234,19 @@ function V.BSPCell(r, x, y, z, checkpoint)
 	end
 	cache[key] = result
 	return result
+end
+
+-- Distance to the nearest non-border corner separates by lattice axis.
+local function brushAxisDistances(center, first, last, step, extent)
+	local distances = {}
+	for cell = first, last do
+		local a, b = cell * step, (cell + 1) * step
+		distances[cell] = math.min(
+			a > EPS and math.abs(a - center) or math.huge,
+			b < extent - EPS and math.abs(b - center) or math.huge
+		) ^ 2
+	end
+	return distances
 end
 
 function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
@@ -1863,26 +2279,33 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, p
 			end
 		end
 	end
-	r.bspCellEditBins = r.bspCellEditBins or {}
+	if not r.bspCellEditBins then
+		-- Keep a legacy journal on its complete chunk index. Creating a
+		-- partial cell index would hide every operation before this stroke.
+		if #r.bspEdits > 1 then return end
+		r.bspCellEditBins = {}
+	end
 	local step = r.step
+	local x0 = math.max(0, math.floor((p.x - radius) / step))
+	local y0 = math.max(0, math.floor((p.y - radius) / step))
+	local z0 = math.max(0, math.floor(lowZ / step))
+	local x1 = math.min(V.RegionCells(r, "x") - 1, math.floor((p.x + radius) / step))
+	local y1 = math.min(V.RegionCells(r, "y") - 1, math.floor((p.y + radius) / step))
+	local z1 = math.min(V.RegionCells(r, "z") - 1, math.floor((p.z + radius) / step))
+	local nearX, nearY, nearZ
+	if not op.plane then
+		nearX = brushAxisDistances(p.x, x0, x1, step, V.RegionAxisSize(r, "x"))
+		nearY = brushAxisDistances(p.y, y0, y1, step, V.RegionAxisSize(r, "y"))
+		nearZ = brushAxisDistances(p.z, z0, z1, step, V.RegionAxisSize(r, "z"))
+	end
+	local nearLimit = (radius - 1 / 128) ^ 2
+	local target = op.plane and op.plane.cell
 	op.nodeSamples = {}
-	for z = math.max(0, math.floor(lowZ / step)), math.min(V.RegionCells(r, "z") - 1, math.floor((p.z + radius) / step)) do
-		for y = math.max(0, math.floor((p.y - radius) / step)), math.min(V.RegionCells(r, "y") - 1, math.floor((p.y + radius) / step)) do
-			for x = math.max(0, math.floor((p.x - radius) / step)), math.min(V.RegionCells(r, "x") - 1, math.floor((p.x + radius) / step)) do
-				local near = 0
-				for i, axis in ipairs(names) do
-					local cell = i == 1 and x or i == 2 and y or z
-					local a, b = cell * step, (cell + 1) * step
-					near = near
-						+ math.min(
-								a > EPS and math.abs(a - p[axis]) or math.huge,
-								b < V.RegionAxisSize(r, axis) - EPS and math.abs(b - p[axis]) or math.huge
-							)
-							^ 2
-				end
-				local target=op.plane and op.plane.cell
-				if (not target or (x==target[1] and y==target[2] and z==target[3]))
-					and (op.plane or near < (radius - 1 / 128) ^ 2) then
+	for z = z0, z1 do
+		for y = y0, y1 do
+			for x = x0, x1 do
+				if (not target or (x == target[1] and y == target[2] and z == target[3]))
+					and (op.plane or nearX[x] + nearY[y] + nearZ[z] < nearLimit) then
 					-- The actual quantized corner samples define all six
 					-- linear tetrahedra, including procedural explosions.
 					-- Strict signs prove the whole cell is missed or filled;
@@ -1944,51 +2367,111 @@ local function wholeTet(tet)
 			vertices = { tet.points[indices[1]], tet.points[indices[2]], tet.points[indices[3]] },
 		}
 	end
-	return { faces = faces, solid = true }
+	return { faces = faces, points = tet.points, solid = true }
 end
 
--- Original map x lattice tetrahedra never change. Compile these intersections
--- near the scan focus during analysis; distant cells compile on first use.
--- Air is compiled only for additions. This bounds the scan's memory overhead.
-local function prewarmCell(r, x, y, z)
+-- Prewarm original BSP intersections near the focus. Compile SAT axes only
+-- for the final solids that actually survive an edit.
+function V.BSPCollisionNearFocus(r, x, y, z, radius)
 	local dx, dy, dz =
 		x + 0.5 - V.RegionCells(r, "x") / 2, y + 0.5 - V.RegionCells(r, "y") / 2, z + 0.5 - V.RegionCells(r, "z") / 2
-	return (dx * dx + dy * dy + dz * dz) * r.step * r.step <= (80 + 2 * r.step) ^ 2
+	return (dx * dx + dy * dy + dz * dz) * r.step * r.step <= ((radius or 80) + 2 * r.step) ^ 2
 end
-local function baseTetrahedra(r, x, y, z, checkpoint, needAir)
+local function diagonalBounds(piece)
+	local bounds = piece.diagonalBounds
+	if not bounds then
+		local points = piece.points
+		if not points then
+			points = {}
+			for _, face in ipairs(piece.faces) do
+				for _, p in ipairs(face.vertices) do
+					points[#points + 1] = p
+				end
+			end
+		end
+		local minXY, minXZ, minYZ = math.huge, math.huge, math.huge
+		local maxXY, maxXZ, maxYZ = -math.huge, -math.huge, -math.huge
+		for _, p in ipairs(points) do
+			local px, py, pz = p.x, p.y, p.z
+			local xy, xz, yz = px - py, px - pz, py - pz
+			minXY, maxXY = math.min(minXY, xy), math.max(maxXY, xy)
+			minXZ, maxXZ = math.min(minXZ, xz), math.max(maxXZ, xz)
+			minYZ, maxYZ = math.min(minYZ, yz), math.max(maxYZ, yz)
+		end
+		bounds = { minXY, minXZ, minYZ, maxXY, maxXZ, maxYZ }
+		piece.diagonalBounds = bounds
+	end
+	return bounds
+end
+
+local function clipLeafToTet(piece, planes, distances)
+	local bounds = diagonalBounds(piece)
+	for i, plane in ipairs(planes) do
+		local axis, factor = plane.diagonal, plane.factor
+		if axis then
+			local nearest = factor * bounds[factor < 0 and axis + 3 or axis]
+			-- Source rounds each clipped coordinate to a float. At the maximum
+			-- 32 m scan size, 1/64 SU exceeds the rounding of all earlier cuts.
+			-- Near a lattice plane, always run the original clip sequence.
+			if nearest - distances[i] > 1 / 64 then
+				return
+			end
+		end
+	end
+	for i, plane in ipairs(planes) do
+		piece = clip(piece, plane.normal, distances[i])
+		if not piece then
+			return
+		end
+	end
+	return piece
+end
+
+local function baseTetrahedra(r, x, y, z, checkpoint, needAir, requested)
 	local cache, key = V.TerrainCellCache(r, "bspBaseTets", x, y, z)
-	if cache[key] and (not needAir or cache[key].hasAir) then
-		return cache[key]
+	local all = cache[key]
+	if not all then
+		all = {}
+	end
+	if requested and all[requested] and (not needAir or all.air and all.air[requested]) then
+		return all[requested]
+	elseif not requested and all.prepared then
+		return all
 	end
 	local low = Vector(x, y, z) * r.step
 	local templates = tetTemplates(r.step)
 	local leaves = cellLeaves(r, x, y, z, needAir, checkpoint)
-	local all = { hasAir = needAir }
-	for ti, template in ipairs(templates) do
-		local pieces = {}
-		for _, leaf in ipairs(leaves) do
-			if leaf.solid or needAir then
-				local piece = leaf
-				for _, plane in ipairs(template.planes) do
+	for ti = requested or 1, requested or #templates do
+		local pieces = all[ti]
+		if not pieces or needAir and not (all.air and all.air[ti]) then
+			pieces = {}
+			local planes, distances = templates[ti].planes, {}
+			for i, plane in ipairs(planes) do
+				distances[i] = plane.distance + plane.normal:Dot(low)
+			end
+			for _, leaf in ipairs(leaves) do
+				if leaf.solid or needAir then
+					local piece = clipLeafToTet(leaf, planes, distances)
 					if piece then
-						piece = clip(piece, plane.normal, plane.distance + plane.normal:Dot(low))
+						pieces[#pieces + 1] = piece
 					end
-				end
-				if piece then
-					pieces[#pieces + 1] = piece
-					if piece.solid and V.BSPPieceHull then
-						V.BSPPieceHull(piece, checkpoint)
+					if checkpoint then
+						checkpoint()
 					end
-				end
-				if checkpoint then
-					checkpoint()
 				end
 			end
+			all[ti] = pieces
+			if needAir then
+				all.air = all.air or {}
+				all.air[ti] = true
+			end
 		end
-		all[ti] = pieces
+	end
+	if not requested then
+		all.prepared = true
 	end
 	cache[key] = all
-	return all
+	return requested and all[requested] or all
 end
 
 function V.PrepareBSPCollisionCell(r, x, y, z, checkpoint)
@@ -2000,28 +2483,42 @@ function V.PrepareBSPCollisionCell(r, x, y, z, checkpoint)
 	if
 		r.bsp
 		and #r.bspEdits == 0
-		and prewarmCell(r, x, y, z)
 		and V.BSPCellUsesDensity(r, x, y, z)
+		and V.BSPCollisionNearFocus(r, x, y, z)
 		and baseOccupancy(r, x, y, z, checkpoint) == 3
 	then
 		baseTetrahedra(r, x, y, z, checkpoint)
 	end
 end
 
-function V.BSPCellSolids(r, x, y, z, checkpoint)
+-- Unedited mixed BSP cells already have a proven occupancy. The scan
+-- can prepare their exact hulls even when no visible face uses that cell.
+function V.BSPCellSolids(r, x, y, z, checkpoint, originalMixed)
+	if originalMixed then
+		if V.BSPCollisionNearFocus(r, x, y, z) then
+			baseTetrahedra(r, x, y, z, checkpoint)
+		end
+		local leaves = cellLeaves(r, x, y, z, false, checkpoint)
+		local solids = {}
+		for _, piece in ipairs(leaves) do
+			if piece.solid then solids[#solids + 1] = piece end
+		end
+		return solids
+	end
 	local cell = V.BSPCell(r, x, y, z, checkpoint)
 	if not cell.solids then
 		local solids = {}
-		local needAir, hasPrevious = false, false
-		for _, tet in ipairs(cell.tetrahedra or {}) do
+		local needsAir, hasPrevious = nil, false
+		for ti, tet in ipairs(cell.tetrahedra or {}) do
 			local previous = tet.solids or tet.previousSolids
-			if previous and #previous > 0 then
+			if previous and (#previous > 0 or tet.addition) then
 				hasPrevious = true
 			end
 			if not tet.solids and not tet.previousSolids then
 				for _, op in ipairs(tet.operations) do
 					if op.adding then
-						needAir = true
+						needsAir = needsAir or {}
+						needsAir[ti] = true
 						break
 					end
 				end
@@ -2032,10 +2529,7 @@ function V.BSPCellSolids(r, x, y, z, checkpoint)
 		-- tetrahedra. Don't reconstruct each one by clipping a cube against
 		-- its four planes. Originally empty cells cannot gain matter from
 		-- removal-only history either.
-		local original = occupancy == 3
-			and (cell.tetrahedra or prewarmCell(r, x, y, z))
-			and baseTetrahedra(r, x, y, z, checkpoint, needAir)
-		if occupancy == 2 and not needAir and not hasPrevious then
+		if occupancy == 2 and not needsAir and not hasPrevious then
 			cell.solids = solids
 			return solids
 		elseif cell.tetrahedra then
@@ -2043,22 +2537,32 @@ function V.BSPCellSolids(r, x, y, z, checkpoint)
 				-- BSPCell retains an old tetrahedron only when the new brush
 				-- misses it. Its immutable final solids remain valid too.
 				if not tet.solids then
-					if tet.previousSolids then
+					if tet.addition then
+						local addition = tet.addition
+						local filled = clip(wholeTet(tet), addition.normal, addition.distance, "cut")
+						local retained = filled and { filled } or {}
+						for _, piece in ipairs(tet.previousSolids) do
+							local outside = clip(piece, addition.opposite, -addition.distance, "cut")
+							if outside then retained[#retained + 1] = outside end
+							if checkpoint then checkpoint() end
+						end
+						tet.solids = retained
+						tet.previousSolids, tet.addition = nil, nil
+					elseif tet.previousSolids then
 						tet.solids = V.ApplyBSPBrushPlanes(tet.previousSolids, tet.removals, checkpoint)
 						tet.previousSolids = nil
 						tet.removals = nil
+					elseif occupancy == 2 and not (needsAir and needsAir[ti]) then
+						tet.solids = EMPTY
 					else
-						local pieces = {}
+						local pieces
 						if occupancy ~= 3 then
 							local piece = wholeTet(tet)
 							piece.solid = occupancy == 1
-							pieces[1] = piece
+							pieces = { piece }
 						else
-							for _, piece in ipairs(original[ti]) do
-								if piece.solid or needAir then
-									pieces[#pieces + 1] = piece
-								end
-							end
+							local needAir = needsAir and needsAir[ti]
+							pieces = baseTetrahedra(r, x, y, z, checkpoint, needAir, ti)
 						end
 						tet.solids = V.ApplyBSPBrushPlanes(pieces, tet.operations, checkpoint)
 					end
@@ -2071,6 +2575,9 @@ function V.BSPCellSolids(r, x, y, z, checkpoint)
 				end
 			end
 		else
+			if occupancy == 3 and V.BSPCollisionNearFocus(r, x, y, z) then
+				baseTetrahedra(r, x, y, z, checkpoint)
+			end
 			if occupancy == 1 then
 				local low = Vector(x, y, z) * r.step
 				local piece = box(low, low + Vector(1, 1, 1) * r.step)
@@ -2089,12 +2596,15 @@ function V.BSPCellSolids(r, x, y, z, checkpoint)
 	return cell.solids
 end
 
-function V.BSPBoundaryOpening(r, face)
+function V.BSPBoundaryOpening(r, face, checkpoint)
 	local vertices = {}
+	local visits = 0
 	local function walk(polygon, index, depth)
 		if #polygon < 3 then
 			return
 		end
+		visits = visits + 1
+		if checkpoint and visits % 16 == 0 then checkpoint() end
 		assert(depth < 1024, "arbre BSP trop profond")
 		if index < 0 then
 			if not r.bsp.leaves[-index].solid then
@@ -2104,7 +2614,7 @@ function V.BSPBoundaryOpening(r, face)
 							vertices[#vertices + 1] = { pos = p, normal = n, u = 0, v = 0 }
 						end
 					end)
-				end)
+				end, checkpoint)
 			end
 			return
 		end

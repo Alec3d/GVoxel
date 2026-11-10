@@ -82,7 +82,8 @@ function V.TracePlayerTerrain(ply, r, start, finish, mins, maxs, options)
 	merge(nativeTrace(ply, start, finish, mins, maxs, true, options))
 	if outsideBlocked(ply, r, start, finish, mins, maxs, options) then
 		local delta = finish - start
-		local inside = outsideBlocked(ply, r, start, start, mins, maxs, options)
+		local moving = delta.x ~= 0 or delta.y ~= 0 or delta.z ~= 0
+		local inside = not moving or outsideBlocked(ply, r, start, start, mins, maxs, options)
 		local lo, hi = 0, 1
 		if not inside then
 			for _ = 1, 16 do
@@ -370,14 +371,15 @@ hook.Add("Move", "GVoxel.SmoothMovement", function(ply, mv)
 	end
 	local mins, maxs = standMin, standMax
 	local crouched = ply:IsFlagSet(FL_DUCKING)
-	local duckMin, duckMax = ply:GetHullDuck()
+	local standing
 	if mv:KeyDown(IN_DUCK) then
 		crouched = true
-	elseif crouched and not V.TracePlayerTerrain(ply, r, pos, pos, standMin, standMax).StartSolid then
-		crouched = false
+	elseif crouched then
+		standing = V.TracePlayerTerrain(ply, r, pos, pos, standMin, standMax)
+		crouched = standing.StartSolid
 	end
 	if crouched then
-		mins, maxs = duckMin, duckMax
+		mins, maxs = ply:GetHullDuck()
 		ply:AddFlags(FL_DUCKING + FL_ANIMDUCKING)
 	else
 		ply:RemoveFlags(FL_DUCKING + FL_ANIMDUCKING)
@@ -385,7 +387,7 @@ hook.Add("Move", "GVoxel.SmoothMovement", function(ply, mv)
 	local trace = function(a, b)
 		return V.TracePlayerTerrain(ply, r, a, b, mins, maxs)
 	end
-	if trace(pos, pos).StartSolid then
+	if (not crouched and standing or trace(pos, pos)).StartSolid then
 		-- A completed scan may differ slightly from the BSP at the feet. Find
 		-- a nearby clear stance vertically before enabling walking.
 		-- An impossible stance used to run 64 full SAT/world probes on EVERY

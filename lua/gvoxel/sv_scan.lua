@@ -184,13 +184,16 @@ function V.CommitScanEdit(scan)
 	elseif V.QueuePropColliders then
 		V.QueuePropColliders(r, work.dirty)
 	end
+	local publishedAt = SysTime()
 	r.editStats = {
 		total = work.total or 0,
 		peak = work.peak or 0,
-		latency = SysTime() - work.started,
+		latency = publishedAt - work.started,
+		queueWait = work.started - (work.queuedAt or work.started),
+		requestLatency = publishedAt - (work.queuedAt or work.started),
 		prepare = work.preparedAt and work.preparedAt - work.started or 0,
 		physicsWait = work.sentAt and work.sentAt - (work.preparedAt or work.started) or 0,
-		displayWait = work.sentAt and SysTime() - work.sentAt or 0,
+		displayWait = work.sentAt and publishedAt - work.sentAt or 0,
 		phases = work.phases,
 		chunks = chunks,
 		nativeCount = cooks and cooks.count - (work.nativeCount or cooks.count) or 0,
@@ -204,8 +207,21 @@ function V.CommitScanEdit(scan)
     if V.ScheduleDetachedCleanup then V.ScheduleDetachedCleanup(scan,work) end
     if V.MarkZoneCacheDirty then V.MarkZoneCacheDirty(scan) end
 end
+local function permitEdit(scan)
+	local work = scan.editWork
+	if not work or work.thread or work.sent or not work.field or scan.failed then return end
+	if V.PropEditReady and not V.PropEditReady(scan.region, work.field.revision) then return end
+	work.sentAt = SysTime()
+	V.PublishScanEdit(scan, work)
+end
+
+function V.OnPropEditPrepared(r)
+	local scan = V.GetScanSession(r.id)
+	if scan and scan.region == r then permitEdit(scan) end
+end
 local function startEdit(scan, work, prepare)
 	work.started = SysTime()
+	work.revision = scan.region.revision + 1
 	local cooks = V.PropState and V.PropState.cookStats
 	work.nativeCount = cooks and cooks.count or 0
 	work.nativeCPU = cooks and cooks.total or 0
@@ -233,6 +249,9 @@ local function startEdit(scan, work, prepare)
 			scan.editWork = nil
 			return
 		end
+		-- The validated descriptor is enough to build a private client mesh.
+		-- Its publication still waits for server SAT and native collision.
+		if V.PrepareScanEdit then V.PrepareScanEdit(scan, work) end
 		nextPhase("clone")
 		work.field = V.CloneScanField(scan.region, checkpoint)
 		checkpoint()
@@ -240,23 +259,34 @@ local function startEdit(scan, work, prepare)
 		local dirty, changed =
 			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ, work.plane)
 		if not changed then
+			if V.AbortScanPreparation then V.AbortScanPreparation(scan, work) end
 			scan.editWork = nil
 			return
 		end
-		work.field.revision = scan.region.revision + 1
+		work.field.revision = work.revision
 		work.dirty = dirty
         if not work.adding and V.EmitBlastDust then V.EmitBlastDust(scan,work) end
-		account()
-		if V.PrepareScanEdit then
-			V.PrepareScanEdit(scan, work)
+		local blockedChunks
+		if V.StagePropEdit and V.PrepareCollisionChunk then
+			nextPhase("stage")
+			blockedChunks = {}
+			for key in pairs(dirty) do blockedChunks[key] = true end
+			V.StagePropEdit(scan.region, work.field, dirty, blockedChunks)
 		end
-		phase = "collision"
-		phaseStarted = SysTime()
-		if V.PrepareChangedCollisions then
+		nextPhase("collision")
+		if blockedChunks then
+			-- SAT and the mesh builder share cell caches. Native preparation
+			-- may start on completed chunks while SAT advances elsewhere.
+			for key, c in pairs(dirty) do
+				V.PrepareCollisionChunk(work.field, c[1], c[2], c[3], checkpoint)
+				blockedChunks[key] = nil
+				checkpoint()
+			end
+		elseif V.PrepareChangedCollisions then
 			V.PrepareChangedCollisions(work.field, dirty, checkpoint)
 		end
-		nextPhase("stage")
-		if V.StagePropEdit then
+		if V.StagePropEdit and not blockedChunks then
+			nextPhase("stage")
 			V.StagePropEdit(scan.region, work.field, dirty)
 		end
 		account()
@@ -282,7 +312,8 @@ function V.EditScannedTerrain(ply, radius, adding)
 	if (r.nextEdit or 0) > CurTime() or r.revision >= V.MaxEdits then
 		return false
 	end
-	radius = V.ScanBrushRadius(r, radius)
+	local power = adding and ply.GetInfoNum and ply:GetInfoNum("vm_add_power", 100) or 100
+	radius = V.ScanBrushRadius(r, radius, power)
 	local start, direction = ply:GetShootPos(), ply:GetAimVector()
 	startEdit(scan, {}, function(work, checkpoint)
 		local tr = V.TraceSculpt(ply, r, V.Reach, checkpoint, start, direction)
@@ -333,6 +364,7 @@ function V.QueueTerrainExplosion(ply, work)
 	work.radius = radius
 	work.adding = false
 	work.author = ply
+	work.queuedAt = SysTime()
 	scan.explosions[#scan.explosions + 1] = work
     if V.EmitBlastDust and work.source~="collapse" then V.EmitBlastDust(scan,work) end
 	return true
@@ -382,29 +414,18 @@ local function sample(scan, deadline)
 		if data then
 			scan.geometryThread = scan.geometryThread
 				or coroutine.create(function()
-					V.PrepareBSPRegion(scan.region, data, function()
+					local function checkpoint()
 						if SysTime() >= scan.deadline then
 							coroutine.yield()
 						end
-					end)
-					if V.PrepareVehicleExterior then
-						V.PrepareVehicleExterior(scan.region, data, function()
-							if SysTime() >= scan.deadline then
-								coroutine.yield()
-							end
-						end)
 					end
-					scan.region.visibilityOrigins = V.BSPVisibilityOrigins(data, scan.region, function()
-						if SysTime() >= scan.deadline then
-							coroutine.yield()
-						end
-					end)
+					V.PrepareBSPRegion(scan.region, data, checkpoint, not scan.cachedRecord)
+					if V.PrepareVehicleExterior then
+						V.PrepareVehicleExterior(scan.region, data, checkpoint)
+					end
+					scan.region.visibilityOrigins = V.BSPVisibilityOrigins(data, scan.region, checkpoint)
 					if V.PrepareVoxelVisibility then
-						V.PrepareVoxelVisibility(scan.region, function()
-							if SysTime() >= scan.deadline then
-								coroutine.yield()
-							end
-						end)
+						V.PrepareVoxelVisibility(scan.region, checkpoint)
 					end
 				end)
 			local ready, err = resume(scan.geometryThread, deadline, scan)
@@ -418,42 +439,53 @@ local function sample(scan, deadline)
 		end
 		scan.geometryPrepared = true
 	end
-    if scan.cachedRecord and not scan.cacheReplayed then
-        scan.cacheThread=scan.cacheThread or coroutine.create(function()
-            local record=scan.cachedRecord
-            for i,value in ipairs(record.values) do
-                scan.region.values[i]=value
-                if i%128==0 and SysTime()>=scan.deadline then coroutine.yield() end
-            end
-            if record.legacyTail then
-                local p,x,y,z=V.ScanPoint(scan.region,33^3-1)
-                local cells=scan.region.cells
-                if not cells or (x<=cells.x and y<=cells.y and z<=cells.z) then
-                    local solid=bit.band(util.PointContents(p),16395)~=0
-                    scan.region.values[33^3]=V.ScanDensity(scan.region,p,solid,worldTrace)
-                end
-            end
-            scan.initialValues=scan.region.values
-            scan.region.featurePlanes={}
-            for _,p in ipairs(record.planes or {}) do
-                scan.region.featurePlanes[#scan.region.featurePlanes+1]={normal=Vector(unpack(p.normal)),distance=p.distance,
-                    low=Vector(unpack(p.low)),high=Vector(unpack(p.high))}
-            end
-            for _,stroke in ipairs(record.history) do
-                local checkpoint=function() if SysTime()>=scan.deadline then coroutine.yield() end end
-                local work=V.CloneScanField(scan.region,checkpoint)
-                local center=Vector(unpack(stroke.center))
-                V.ApplyBrush(work,center,stroke.radius,stroke.adding,stroke.seed,checkpoint,stroke.floorZ,stroke.plane)
-                work.revision=scan.region.revision+1
-                V.PublishScanField(scan.region,work)
-                scan.history[#scan.history+1]={center=center,radius=stroke.radius,adding=stroke.adding,seed=stroke.seed,floorZ=stroke.floorZ,plane=stroke.plane}
-            end
-        end)
-        local ready,err=resume(scan.cacheThread,deadline,scan)
-        if err then error(err) end
-        if not ready then return end
-        scan.cacheThread=nil scan.cacheReplayed=true scan.cachedRecord=nil scan.index=33^3
-    end
+	if scan.cachedRecord then
+		scan.cacheThread = scan.cacheThread or coroutine.create(function()
+			local r, record = scan.region, scan.cachedRecord
+			local function checkpoint()
+				if SysTime() >= scan.deadline then coroutine.yield() end
+			end
+			r.values = record.values
+			if record.legacyTail then
+				local p, x, y, z = V.ScanPoint(r, 33 ^ 3 - 1)
+				local cells = r.cells
+				if not cells or (x <= cells.x and y <= cells.y and z <= cells.z) then
+					local solid = bit.band(util.PointContents(p), 16395) ~= 0
+					r.values[33 ^ 3] = V.ScanDensity(r, p, solid, worldTrace)
+				end
+			end
+			r.featurePlanes = {}
+			for i, p in ipairs(record.planes) do
+				r.featurePlanes[i] = { normal = Vector(unpack(p.normal)), distance = p.distance,
+					low = Vector(unpack(p.low)), high = Vector(unpack(p.high)) }
+			end
+			scan.initialValues = r.values
+			if #record.history == 0 then return end
+			-- This field is private until restoration completes. Copy the
+			-- immutable base once, then replay directly into the working field.
+			if r.bspFallback then V.BSPDensityBase(r) end
+			r.values = {}
+			for i, value in ipairs(scan.initialValues) do
+				r.values[i] = value
+				if i % 512 == 0 then checkpoint() end
+			end
+			for i, stroke in ipairs(record.history) do
+				local center = Vector(unpack(stroke.center))
+				V.ApplyBrush(r, center, stroke.radius, stroke.adding, stroke.seed, checkpoint, stroke.floorZ, stroke.plane)
+				r.revision = i
+				scan.history[i] = { center = center, radius = stroke.radius, adding = stroke.adding,
+					seed = stroke.seed, floorZ = stroke.floorZ, plane = stroke.plane }
+				checkpoint()
+			end
+		end)
+		local ready, err = resume(scan.cacheThread, deadline, scan)
+		if err then error(err) end
+		if not ready then return end
+		scan.cacheThread = nil
+		scan.cachedRecord = nil
+		scan.index = 33 ^ 3
+	end
+	local sampleStarted = scan.index < 33 ^ 3 and SysTime()
 	while scan.index < 33 ^ 3 and SysTime() < deadline do
 		local cells = scan.region.cells
 		if cells then
@@ -484,12 +516,19 @@ local function sample(scan, deadline)
 		end
 		scan.index = scan.index + 1
 	end
+	if sampleStarted then
+		local elapsed = SysTime() - sampleStarted
+		scan.total = (scan.total or 0) + elapsed
+		scan.peak = math.max(scan.peak or 0, elapsed)
+	end
 	scan.rays = scan.traceStats.rays
 	if scan.index == 33 ^ 3 then
 		scan.trace = nil
 		scan.terrainSign = nil
 		scan.region.bspTerrainColumns = nil
-		scan.snapshot = { id = scan.region.id, nx = 32, ny = 32, nz = 32, values = scan.initialValues or scan.region.values }
+		scan.snapshot = { values = scan.initialValues or scan.region.values }
+		scan.initialValues = nil
+		scan.traceStats = nil
 		if V.PreparePropRegion then
 			V.PreparePropRegion(scan.region, game.GetWorld())
 		end
@@ -508,6 +547,12 @@ local function tick(scan)
 	local deadline = math.min(V.ZoneTickDeadline or math.huge,SysTime() + scanBudget:GetFloat() / 1000)
 	if not scan.snapshot then
 		sample(scan, deadline)
+	end
+	-- The immutable density can travel while the server prepares SAT and
+	-- native collision. The completion message still waits for both.
+	local streaming = not scan.completed and scan.snapshot ~= nil
+	if streaming then
+		V.PumpScanReplication(scan, deadline)
 	end
 	if scan.preparation and SysTime() < deadline then
 		local done, err = resume(scan.preparation, deadline, scan)
@@ -537,7 +582,9 @@ local function tick(scan)
         if V.RefreshVoxelVisibility then V.RefreshVoxelVisibility(scan.region) end
         if V.EnsurePersistentZone then V.EnsurePersistentZone(scan) end
 	end
-	V.PumpScanReplication(scan, deadline)
+	if not streaming then
+		V.PumpScanReplication(scan, deadline)
+	end
 	if not scan.completed and SysTime() >= scan.nextProgress then
 		V.SendScanProgress(scan, scan.snapshot and 1 or 0, scan.index / (33 ^ 3))
 		scan.nextProgress = SysTime() + 0.15
@@ -583,10 +630,7 @@ local function tick(scan)
 	if scan.editWork ~= work then
 		return
 	end
-	if not work.sent and (not V.PropEditReady or V.PropEditReady(r, work.field.revision)) then
-		work.sentAt = SysTime()
-		V.PublishScanEdit(scan, work)
-	end
+	permitEdit(scan)
 	V.CommitScanEdit(scan)
 end
 hook.Add("Think", "GVoxel.BSPScan", function()
@@ -629,19 +673,26 @@ concommand.Add("vm_collision_server_stats", function(ply)
 			work and (work.sent and "attente clients" or "preparation") or "aucun",
 			(last.total or 0) * 1000,
 			(last.peak or 0) * 1000,
-			(last.latency or 0) * 1000
+			(last.requestLatency or last.latency or 0) * 1000
 		)
 	)
+	local densityBytes = 0
+	for _, data in pairs(scan.densityLayers or {}) do
+		densityBytes = densityBytes + #data + 3
+	end
+	print(string.format("[GVoxel] Preparation initiale : %.2f ms CPU / tranche max %.2f ms | densite encodee %d octets",
+		(scan.total or 0) * 1000, (scan.peak or 0) * 1000, densityBytes))
 	local phases = last.phases or {}
 	print(
 		string.format(
-			"[GVoxel] Dernier trou : visee %.2f | copie %.2f | brosse %.2f | SAT %.2f | file physique %.2f ms CPU ; %d chunks ; preparation %.2f | attente physique %.2f | attente affichage %.2f ms reels (client prepare en parallele)",
+			"[GVoxel] Dernier trou : visee %.2f | copie %.2f | brosse %.2f | SAT %.2f | file physique %.2f ms CPU ; %d chunks ; file initiale %.2f | preparation %.2f | attente physique %.2f | attente affichage %.2f ms reels (client prepare en parallele)",
 			(phases.trace or 0) * 1000,
 			(phases.clone or 0) * 1000,
 			(phases.brush or 0) * 1000,
 			(phases.collision or 0) * 1000,
 			(phases.stage or 0) * 1000,
 			last.chunks or 0,
+			(last.queueWait or 0) * 1000,
 			(last.prepare or 0) * 1000,
 			(last.physicsWait or 0) * 1000,
 			(last.displayWait or 0) * 1000
@@ -669,9 +720,10 @@ concommand.Add("vm_collision_server_stats", function(ply)
 	for ply, peer in pairs(scan.peers) do
 		print(
 			string.format(
-				"[GVoxel] %s : paquets %d/64 | envoye %d | affiche %d%s",
+				"[GVoxel] %s : tranches %d/%d | envoye %d | affiche %d%s",
 				tostring(ply),
-				peer.chunk,
+				peer.nextLayer,
+				V.RegionCells(r, "z") + 1,
 				peer.sent,
 				peer.acknowledged,
 				peer.failed and " | ECHEC" or ""

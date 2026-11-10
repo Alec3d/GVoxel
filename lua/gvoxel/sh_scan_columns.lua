@@ -2,8 +2,9 @@
 -- every node. Complex/ambiguous columns fall back to the original local rays.
 local V = GVoxel
 local names = { "x", "y", "z" }
+local uAxes, vAxes = { "y", "z", "x" }, { "z", "x", "y" }
 function V.ColumnScanTrace(r, raw, contents)
-	local columns = {}
+	local columns = { {}, {}, {} }
 	local stats = { rays = 0, hits = 0, fallbacks = 0, compiled = 0 }
 	local noHit = { Hit = false, StartSolid = false, AllSolid = false, Fraction = 1 }
 	local allSolid = { Hit = false, StartSolid = true, AllSolid = true, Fraction = 1 }
@@ -59,13 +60,10 @@ function V.ColumnScanTrace(r, raw, contents)
 		end
 		return false
 	end
-	local function build(axis, a)
+	local function build(axis, a, x, y)
 		local column = buildRaw(axis, a)
 		local compiled
 		if r.bspTerrainColumns then
-			local u, v = names[axis % 3 + 1], names[(axis + 1) % 3 + 1]
-			local x, y =
-				math.floor((a[u] - r.origin[u]) / r.step + 0.5), math.floor((a[v] - r.origin[v]) / r.step + 0.5)
 			compiled = r.bspTerrainColumns[axis][x + y * 33]
 		end
 		if not column then
@@ -119,22 +117,24 @@ function V.ColumnScanTrace(r, raw, contents)
 		return column
 	end
 	local function columnAt(axis, a)
-		local key = axis
-		for i, other in ipairs(names) do
-			if i ~= axis then
-				key = key .. ":" .. math.floor((a[other] - r.origin[other]) / r.step + 0.5)
-			end
+		local u, v = uAxes[axis], vAxes[axis]
+		local x = math.floor((a[u] - r.origin[u]) / r.step + 0.5)
+		local y = math.floor((a[v] - r.origin[v]) / r.step + 0.5)
+		local rows = columns[axis]
+		local row = rows[y]
+		if not row then
+			row = {}
+			rows[y] = row
 		end
-		local column = columns[key]
+		local column = row[x]
 		if column == nil then
-			column = build(axis, a)
-			columns[key] = column
+			column = build(axis, a, x, y)
+			row[x] = column
 		end
 		return column
 	end
 	local function query(a, b)
-		local delta = b - a
-		local axis = math.abs(delta.x) > 0 and 1 or (math.abs(delta.y) > 0 and 2 or 3)
+		local axis = a.x ~= b.x and 1 or (a.y ~= b.y and 2 or 3)
 		local name = names[axis]
 		local column = columnAt(axis, a)
 		if not column or column.fallback then
@@ -143,22 +143,23 @@ function V.ColumnScanTrace(r, raw, contents)
 		end
 		stats.hits = stats.hits + 1
 		local solid = column.solid
+		local start, span = a[name], b[name] - a[name]
 		for _, e in ipairs(column.events) do
-			if e.t > a[name] then
+			if e.t > start then
 				break
 			end
 			if e.kind ~= "surface" then
 				solid = e.kind == "enter"
 			end
 		end
-		local sign = b[name] > a[name] and 1 or -1
+		local sign = span > 0 and 1 or -1
 		local first, last, increment = 1, #column.events, 1
 		if sign < 0 then
 			first, last, increment = #column.events, 1, -1
 		end
 		for i = first, last, increment do
 			local e = column.events[i]
-			local f = (e.t - a[name]) / (b[name] - a[name])
+			local f = (e.t - start) / span
 			if f > 0.0000001 and f <= 1 then
 				if solid then
 					if (sign > 0 and e.kind == "exit") or (sign < 0 and e.kind == "enter") then

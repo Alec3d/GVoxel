@@ -61,124 +61,177 @@ function V.CloseScanMenu(save)
 	gesture = {}
 end
 
+local blue = Color(39, 153, 240)
+local orange = Color(255, 151, 62)
+local background = Color(18, 25, 32, 250)
+local card = Color(43, 61, 75)
+local hover = Color(57, 80, 99)
+local accentText = Color(32, 21, 12)
+local flags = {en = "gb", fr = "fr", ru = "ru", es = "es", it = "it", de = "de"}
+local addPower = CreateClientConVar("vm_add_power", "100", true, true, "Addition volume percentage", 10, 100)
+local lastX, lastY
+
+function V.GetAddPower()
+	return addPower:GetInt()
+end
+
 function V.OpenScanMenu()
 	local weapon = activeWeapon()
-	if not weapon or IsValid(menu) then
-		return
-	end
+	if not weapon or IsValid(menu) then return end
+
 	local frame = vgui.Create("DFrame")
 	menu = frame
-	frame:SetSize(580, 620)
-	frame:Center()
-	frame:SetTitle(V.L("GVoxel — dimensions de la zone"))
+	frame:SetSize(math.min(470, ScrW() - 16), 388)
+	frame:SetPos(math.Clamp(lastX or ScrW() - frame:GetWide() - 24, 0, ScrW() - frame:GetWide()),
+		math.Clamp(lastY or 90, 0, math.max(0, ScrH() - frame:GetTall())))
+	frame:SetTitle("")
 	frame:SetDeleteOnClose(true)
 	frame:MakePopup()
+	frame:SetKeyboardInputEnabled(false)
 	frame.VMMetres = V.SelectedMetres()
-	frame.OnClose = function()
-		sendSettings(frame.VMMetres, math.Round(frame.VMRadius:GetValue()))
+	frame.Paint = function(_, w, h)
+		draw.RoundedBox(9, 0, 0, w, h, background)
+		draw.SimpleText("GVoxel", "Trebuchet24", 15, 12, blue)
+		surface.SetDrawColor(orange)
+		surface.DrawRect(14, 43, w - 28, 2)
+	end
+	frame.OnRemove = function()
+		lastX, lastY = frame:GetPos()
+		if menu == frame then menu = nil end
 		gesture = {}
 	end
+	frame.OnClose = function()
+		sendSettings(frame.VMMetres, math.Round(frame.VMRadius:GetValue()))
+	end
 
-	local title = vgui.Create("DLabel", frame)
-	title:SetPos(18, 38)
-	title:SetSize(544, 45)
-	title:SetText(V.L("Relache R pour utiliser ce menu.\nR court lance l'analyse de la selection."))
-	local choices = {}
-	for i, metres in ipairs(V.ScanSizes) do
-		local button = vgui.Create("DButton", frame)
-		button:SetPos(18 + (i - 1) * 277, 91)
-		button:SetSize(267, 48)
-		choices[metres] = button
-		local function refresh()
-			for size, b in pairs(choices) do
-				b:SetText(
-					(size == frame.VMMetres and V.L("[ Selectionne ] ") or "")
-						.. size
-						.. " x "
-						.. size
-						.. " x "
-						.. size
-						.. " m"
-				)
-			end
+	for i, option in ipairs(V.LanguageOptions) do
+		local flag = vgui.Create("DImageButton", frame)
+		flag:SetImage("flags16/" .. flags[option[1]] .. ".png")
+		flag:SetSize(20, 16)
+		flag:SetPos(frame:GetWide() - 46 - (6 - i) * 24, 16)
+		flag:SetTooltip(option[2])
+		flag.DoClick = function() RunConsoleCommand("gvoxel_language", option[1]) end
+	end
+
+	local content = vgui.Create("DPanel", frame)
+	content:Dock(FILL)
+	content:DockMargin(8, 26, 8, 5)
+	content:SetPaintBackground(false)
+
+	local function button(parent, label, action, accent)
+		local control = vgui.Create("DButton", parent)
+		control:SetText("")
+		control.Paint = function(self, w, h)
+			draw.RoundedBox(5, 0, 0, w, h, accent and orange or (self:IsHovered() and hover or card))
+			draw.SimpleText(label(), "Trebuchet18", w / 2, h / 2,
+				accent and accentText or color_white, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
 		end
-		frame.VMRefreshSizes = refresh
-		button.DoClick = function()
-			frame.VMMetres = metres
+		control.DoClick = action
+		return control
+	end
+
+	local create = button(content, function() return V.L("Nouvelle zone") end, function()
+		local function startPlacement()
+			RunConsoleCommand("vm_give")
+			if V.CustomBlockEnabled() then V.ResetCustomBlockSelection() end
+			V.CloseScanMenu(true)
+		end
+		if V.GetClientScanState() then
+			Derma_Query(V.L("Une seule zone est autorisee. Retirer la zone actuelle avant d'en creer une autre."),
+				"GVoxel", V.L("Retirer la zone active"), function()
+					net.Start("vm_scan_cancel")
+					net.SendToServer()
+					startPlacement()
+				end, V.L("Annuler"))
+			return
+		end
+		startPlacement()
+	end, true)
+	create:Dock(TOP)
+	create:SetTall(34)
+
+	local choices = vgui.Create("DPanel", content)
+	choices:Dock(TOP)
+	choices:DockMargin(0, 8, 0, 0)
+	choices:SetTall(31)
+	choices:SetPaintBackground(false)
+	for _, size in ipairs(V.ScanSizes) do
+		local option = button(choices, function()
+			return (not V.CustomBlockEnabled() and frame.VMMetres == size and "✓ " or "") .. size .. " m"
+		end, function()
+			frame.VMMetres = size
 			RunConsoleCommand("vm_custom_block", "0")
-			refresh()
-		end
-		refresh()
+		end)
+		option:Dock(LEFT)
+		option:DockMargin(0, 0, 5, 0)
+		option:SetWide(70)
 	end
-	local custom = vgui.Create("DCheckBoxLabel", frame)
-	custom:SetPos(18, 149)
-	custom:SetSize(544, 23)
-	custom:SetText(V.L("Custom block — boite rectangulaire a 4 points"))
-	custom:SetConVar("vm_custom_block")
-	local help = vgui.Create("DLabel", frame)
-	help:SetPos(18, 178)
-	help:SetSize(544, 72)
-	help:SetWrap(true)
-	help:SetText(
-		V.L("Molette : depart, largeur X, longueur Y, hauteur.\nPuis molette : deplacer / verrouiller. R : analyser.\nDimensions ajustees a la grille ; maximum 32 m par axe.")
-	)
-	local undo = vgui.Create("DButton", frame)
-	undo:SetPos(18, 254)
-	undo:SetSize(267, 27)
-	undo:SetText(V.L("Retirer le dernier point"))
-	undo.DoClick = function()
-		V.UndoCustomBlockSelection()
+	local custom = button(choices, function()
+		return (V.CustomBlockEnabled() and "✓ " or "") .. V.L("Boite sur mesure")
+	end, function() RunConsoleCommand("vm_custom_block", "1") end)
+	custom:Dock(FILL)
+
+	local points = vgui.Create("DPanel", content)
+	points:Dock(TOP)
+	points:DockMargin(0, 6, 0, 0)
+	points:SetTall(28)
+	points:SetPaintBackground(false)
+	local undo = button(points, function() return V.L("Retirer le dernier point") end, V.UndoCustomBlockSelection)
+	undo:Dock(LEFT)
+	undo:SetWide(math.floor((frame:GetWide() - 26) / 2))
+	button(points, function() return V.L("Recommencer la boite") end, V.ResetCustomBlockSelection):Dock(FILL)
+
+	local function slider(label, minimum, maximum, value)
+		local control = vgui.Create("DNumSlider", content)
+		control:Dock(TOP)
+		control:SetTall(39)
+		control:SetText(V.L(label))
+		control.Label:SetTextColor(color_white)
+		control:SetMinMax(minimum, maximum)
+		control:SetDecimals(0)
+		control:SetValue(value)
+		return control
 	end
-	local reset = vgui.Create("DButton", frame)
-	reset:SetPos(295, 254)
-	reset:SetSize(267, 27)
-	reset:SetText(V.L("Recommencer la boite"))
-	reset.DoClick = function()
-		V.ResetCustomBlockSelection()
+	frame.VMRadius = slider("Rayon de l'outil (unites)", 24, 80, math.max(24, weapon:GetBrushRadius()))
+	local power = slider("Volume d'ajout (%)", 10, 100, addPower:GetInt())
+	power.OnValueChanged = function(_, value)
+		local rounded = math.Round(value)
+		if rounded ~= addPower:GetInt() then RunConsoleCommand("vm_add_power", tostring(rounded)) end
 	end
-	local slider = vgui.Create("DNumSlider", frame)
-	slider:SetPos(18, 290)
-	slider:SetSize(544, 46)
-	slider:SetText(V.L("Rayon de l'outil (unites)"))
-	slider:SetMin(24)
-	slider:SetMax(80)
-	slider:SetDecimals(0)
-	slider:SetValue(math.max(24, weapon:GetBrushRadius()))
-	frame.VMRadius = slider
-	for i, option in ipairs({
-		{ V.L("Afficher les limites des zones"), "vm_show_zone" },
-		{ V.L("Afficher le releve en fil de fer"), "vm_show_wireframe" },
-		{ V.L("Afficher le viseur de creusement"), "vm_show_cursor" },
-		{ V.L("Remplacer visuellement le BSP"), "vm_replace_visual" },
-	}) do
-		local check = vgui.Create("DCheckBoxLabel", frame)
-		check:SetPos(18, 346 + (i - 1) * 27)
-		check:SetSize(544, 23)
-		check:SetText(option[1])
-		check:SetConVar(option[2])
-	end
-	local info = vgui.Create("DLabel", frame)
-	info:SetPos(18, 461)
-	info:SetSize(544, 78)
-	info:SetWrap(true)
-	info:SetText(
-		V.L("Une zone partagee par serveur. Gauche : creuser ; droite : ajouter. Les modifications attendent la preparation des collisions et des clients.")
-	)
-	local cancel = vgui.Create("DButton", frame)
-	cancel:SetPos(18, 560)
-	cancel:SetSize(260, 42)
-	cancel:SetText(V.L("Annuler / effacer le releve"))
-	cancel.DoClick = function()
-		net.Start("vm_scan_cancel")
-		net.SendToServer()
-	end
-	local close = vgui.Create("DButton", frame)
-	close:SetPos(290, 560)
-	close:SetSize(272, 42)
-	close:SetText(V.L("Enregistrer et fermer"))
-	close.DoClick = function()
+
+	local footer = vgui.Create("DPanel", content)
+	footer:Dock(BOTTOM)
+	footer:SetTall(30)
+	footer:SetPaintBackground(false)
+	local saved = button(footer, function() return V.L("Zones sauvegardees") end, function()
 		V.CloseScanMenu(true)
-	end
+		V.OpenSavedZones()
+	end)
+	local view = button(footer, function() return "⚙" end, function()
+		local options = DermaMenu()
+		for _, setting in ipairs({
+			{"Afficher les limites des zones", "vm_show_zone"},
+			{"Afficher le releve en fil de fer", "vm_show_wireframe"},
+			{"Afficher le viseur de creusement", "vm_show_cursor"},
+			{"Remplacer visuellement le BSP", "vm_replace_visual"},
+		}) do
+			local enabled = GetConVar(setting[2]):GetBool()
+			options:AddOption((enabled and "✓ " or "") .. V.L(setting[1]), function()
+				RunConsoleCommand(setting[2], enabled and "0" or "1")
+			end)
+		end
+		options:Open()
+	end)
+	view:SetTooltip(V.L("Afficher les limites des zones"))
+	view:Dock(RIGHT)
+	view:SetWide(34)
+	view:DockMargin(5, 0, 0, 0)
+	saved:Dock(FILL)
+	local help = vgui.Create("DLabel", content)
+	help:Dock(FILL)
+	help:SetWrap(true)
+	help:SetTextColor(color_white)
+	help:SetText(V.L("Commandes GVoxel"))
 end
 
 local function requestScan()
@@ -203,6 +256,7 @@ concommand.Add("vm_menu", function()
 	V.OpenScanMenu()
 end)
 
+local shortcutDown = false
 hook.Add("Think", "GVoxel.ReloadGesture", function()
 	local weapon = activeWeapon()
 	local allowed = weapon
@@ -211,6 +265,17 @@ hook.Add("Think", "GVoxel.ReloadGesture", function()
 		and not gui.IsGameUIVisible()
 		and not gui.IsConsoleVisible()
 		and not vgui.CursorVisible()
+	local shortcut = input.IsKeyDown(KEY_H)
+		and (input.IsKeyDown(KEY_LCONTROL) or input.IsKeyDown(KEY_RCONTROL))
+	if shortcut and not shortcutDown then
+		if IsValid(menu) then
+			V.CloseScanMenu(true)
+		elseif allowed and not IsValid(vgui.GetKeyboardFocus()) then
+			V.OpenScanMenu()
+			allowed = false
+		end
+	end
+	shortcutDown = shortcut
 	local down = weapon and LocalPlayer():KeyDown(IN_RELOAD) or false
 	local action = V.ReloadGesture(gesture, down, RealTime(), allowed)
 	if action == "menu" then
@@ -293,8 +358,8 @@ hook.Add("HUDPaint", "GVoxel.ScanStatus", function()
 	local text
 	if scan.phase == 0 then
 		text = string.format(V.L("Analyse de la zone : %d %%"), scan.ratio * 100)
-	elseif scan.built < 64 then
-		text = string.format(V.L("Preparation du terrain : %d / 64 blocs"), scan.built)
+	elseif scan.densityReady and scan.built < scan.chunkCount then
+		text = string.format(V.L("Preparation du terrain : %d / %d blocs"), scan.built, scan.chunkCount)
 	elseif scan.phase ~= 2 then
 		text = V.L("Reception du terrain...")
 	elseif not scan.visualReady then
@@ -332,7 +397,6 @@ hook.Add("GVoxel.LanguageChanged", "GVoxel.ScanMenuLanguage", function()
     V.OpenScanMenu()
     if IsValid(menu) then
         menu.VMMetres = metres
-        menu.VMRefreshSizes()
         menu.VMRadius:SetValue(radius)
     end
 end)

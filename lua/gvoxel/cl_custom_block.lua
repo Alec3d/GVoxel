@@ -5,6 +5,7 @@ local enabled = CreateClientConVar("vm_custom_block", "0", true, false, "Selecti
 local state = { points = {} }
 local preview, cursor, lastPose
 local pressed, blocked = false, false
+local pointRequested = false
 local message
 function V.CustomBlockEnabled()
 	return enabled:GetBool()
@@ -41,25 +42,29 @@ function V.CustomBlockStatus()
 		return
 	end
 	local instructions = {
-		V.L("Molette : point 1, coin de depart"),
-		V.L("Molette : point 2, largeur X"),
-		V.L("Molette : point 3, longueur Y"),
-		V.L("Viser la hauteur puis molette : point 4"),
+		"Molette : point 1, coin de depart",
+		"Molette : point 2, largeur X",
+		"Molette : point 3, longueur Y",
+		"Viser la hauteur puis molette : point 4",
 	}
 	local text = message and V.L(message)
 		or (
 			state.moving and V.L("Deplacer en visant ; molette pour verrouiller")
-			or instructions[#state.points + 1]
-			or V.L("R : analyser | Molette : deplacer la boite")
+			or V.L(instructions[#state.points + 1] or "R : analyser | Molette : deplacer la boite")
 		)
 	if preview and preview.low and preview.high then
 		local e = (preview.bounds and preview.bounds.extent or preview.high - preview.low) / V.UnitsPerMetre
 		text = text
 			.. string.format(" | %.2f x %.2f x %.2f m%s", e.x, e.y, e.z, preview.bounds and V.L(" (grille)") or V.L(" (apercu)"))
 	end
+	local bound = input.LookupBinding("vm_box_point")
+	if bound then text = text .. "  [" .. string.upper(bound) .. "]" end
 	return V.L(text)
 end
+concommand.Add("vm_box_point", function() pointRequested = true end)
 hook.Add("Think", "GVoxel.CustomBlockSelection", function()
+	local requested = pointRequested
+	pointRequested = false
 	local weapon = V.GetActiveVoxelTool and V.GetActiveVoxelTool()
 	local down = input.IsMouseDown(MOUSE_MIDDLE)
 	local allowed = V.CustomBlockEnabled()
@@ -99,7 +104,7 @@ hook.Add("Think", "GVoxel.CustomBlockSelection", function()
 		preview = V.CustomSelectionPreview(state, cursor)
 		lastPose = { start = start, direction = direction, serial = state.serial }
 	end
-	if down and not pressed then
+	if requested or (down and not pressed) then
 		local ok, err = V.CustomSelectionClick(state, cursor)
 		message = not ok and err or nil
 		lastPose = nil

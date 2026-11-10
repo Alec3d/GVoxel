@@ -12,6 +12,12 @@ if V.ReleaseVoxelLighting and V.GetClientScanRegion then
 end
 local modelAnchors = {}
 local nativeOverride
+local directRegion, directJob
+local directBatches, directQueue, directCursor = {}, {}, 1
+local lightTools, nextToolSearch = {}, 0
+local activeDirectLights, lightEpoch, lastEmitterCount = false, 0, 0
+local toolClasses = { "gmod_light", "gmod_lamp" }
+local MAX_DIRECT_BATCHES, DIRECT_PROBES, MAX_TOOLS_PER_CLASS = 512, 6, 8
 V.VoxelSunBlocked = nil
 local function positive(v)
 	return Vector(math.max(0, v.x), math.max(0, v.y), math.max(0, v.z))
@@ -20,7 +26,11 @@ local function solid(p)
 	return util.PointContents and bit.band(util.PointContents(p), CONTENTS_SOLID) ~= 0
 end
 local function dynamic(p, n)
-	return render.ComputeDynamicLighting and positive(render.ComputeDynamicLighting(p, n)) or zero
+	local color = render.ComputeDynamicLighting and render.ComputeDynamicLighting(p, n)
+	if not color or (color.x <= 0 and color.y <= 0 and color.z <= 0) then
+		return zero
+	end
+	return color.x >= 0 and color.y >= 0 and color.z >= 0 and color or positive(color)
 end
 local function apply(cube, origin)
 	render.ResetModelLighting(0, 0, 0)
@@ -31,33 +41,71 @@ local function apply(cube, origin)
 	render.SetLocalModelLights()
 end
 
+local function surfaceProbe(source, r, chunk)
+	local probe = source.lightOrigin or (chunk and chunk.lightOrigin) or r.base
+	local n = source.planeNormal or (source.frame and source.frame.normal)
+	-- Prefer air immediately on this face before using a farther source probe.
+	if n and source.point then
+		local offset = n * 2
+		local anchor = (source.lightAnchor or source.point) + offset
+		if not solid(anchor) then
+			return anchor, false
+		end
+		if source.lightAnchor and source.lightAnchor ~= source.point then
+			local point = source.point + offset
+			if not solid(point) then
+				return point, false
+			end
+		end
+	end
+	return probe, solid(probe)
+end
+
 function V.PrepareSurfaceLighting(source, r, chunk)
 	if source.voxelEnvironment then
 		return source.voxelEnvironment, source.voxelLightProbe
 	end
-	local probe = source.lightOrigin or (chunk and chunk.lightOrigin) or r.base
-	local candidates = {}
-	local n = source.planeNormal or (source.frame and source.frame.normal)
-	if n and source.point then
-		candidates[#candidates + 1] = (source.lightAnchor or source.point) + n * 2
-		candidates[#candidates + 1] = source.point + n * 2
-	end
-	candidates[#candidates + 1] = probe
-	-- Never borrow the first free probe from an unrelated wall. A large
-	-- offset can cross a narrow room; prefer the air immediately at this face.
-	for _, point in ipairs(candidates) do
-		if not solid(point) then
-			probe = point
-			break
+	local probe, inside = surfaceProbe(source, r, chunk)
+	local cube
+	if inside or not render.ComputeLighting then
+		local point = source.lightAnchor or source.point
+		local native = point and V.SurfaceLightmap and V.SurfaceLightmap(r, source, point)
+		if native then
+			cube = { native, native, native, native, native, native }
+		else
+			cube = r.surfaceAmbientCube
+			if not cube then
+				local ambient = render.GetAmbientLightColor and positive(render.GetAmbientLightColor()) or zero
+				cube = { ambient, ambient, ambient, ambient, ambient, ambient }
+				r.surfaceAmbientCube = cube
+			end
 		end
-	end
-	local cube = {}
-	local inside = solid(probe)
-	local ambient = render.GetAmbientLightColor and positive(render.GetAmbientLightColor()) or zero
-	for i, n in ipairs(directions) do
-		-- ComputeLighting includes dynamic light. Freeze only the static part;
-		-- moving lamps on cuts are sampled separately with a global limit.
-		cube[i] = inside and ambient or positive(render.ComputeLighting(probe, n) - dynamic(probe, n))
+	else
+		-- A static ambient cube depends on the exact air position, independent
+		-- of material/chunk. Never quantize across a doorway or a thin wall.
+		local key = probe.x .. ":" .. probe.y .. ":" .. probe.z
+		local probes = r.surfaceLightProbes
+		if not probes then
+			probes = { count = 0 }
+			r.surfaceLightProbes = probes
+		end
+		cube = probes[key]
+		if not cube then
+			cube = {}
+			for i, n in ipairs(directions) do
+				-- Freeze only the static part. Moving lamps have their own pass.
+				local total, moving = render.ComputeLighting(probe, n), dynamic(probe, n)
+				cube[i] = Vector(
+					math.max(0, total.x - moving.x),
+					math.max(0, total.y - moving.y),
+					math.max(0, total.z - moving.z)
+				)
+			end
+			if probes.count < 4096 then
+				probes[key] = cube
+				probes.count = probes.count + 1
+			end
+		end
 	end
 	source.voxelEnvironment = cube
 	source.voxelLightProbe = probe
@@ -87,15 +135,17 @@ local function dynamicAt(chunk, point)
 			end
 		end
 		if selected then
-			local cache = { next = now + 0.1, cube = {} }
+			local cache = { next = now + 0.1, cube = {}, illuminated = false }
 			for i, n in ipairs(directions) do
-				cache.cube[i] = dynamic(location, n)
+				local color = dynamic(location, n)
+				cache.cube[i] = color
+				cache.illuminated = cache.illuminated or color:LengthSqr() > 0.000001
 			end
 			selected.voxelDynamic = cache
 		end
 	end
 	local cache = chunk.voxelDynamic
-	return cache and cache.cube
+	return cache and cache.cube, cache and cache.illuminated
 end
 
 function V.SurfaceLighting(r, chunk, batch)
@@ -113,6 +163,211 @@ function V.SurfaceLighting(r, chunk, batch)
 	batch.movingLight = moving
 	batch.lighting = { environment = environment, dynamic = moving, total = total, probe = probe }
 	return batch.lighting
+end
+
+local function resetDirectLighting(r)
+	directRegion, directJob = r, nil
+	directBatches, directQueue, directCursor = {}, {}, 1
+	lightTools, nextToolSearch = {}, 0
+	activeDirectLights, lightEpoch, lastEmitterCount = false, 0, 0
+end
+
+local function emitterColor(color, brightness)
+	if not color then return Vector(brightness, brightness, brightness) end
+	return Vector(color.r / 255, color.g / 255, color.b / 255) * brightness
+end
+
+local function sandboxEmitters(now)
+	if now >= nextToolSearch then
+		nextToolSearch = now + 0.25
+		lightTools = {}
+		if ents and ents.FindByClass then
+			for _, class in ipairs(toolClasses) do
+				local count = 0
+				for _, ent in ipairs(ents.FindByClass(class)) do
+					if IsValid(ent) and not ent:IsDormant() and ent.GetOn and ent:GetOn() then
+						lightTools[#lightTools + 1] = { entity = ent, spot = class == "gmod_lamp" }
+						count = count + 1
+						if count == MAX_TOOLS_PER_CLASS then break end
+					end
+				end
+			end
+		end
+	end
+	local emitters = {}
+	for _, tool in ipairs(lightTools) do
+		local ent = tool.entity
+		if IsValid(ent) and not ent:IsDormant() and ent.GetOn and ent:GetOn() then
+			local range = tool.spot and ent:GetDistance() or ent:GetLightSize()
+			local brightness = math.min(tool.spot and 8 or 6, ent:GetBrightness())
+			-- Sandbox's LightWorld variable is the dlight `noworld` flag.
+			if range > 0 and brightness > 0 and (tool.spot or not ent:GetLightWorld()) then
+				local light = { entity = ent, pos = ent:GetPos(), range = math.min(2048, range),
+					color = emitterColor(ent:GetColor(), brightness) }
+				if tool.spot then
+					local info = ent.GetLightInfo and ent:GetLightInfo()
+					if info then light.pos = ent:LocalToWorld(info.Offset - Vector(5, 0, 0)) end
+					light.direction = info and ent:LocalToWorldAngles(info.Angle):Forward() or ent:GetForward()
+					light.cone = math.cos(math.rad(math.max(10, math.min(170, ent:GetLightFOV())) / 2))
+				end
+				emitters[#emitters + 1] = light
+			end
+		end
+	end
+	return emitters
+end
+
+local function throughVoxelOpening(r, light, point, direction, distance, checkpoint)
+	local finish = point - direction * 0.25
+	local parameters = { start = light.pos, endpos = finish, mask = MASK_SOLID,
+		filter = function(ent) return ent ~= light.entity and ent:GetClass() ~= "vm_voxel_collider" end }
+	local native = util.TraceLine(parameters)
+	if not native.Hit and not native.StartSolid then
+		-- World-only Sandbox point lights may be absent from model queries.
+		if light.direction then return false end
+		return r.revision == 0 or not V.TraceScanRegion
+			or not V.TraceScanRegion(r, light.pos, direction, distance - 0.25, true, checkpoint)
+	end
+	if r.revision == 0 or not V.TraceScanRegion or not V.InScanCube then return false end
+	local stale = native.StartSolid and V.InScanCube(r, light.pos)
+		or native.HitWorld and native.HitPos and V.InScanCube(r, native.HitPos)
+	if not stale or not V.InScanCube(r, point) then return false end
+	parameters.ignoreworld = true
+	local object = util.TraceLine(parameters)
+	if object.Hit or object.StartSolid then return false end
+	return not V.TraceScanRegion(r, light.pos, direction, distance - 0.25, true, checkpoint)
+end
+
+local function sampleDirect(r, state, emitters, checkpoint)
+	local normal = state.normal
+	local point = state.point + normal * 0.75
+	local native = dynamic(point, normal)
+	local points, spots = zero, zero
+	if not util.TraceLine then return native, points, spots end
+	for _, light in ipairs(emitters) do
+		local delta = point - light.pos
+		local distance = delta:Length()
+		if distance > 0.25 and distance < light.range then
+			local direction = delta / distance
+			local facing = -normal:Dot(direction)
+			local angular = light.direction and (light.direction:Dot(direction) - light.cone) / (1 - light.cone) or 1
+			if facing > 0 and angular > 0 and throughVoxelOpening(r, light, point, direction, distance, checkpoint) then
+				local falloff = 1 - distance / light.range
+				local color = light.color * (falloff * falloff * facing * math.min(1, angular * 2))
+				if light.direction then spots = spots + color else points = points + color end
+			end
+		end
+		checkpoint()
+	end
+	return native, points, spots
+end
+
+local function inCone(state, light)
+	local x, y, z = state.x - light.x, state.y - light.y, state.z - light.z
+	local distance2 = x * x + y * y + z * z
+	if distance2 >= light.range * light.range or state.nx * x + state.ny * y + state.nz * z >= 0 then return false end
+	if not light.direction then return true end
+	local facing = x * light.dx + y * light.dy + z * light.dz
+	return facing > 0 and facing * facing > distance2 * light.cone * light.cone
+end
+
+local function nextVisibleBatch(frame, focus, deadline)
+	for i = 1, #directQueue do
+		if #directQueue == 0 or i % 16 == 0 and SysTime() >= deadline then return end
+		if directCursor > #directQueue then directCursor = 1 end
+		local state = directQueue[directCursor]
+		if state.seen < frame - 2 then
+			directBatches[state.batch] = nil
+			directQueue[directCursor] = directQueue[#directQueue]
+			directQueue[#directQueue] = nil
+		else
+			directCursor = directCursor + 1
+			if state.probedFrame ~= frame and (not focus or inCone(state, focus)) then
+				state.probedFrame = frame
+				return state
+			end
+		end
+	end
+end
+
+hook.Add("Think", "GVoxel.LiveSurfaceLighting", function()
+	local r = directRegion
+	if not r then return end
+	if V.GetClientScanRegion and V.GetClientScanRegion() ~= r then resetDirectLighting(nil) return end
+	if #directQueue == 0 then return end
+	local now, frame = RealTime(), FrameNumber()
+	local emitters = sandboxEmitters(now)
+	activeDirectLights = #emitters > 0
+	if #emitters ~= lastEmitterCount then
+		lastEmitterCount, lightEpoch = #emitters, lightEpoch + 1
+	end
+	local focus = emitters[1]
+	for _, light in ipairs(emitters) do
+		if light.direction then
+			focus = light
+			break
+		end
+	end
+	if focus then
+		focus.x, focus.y, focus.z = focus.pos.x, focus.pos.y, focus.pos.z
+		if focus.direction then focus.dx, focus.dy, focus.dz = focus.direction.x, focus.direction.y, focus.direction.z end
+	end
+	local deadline = SysTime() + 0.0006
+	for i = 1, math.min(DIRECT_PROBES, #directQueue) do
+		if SysTime() >= deadline then break end
+		if directJob and (directJob.revision ~= r.revision or directJob.lightEpoch ~= lightEpoch) then
+			directJob = nil
+		end
+		if not directJob then
+			local state = focus and i <= 4 and nextVisibleBatch(frame, focus, deadline)
+			if not state then
+				focus = nil
+				state = nextVisibleBatch(frame, nil, deadline)
+			end
+			if not state then return end
+			local job = { state = state, revision = r.revision, lightEpoch = lightEpoch }
+			job.thread = coroutine.create(function()
+				return sampleDirect(r, state, emitters, function()
+					if SysTime() >= job.deadline then coroutine.yield() end
+				end)
+			end)
+			directJob = job
+		end
+		local job = directJob
+		job.deadline = deadline
+		local ok, native, points, spots = coroutine.resume(job.thread)
+		if not ok then
+			directJob = nil
+			if ErrorNoHalt then ErrorNoHalt("[GVoxel] Lumiere locale : " .. tostring(native) .. "\n") end
+			return
+		end
+		if coroutine.status(job.thread) ~= "dead" then return end
+		job.state.native, job.state.points, job.state.spots = native, points, spots
+		job.state.revision, job.state.sampledAt, job.state.lightEpoch = r.revision, now, lightEpoch
+		directJob = nil
+	end
+end)
+
+local function directLight(r, batch, dynamicInBase)
+	if directRegion ~= r then resetDirectLighting(r) end
+	local state = directBatches[batch]
+	if not state then
+		if #directQueue >= MAX_DIRECT_BATCHES then return zero end
+		local p, n = batch.worldCenter, batch.normal
+		state = { batch = batch, point = p, normal = n, x = p.x, y = p.y, z = p.z, nx = n.x, ny = n.y, nz = n.z }
+		directBatches[batch] = state
+		directQueue[#directQueue + 1] = state
+	end
+	state.seen = FrameNumber()
+	if state.revision ~= r.revision or not state.sampledAt or RealTime() - state.sampledAt > 0.25 then return zero end
+	local native = state.native
+	local current = activeDirectLights and state.lightEpoch == lightEpoch
+	local points = current and state.points or zero
+	local spots = current and state.spots or zero
+	if dynamicInBase then
+		return positive(points - native) + spots
+	end
+	return Vector(math.max(native.x, points.x), math.max(native.y, points.y), math.max(native.z, points.z)) + spots
 end
 
 -- Reloading this module restores the regular terrain renderer as well.
@@ -134,26 +389,32 @@ function V.DrawSurfaceBatch(r, chunk, batch, deferFlashlights)
 	if batch.cutLighting then
 		render.SetColorModulation(1, 1, 1)
 	end
-	if baked or batch.cutLighting then
-		local moving = dynamicAt(chunk, batch.worldCenter or chunk.lightOrigin or r.base)
-		local illuminated = false
-		for _, color in ipairs(moving or {}) do
-			if color:LengthSqr() > 0.000001 then
-				illuminated = true
-				break
-			end
+	local direct = V.SurfaceDirectLightMaterial and not batch.translucent and batch.worldCenter
+		and batch.normal and batch.normal:LengthSqr() > 0.5
+	if direct then
+		local light = directLight(r, batch, not baked and not batch.cutLighting)
+		local material = light:LengthSqr() > 0.000001 and V.SurfaceDirectLightMaterial(batch)
+		if material then
+			render.SetColorModulation(light.x, light.y, light.z)
+			render.SetMaterial(material)
+			render.OverrideBlend(true, BLEND_ONE, BLEND_ONE, BLENDFUNC_ADD)
+			batch.mesh:Draw()
+			render.OverrideBlend(false)
+			render.SetColorModulation(1, 1, 1)
 		end
+	elseif not batch.translucent and (baked or batch.cutLighting) then
+		local moving, illuminated = dynamicAt(chunk, batch.worldCenter or chunk.lightOrigin or r.base)
 		if illuminated then
 			-- Zero ambient: never add the captured map lighting a second time.
 			-- ComputeDynamicLighting includes the standard Sandbox Light tool.
 			apply(moving, batch.worldCenter or chunk.lightOrigin or r.base)
-			render.SetMaterial(V.SurfaceFlashMaterial(batch))
+			render.SetMaterial(V.SurfaceDynamicMaterial and V.SurfaceDynamicMaterial(batch) or V.SurfaceFlashMaterial(batch))
 			render.OverrideBlend(true, BLEND_ONE, BLEND_ONE, BLENDFUNC_ADD)
 			batch.mesh:Draw()
 			render.OverrideBlend(false)
 		end
 	end
-	if not deferFlashlights then
+	if not deferFlashlights and not batch.translucent then
 		render.SetMaterial(V.SurfaceFlashMaterial(batch))
 		render.RenderFlashlights(function()
 			batch.mesh:Draw()
@@ -257,7 +518,10 @@ function V.ReleaseVoxelLighting(r)
 	if not r then
 		return
 	end
+	if directRegion == r then resetDirectLighting(nil) end
 	r.cutLighting = nil
+	r.surfaceLightProbes = nil
+	r.surfaceAmbientCube = nil
 	if nativeOverride and nativeOverride.region == r then
 		V.RestoreVoxelPropLighting()
 	end

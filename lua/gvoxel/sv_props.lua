@@ -166,13 +166,14 @@ local function makeCollider(r, origin, vertices)
 		return nil
 	end
 	-- Ray broadphase must cover the triangle soup, not the placeholder model.
-	local low, high = Vector(math.huge, math.huge, math.huge), Vector(-math.huge, -math.huge, -math.huge)
+	local lx, ly, lz = math.huge, math.huge, math.huge
+	local hx, hy, hz = -math.huge, -math.huge, -math.huge
 	for _, p in ipairs(vertices) do
-		for _, axis in ipairs({ "x", "y", "z" }) do
-			low[axis] = math.min(low[axis], p[axis])
-			high[axis] = math.max(high[axis], p[axis])
-		end
+		local x, y, z = p.x, p.y, p.z
+		lx, ly, lz = math.min(lx, x), math.min(ly, y), math.min(lz, z)
+		hx, hy, hz = math.max(hx, x), math.max(hy, y), math.max(hz, z)
 	end
+	local low, high = Vector(lx, ly, lz), Vector(hx, hy, hz)
 	ent:SetCollisionBounds(low - Vector(0.1, 0.1, 0.1), high + Vector(0.1, 0.1, 0.1))
 	ent:SetMoveType(MOVETYPE_NONE)
 	ent:SetSolid(SOLID_VPHYSICS)
@@ -248,6 +249,7 @@ local function publishPhysics(r, physics)
 	physics.field = nil
 	physics.preparedRevision = nil
 	physics.deferPublish = nil
+	physics.blockedChunks = nil
 	local pending = physics.pendingDirty
 	physics.pendingDirty = nil
 	if pending and next(pending) then
@@ -321,11 +323,12 @@ function V.QueuePropColliders(r, dirty, requested, field)
 	physics.field = field or (r.revision == 0 and r or V.CloneScanField(r))
 end
 
-function V.StagePropEdit(r, field, dirty)
+function V.StagePropEdit(r, field, dirty, blockedChunks)
 	if not r.propPhysics then
 		return
 	end
 	r.propPhysics.deferPublish = true
+	r.propPhysics.blockedChunks = blockedChunks
 	V.QueuePropColliders(r, dirty, true, field)
 end
 function V.PropEditReady(r, revision)
@@ -357,6 +360,7 @@ function V.AbortPropEdit(r)
 	physics.failed = false
 	physics.deferPublish = nil
 	physics.preparedRevision = nil
+	physics.blockedChunks = nil
 	physics.targetRevision = r.revision
 end
 
@@ -631,6 +635,13 @@ hook.Add("PhysgunPickup", "GVoxel.ProtectTerrainColliders", function(_, ent)
 	end
 end)
 
+local function takeReadyJob(physics)
+	if not physics.blockedChunks then return table.remove(physics.jobs, 1) end
+	for i, job in ipairs(physics.jobs) do
+		if not physics.blockedChunks[job.key] then return table.remove(physics.jobs, i) end
+	end
+end
+
 hook.Add("Think", "GVoxel.PropPhysics", function()
 	local deadline = SysTime() + budget:GetFloat() / 1000
 	local cooked = 0
@@ -643,7 +654,8 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 			if physics.jobs and not physics.failed then
 				while (physics.current or #physics.jobs > 0) and SysTime() < deadline do
 					if not physics.current then
-						local job = table.remove(physics.jobs, 1)
+						local job = takeReadyJob(physics)
+						if not job then break end
 						job.thread = coroutine.create(function()
 							if job.exterior then
 								return job.exterior.vertices
@@ -685,10 +697,13 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 							if cooked >= 4 or SysTime() >= deadline then
 								break
 							end
-							local vertices = {}
 							local last = math.min(#job.vertices, job.offset + maxCookVertices - 1)
-							for i = job.offset, last do
-								vertices[#vertices + 1] = job.vertices[i]
+							local vertices = job.vertices
+							if job.exterior or job.offset ~= 1 or last ~= #vertices then
+								vertices = {}
+								for i = job.offset, last do
+									vertices[#vertices + 1] = job.vertices[i]
+								end
 							end
 							local origin = job.exterior and r.origin
 								or r.origin + Vector(job.x, job.y, job.z) * (r.step * 8)
@@ -744,6 +759,7 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 						if physics.deferPublish then
 							physics.jobs = nil
 							physics.preparedRevision = physics.targetRevision
+							if V.OnPropEditPrepared then V.OnPropEditPrepared(r) end
 						else
 							publishPhysics(r, physics)
 						end

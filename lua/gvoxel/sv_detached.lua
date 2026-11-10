@@ -27,9 +27,8 @@ hook.Add("Think","GVoxel.DetachedCleanup",function()
     if scan.editWork or not scan.completed then return end
     local r=scan.region
     if state.thread and state.revision~=r.revision then scan.detached=nil return end
-    state.deadline=SysTime()+0.001
-    local function checkpoint() if SysTime()>=state.deadline then coroutine.yield() end end
     state.thread=state.thread or (not state.ready and coroutine.create(function()
+        local function checkpoint() if SysTime()>=state.deadline then coroutine.yield() end end
         local components, lookup = V.FindDetachedComponents(r,state.low,state.high,checkpoint)
         for _, component in ipairs(components) do
             local allowed, groups, byCell = {lookup=lookup}, {}, {}
@@ -77,6 +76,7 @@ hook.Add("Think","GVoxel.DetachedCleanup",function()
         state.ready=true
     end))
     if state.thread then
+        state.deadline=SysTime()+0.001
         local ok,err=coroutine.resume(state.thread)
         if not ok then scan.detached=nil ErrorNoHalt("[GVoxel] Fragment cleanup stopped: "..tostring(err).."\n") return end
         if coroutine.status(state.thread)~="dead" then return end

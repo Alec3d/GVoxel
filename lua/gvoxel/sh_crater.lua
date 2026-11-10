@@ -2,21 +2,30 @@
 -- list of random secondary spheres or client-specific math.random state.
 local V = GVoxel
 local floor, sqrt = math.floor, math.sqrt
-local function hash(x, y, z, seed)
-	local n = (x * 73856093 + y * 19349663 + z * 83492791 + seed * 104729) % 2147483647
-	return ((n * 48271) % 2147483647) / 1073741823.5 - 1
+local strideX, strideY, strideZ = 73856093, 19349663, 83492791
+local modulus = 2147483647
+
+local function hash(n)
+	return (((n % modulus) * 48271) % modulus) / 1073741823.5 - 1
 end
+
 local function noise(x, y, z, seed)
 	local ix, iy, iz = floor(x), floor(y), floor(z)
 	local u, v, w = x - ix, y - iy, z - iz
 	u = u * u * (3 - 2 * u)
 	v = v * v * (3 - 2 * v)
 	w = w * w * (3 - 2 * w)
-	local function row(y, z)
-		return hash(ix, y, z, seed) * (1 - u) + hash(ix + 1, y, z, seed) * u
-	end
-	return (row(iy, iz) * (1 - v) + row(iy + 1, iz) * v) * (1 - w)
-		+ (row(iy, iz + 1) * (1 - v) + row(iy + 1, iz + 1) * v) * w
+	-- Neighbours differ only by an integer stride. These small lattice
+	-- coordinates and network seeds keep all eight sums exact in Lua.
+	local a = ix * strideX + iy * strideY + iz * strideZ + seed * 104729
+	local b, c = a + strideY, a + strideZ
+	local d = c + strideY
+	local left = 1 - u
+	local ab = (hash(a) * left + hash(a + strideX) * u) * (1 - v)
+		+ (hash(b) * left + hash(b + strideX) * u) * v
+	local cd = (hash(c) * left + hash(c + strideX) * u) * (1 - v)
+		+ (hash(d) * left + hash(d + strideX) * u) * v
+	return ab * (1 - w) + cd * w
 end
 
 function V.BrushInnerRadius(radius, seed, centerZ, floorZ)

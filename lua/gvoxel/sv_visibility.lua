@@ -17,18 +17,25 @@ end
 local function variable(ent, key)
 	return ent.GetInternalVariable and ent:GetInternalVariable(key)
 end
-local function touched(r, low, high)
-	for _, edit in ipairs(r.bspEdits or {}) do
+local function touched(r, entry)
+	if entry.touched then return true end
+	local history = r.bspEdits
+	if not history then return false end
+	local low, high = entry.low, entry.high
+	for i = (entry.checked or 0) + 1, #history do
+		local edit = history[i]
 		if not edit.adding then
 			local p = r.origin + edit.center
 			local dx = math.max(low.x - p.x, 0, p.x - high.x)
 			local dy = math.max(low.y - p.y, 0, p.y - high.y)
 			local dz = math.max(low.z - p.z, 0, p.z - high.z)
 			if dx * dx + dy * dy + dz * dz < edit.radius ^ 2 then
+				entry.touched = true
 				return true
 			end
 		end
 	end
+	entry.checked = #history
 	return false
 end
 function V.PrepareVoxelVisibility(r, checkpoint)
@@ -68,7 +75,7 @@ function V.RefreshVoxelVisibility(r)
 	state.revision = r.revision
 	for _, entry in ipairs(state.entries) do
 		local ent = entry.ent
-		if IsValid(ent) and not controlled[ent] and touched(r, entry.low, entry.high) then
+		if IsValid(ent) and not controlled[ent] and touched(r, entry) then
 			local record = { region = r, class = entry.class }
 			if entry.class == "func_areaportal" then
 				local value = variable(ent, "m_state")

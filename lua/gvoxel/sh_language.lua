@@ -6,6 +6,19 @@ V.LanguageOptions = {
     {"es", "Español"}, {"it", "Italiano"}, {"de", "Deutsch"},
 }
 local translations = {
+    ["Nouvelle zone"] = {en="New zone", fr="Nouvelle zone", ru="Новая зона", es="Nueva zona", it="Nuova zona", de="Neue Zone"},
+    ["Boite sur mesure"] = {en="Custom box", fr="Boîte sur mesure", ru="Своя область", es="Caja personalizada", it="Area personalizzata", de="Eigene Box"},
+    ["Volume d'ajout (%)"] = {en="Add volume (%)", fr="Volume d’ajout (%)", ru="Объём добавления (%)", es="Volumen añadido (%)", it="Volume aggiunto (%)", de="Auftragsvolumen (%)"},
+    ["Zones sauvegardees"] = {en="Saved zones", fr="Zones sauvegardées", ru="Сохранённые зоны", es="Zonas guardadas", it="Zone salvate", de="Gespeicherte Zonen"},
+    ["Ctrl+H avec l'outil en main"] = {en="Hold the tool and press Ctrl+H", fr="Outil en main, appuyez sur Ctrl+H", ru="Возьмите инструмент и нажмите Ctrl+H", es="Equipa la herramienta y pulsa Ctrl+H", it="Impugna lo strumento e premi Ctrl+H", de="Werkzeug ausrüsten und Strg+H drücken"},
+    ["Commandes GVoxel"] = {
+        en="Aim and tap Reload to scan. Primary digs, secondary adds. Middle click places the custom box points.",
+        fr="Visez et appuyez brièvement sur Recharger pour scanner. Tir principal : creuser. Tir secondaire : ajouter. Clic molette : points de la boîte.",
+        ru="Прицельтесь и нажмите перезарядку для сканирования. Основная атака копает, вторая добавляет. Колесо ставит точки.",
+        es="Apunta y pulsa Recargar para escanear. Ataque principal excava, secundario añade. La rueda coloca los puntos.",
+        it="Mira e premi Ricarica per scansionare. Attacco primario scava, secondario aggiunge. La rotella posiziona i punti.",
+        de="Zielen und Nachladen kurz drücken. Primär gräbt, Sekundär fügt hinzu. Mittelklick setzt die Eckpunkte.",
+    },
     ["Language"] = {
         en = "Language",
         fr = "Langue",
@@ -342,13 +355,13 @@ local translations = {
         it = "Analisi della zona: %d %%",
         de = "Zone wird analysiert: %d %%",
     },
-    ["Preparation du terrain : %d / 64 blocs"] = {
-        en = "Preparing terrain: %d / 64 blocks",
-        fr = "Preparation du terrain : %d / 64 blocs",
-        ru = "Подготовка рельефа: %d / 64 блоков",
-        es = "Preparando terreno: %d / 64 bloques",
-        it = "Preparazione del terreno: %d / 64 blocchi",
-        de = "Gelände wird vorbereitet: %d / 64 Blöcke",
+    ["Preparation du terrain : %d / %d blocs"] = {
+        en = "Preparing terrain: %d / %d blocks",
+        fr = "Preparation du terrain : %d / %d blocs",
+        ru = "Подготовка рельефа: %d / %d блоков",
+        es = "Preparando terreno: %d / %d bloques",
+        it = "Preparazione del terreno: %d / %d blocchi",
+        de = "Gelände wird vorbereitet: %d / %d Blöcke",
     },
     ["Reception du terrain..."] = {
         en = "Receiving terrain...",

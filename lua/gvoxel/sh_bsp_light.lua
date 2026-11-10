@@ -6,7 +6,7 @@ for e = 0, 255 do
 	powers[e] = 2 ^ (e >= 128 and e - 256 or e) / 255
 end
 
-function V.SampleBSPLightmap(data, face, point)
+function V.PrepareBSPLightmap(data, face)
 	local tex = face and face.tex
 	local bytes = data and data.lighting
 	local size, min = face and face.lightSize, face and face.lightMin
@@ -49,12 +49,32 @@ function V.SampleBSPLightmap(data, face, point)
 	if start < 0 or start + w * h * 4 > #bytes then
 		return
 	end
-	local u = point:Dot(tex.lu) + (tex.luo or 0) - min[1]
-	local v = point:Dot(tex.lv) + (tex.lvo or 0) - min[2]
+	return {
+		bytes = bytes,
+		width = w,
+		height = h,
+		start = start + 1,
+		u = tex.lu,
+		v = tex.lv,
+		uo = (tex.luo or 0) - min[1],
+		vo = (tex.lvo or 0) - min[2],
+	}
+end
+
+local function texel(bytes, offset)
+	local r, g, b, e = string.byte(bytes, offset, offset + 3)
+	local scale = powers[e]
+	return r * scale, g * scale, b * scale
+end
+
+function V.SamplePreparedBSPLightmap(map, point)
+	local u = point:Dot(map.u) + map.uo
+	local v = point:Dot(map.v) + map.vo
 	if u ~= u or v ~= v then
 		return
 	end
 	-- Edges share the border luxels. Clamp roundoff, not arbitrary other walls.
+	local w, h = map.width, map.height
 	if u < -1 or v < -1 or u > w or v > h then
 		return
 	end
@@ -62,21 +82,41 @@ function V.SampleBSPLightmap(data, face, point)
 	v = math.max(0, math.min(h - 1, v))
 	local x, y = math.floor(u), math.floor(v)
 	local fx, fy = u - x, v - y
-	local red, green, blue = 0, 0, 0
-	for dy = 0, 1 do
-		for dx = 0, 1 do
-			local weight = (dx == 0 and 1 - fx or fx) * (dy == 0 and 1 - fy or fy)
-			local offset = start + (math.min(y + dy, h - 1) * w + math.min(x + dx, w - 1)) * 4 + 1
-			local r, g, b, e = string.byte(bytes, offset, offset + 3)
-			local scale = powers[e] * weight
-			red = red + r * scale
-			green = green + g * scale
-			blue = blue + b * scale
-		end
+	local bytes = map.bytes
+	local top = map.start + (y * w + x) * 4
+	local r, g, b = texel(bytes, top)
+	if fx ~= 0 then
+		local rr, gg, bb = texel(bytes, top + 4)
+		r, g, b = r + (rr - r) * fx, g + (gg - g) * fx, b + (bb - b) * fx
 	end
-	return Vector(red, green, blue)
+	if fy ~= 0 then
+		local bottom = top + w * 4
+		local br, bg, bb = texel(bytes, bottom)
+		if fx ~= 0 then
+			local rr, gg, blue = texel(bytes, bottom + 4)
+			br, bg, bb = br + (rr - br) * fx, bg + (gg - bg) * fx, bb + (blue - bb) * fx
+		end
+		r, g, b = r + (br - r) * fy, g + (bg - g) * fy, b + (bb - b) * fy
+	end
+	return Vector(r, g, b)
+end
+
+function V.SampleBSPLightmap(data, face, point)
+	local map = V.PrepareBSPLightmap(data, face)
+	return map and V.SamplePreparedBSPLightmap(map, point)
 end
 
 function V.SurfaceLightmap(r, source, point)
-	return source and V.SampleBSPLightmap(r.bsp, source.nativeFace, point)
+	if not source then
+		return
+	end
+	if source.voxelLightmap == nil or source.voxelLightmapFace ~= source.nativeFace
+		or source.voxelLightmapBSP ~= r.bsp then
+		source.voxelLightmap = V.PrepareBSPLightmap(r.bsp, source.nativeFace) or false
+		source.voxelLightmapFace = source.nativeFace
+		source.voxelLightmapBSP = r.bsp
+	end
+	if source.voxelLightmap then
+		return V.SamplePreparedBSPLightmap(source.voxelLightmap, point)
+	end
 end

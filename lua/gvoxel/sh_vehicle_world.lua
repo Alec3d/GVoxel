@@ -3,13 +3,14 @@
 local V = GVoxel
 local axes = { "x", "y", "z" }
 local basis = { Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1) }
+local reverseBasis = { -basis[1], -basis[2], -basis[3] }
 V.VehicleHaloWidth = 1024
 local tileSize = 256
 local EPS = 0.00001
 local function clipBox(poly, low, high)
 	for i, axis in ipairs(axes) do
 		poly = V.ClipBSPPolygon(poly, basis[i], high[axis])
-		poly = V.ClipBSPPolygon(poly, -basis[i], -low[axis])
+		poly = V.ClipBSPPolygon(poly, reverseBasis[i], -low[axis])
 		if #poly < 3 then
 			break
 		end
@@ -31,6 +32,9 @@ function V.PrepareVehicleExterior(r, data, checkpoint)
 		return r.vehicleExterior
 	end
 	local width = V.VehicleHaloWidth
+	-- Only server-side native colliders consume the triangle soup. Both
+	-- realms still precompute all swept hulls before publishing the seam.
+	local storeVertices = not CLIENT
 	local outerLow, outerHigh = Vector(-width, -width, -width), V.RegionSize(r) + Vector(width, width, width)
 	local exterior = { groups = {}, width = width, tileSize = tileSize, triangles = 0 }
 	local function store(poly, normal)
@@ -51,24 +55,27 @@ function V.PrepareVehicleExterior(r, data, checkpoint)
 					local key = V.ChunkKey(x, y, z)
 					for i = 2, #part - 1 do
 						local a, b, c = part[1], part[i], part[i + 1]
-						if V.PhysicsTriangleUsable(a, b, c) then
-							if (b - a):Cross(c - a):Dot(normal) > 0 then
+						local cross = (b - a):Cross(c - a)
+						if V.PhysicsTriangleUsable(a, b, c, cross) then
+							if cross:Dot(normal) > 0 then
 								b, c = c, b
 							end
 							local group = exterior.groups[key]
 							if not group then
 								group = {
-									vertices = {},
+									vertices = storeVertices and {} or nil,
 									triangles = {},
 									low = origin,
 									high = origin + Vector(tileSize, tileSize, tileSize),
 								}
 								exterior.groups[key] = group
 							end
-							local vertices = group.vertices
-							vertices[#vertices + 1] = a
-							vertices[#vertices + 1] = b
-							vertices[#vertices + 1] = c
+							if storeVertices then
+								local vertices = group.vertices
+								vertices[#vertices + 1] = a
+								vertices[#vertices + 1] = b
+								vertices[#vertices + 1] = c
+							end
 							group.triangles[#group.triangles + 1] = V.VehicleTriangleHull(a, b, c)
 							exterior.triangles = exterior.triangles + 1
 						end
@@ -92,14 +99,18 @@ function V.PrepareVehicleExterior(r, data, checkpoint)
 			if #remaining < 3 then
 				break
 			end
-			local low, high = bounds(remaining)
-			if low[axis] < -EPS then
+			local low, high = math.huge, -math.huge
+			for _, point in ipairs(remaining) do
+				local coordinate = point[axis]
+				low, high = math.min(low, coordinate), math.max(high, coordinate)
+			end
+			if low < -EPS then
 				store(V.ClipBSPPolygon(remaining, basis[i], 0), normal)
 			end
-			remaining = V.ClipBSPPolygon(remaining, -basis[i], 0)
+			remaining = V.ClipBSPPolygon(remaining, reverseBasis[i], 0)
 			local size = V.RegionAxisSize(r, axis)
-			if high[axis] > size + EPS then
-				store(V.ClipBSPPolygon(remaining, -basis[i], -size), normal)
+			if high > size + EPS then
+				store(V.ClipBSPPolygon(remaining, reverseBasis[i], -size), normal)
 			end
 			remaining = V.ClipBSPPolygon(remaining, basis[i], size)
 		end
@@ -169,6 +180,7 @@ local function exteriorTrace(r, start, finish, mins, maxs)
 	local delta = finish - start
 	local center = start + (mins + maxs) / 2 - r.origin
 	local extent = (maxs - mins) / 2
+	local pointCast = extent:LengthSqr() < 1e-16
 	local low, high = {}, {}
 	for _, axis in ipairs(axes) do
 		low[axis] = math.floor((math.min(start[axis], finish[axis]) + mins[axis] - r.origin[axis] - EPS) / tileSize)
@@ -180,8 +192,7 @@ local function exteriorTrace(r, start, finish, mins, maxs)
 				local group = world.groups[V.ChunkKey(x, y, z)]
 				if group then
 					for _, hull in ipairs(group.triangles) do
-						local t, n, inside =
-							V.SweepVehicleSolid(hull, center, extent, delta, extent:LengthSqr() < 1e-16)
+						local t, n, inside = V.SweepVehicleSolid(hull, center, extent, delta, pointCast)
 						if t and (t < result.Fraction or inside) then
 							result.Hit = true
 							result.Fraction = t
