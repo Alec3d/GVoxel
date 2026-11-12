@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./docs/images/Gvoxel 2.png" alt="GVoxel 2" width="760">
+  <img src="./docs/images/Gvoxel%202.png" alt="GVoxel 2" width="760">
 </p>
 
 # GVoxel
@@ -8,15 +8,19 @@
 
 GVoxel is a Lua addon that scans a selected section of a map’s BSP geometry and rebuilds it as editable voxel terrain, with reconstructed surfaces, textures, and collisions. Create tunnels, excavate the ground, breach buildings, and interact with the resulting openings using players, props, supported vehicles, and explosives.
 
-**One persistent zone per map · Admin-only editing tools · Six interface languages · Vehicle and explosive integrations · Multiplayer validation in progress**
+**One zone per map · Manual saves · Admin-only editing tools · Six interface languages · Vehicle and explosive integrations · Multiplayer validation in progress**
+
+[Release notes](./CHANGELOG.md)
 
 ## How It Works
 
 1. An administrator selects an area using a standard cage or a custom box.
-2. GVoxel analyzes the geometry, terrain, and surface materials inside the selection.
+2. GVoxel reads the map’s BSP geometry and materials. The tool also offers a ray-based scan.
 3. A destructible mesh and its collisions take over within the zone.
 4. Digging or adding material rebuilds the affected sections without repeating the entire scan.
-5. The zone and its modifications are saved for future sessions on the same map.
+5. To keep the zone for another session on the same map, use [**R → Save zone**](#saving-and-restoring-a-zone).
+
+The initial scan preview can be toggled in the tool menu. Once the zone has been edited, its voxel rendering stays enabled so that visible openings match the physical terrain.
 
 The original BSP file is never permanently modified. Outside the voxel zone, the map continues to use its normal geometry and collisions.
 
@@ -29,25 +33,23 @@ The original BSP file is never permanently modified. Outside the voxel zone, the
 - Original material mapping, including texture scale and orientation.
 - Surface appearance capture with resolution managed through rendering budgets.
 - Approximate lighting for newly exposed surfaces using surrounding environmental information.
-- Dynamic lights, lamps, and flashlights.
+- Dynamic lighting from standard GMod lights and lamps.
 - Visibility handling for the skybox, surrounding environment, props, and characters through openings.
 
-Newly exposed surfaces use approximate lighting: GVoxel does not rebuild the map’s compiled lightmaps. Complex corners, reflections, and Source visibility optimizations may still require adjustments.
+Newly exposed surfaces use approximate lighting. Complex corners, reflections, and Source visibility optimizations may still require adjustments.
 
 ## Players, Props, and NPCs
 
-GVoxel includes collision and trace adaptations for:
+- **Players** can move through excavated areas.
+- **Props and ragdolls** interact with voxel ground and openings.
+- **Physics Gun and Gravity Gun** can move objects through holes.
+- **GMod lights and lamps** interact with and illuminate voxel terrain.
+- **Ground NPCs and compatible NextBots** can use local movement and passage adaptations.
+- **Supported bullets and projectiles** can pass through existing openings while remaining blocked by intact obstacles.
 
-- **Players:** movement through excavated areas.
-- **Props and ragdolls:** interaction with voxel ground and openings.
-- **Physics Gun and Gravity Gun:** object manipulation through holes.
-- **GMod lights and lamps:** physical interaction and terrain illumination.
-- **Ground NPCs and compatible NextBots:** local movement and passage adaptations.
-- **Supported bullets and projectiles:** travel through existing openings while remaining blocked by intact obstacles.
+Repeated impacts from supported weapons can gradually chip voxel terrain. The HL2 shotgun, pulse rifle, and crossbow are reference weapons. Projectile passage through an existing hole works independently of terrain damage.
 
-Projectile passage and terrain destruction are separate features. Ordinary bullets can pass through an existing hole without automatically carving one.
-
-NPC navigation uses local adaptations. It does not replace every map navigation network or the custom AI implemented by other addons.
+NPC navigation uses local adaptations. Compatibility with custom AI and map navigation varies.
 
 ## Vehicle Support
 
@@ -58,120 +60,114 @@ NPC navigation uses local adaptations. It does not replace every map navigation 
 | **LVS** | Vehicles and their associated physical components. |
 | **Simfphys** | Vehicles and associated physical wheels. |
 
-These integrations are designed to let vehicles drive on voxel surfaces, fall into excavations, and pass through destroyed walls when sufficient clearance is available. They also address wheel visibility and preservation of vehicle appearance.
+Supported vehicles can drive on voxel surfaces, fall into excavations, and pass through destroyed walls when there is enough clearance. The integrations also address wheel visibility and preserve vehicle appearance.
 
-Compatibility is implemented at the vehicle-system level rather than individually for every model. Custom suspension, constraints, dimensions, and controllers can still require additional testing. The Airboat retains its native controller and is distinct from the wheeled-vehicle adaptations.
+Compatibility depends on the vehicle framework and the model’s suspension, constraints, dimensions, and controllers. The Airboat retains its native controller.
 
 ## Explosions and Weapons
 
-Supported explosive events use a shared destruction system, with hole dimensions based on the available explosion information.
+Supported explosions create holes based on the available blast information.
 
 - **Standard Garry’s Mod RPG.**
 - **HL2 fragmentation grenades.**
 - **HL2 SLAM charges and tripmines.**
-- **Glide tank shells:** recognized impacts can create openings sized according to the tank’s dimensions.
-- **Glide P-996 Lazer and B-11 Strikeforce aircraft:** supported guided and unguided missiles.
+- **Glide tank shells**, with openings sized according to the tank’s dimensions.
+- **Glide P-996 Lazer and B-11 Strikeforce aircraft**, including supported guided and unguided missiles.
 - **Other explosive weapon addons** that emit recognized blast-damage events.
 
-Destruction remains limited to the voxel zone. Thick walls, small selections, and custom projectile implementations may limit the resulting opening. Purely visual explosions without a detectable event cannot automatically trigger terrain destruction.
+Destruction is limited to the voxel zone. Thick walls, small selections, and custom projectile implementations can affect the resulting opening.
 
-## Persistent Zone and Administration
+Excavation and craters trigger native **ThumperDust** and a short dust effect sized to the impact. Particle counts, distance, and burst rate are capped. Clients can disable dust with `vm_blast_dust 0`.
 
-GVoxel supports **one active, saved zone per map**.
+After edits, GVoxel checks for unsupported fragments. Small groups are removed together where a safe cut is possible, and larger groups erode progressively with dust and breaking sounds. Fragment removal updates collisions and syncs to clients like any other terrain edit. It is included when you save with destruction.
 
-- Standard **16- or 32-meter cages**.
-- **Custom block mode:** an axis-aligned box defined using four points.
-- Boundary and dimension previews before scanning.
-- Automatic saving after scanning and committed edits.
-- Automatic restoration when starting another session on the same map.
-- Management through **Utilities → GVoxel → Persistent zone** when using English.
-- **Administrator-only** creation, editing, and management tools.
+Material connected to a zone boundary is treated as supported. Fragments with uncertain contacts can remain to protect attached terrain. Administrators can disable fragment cleanup with `vm_detached_cleanup 0`.
 
-The cache avoids repeating the full terrain sampling process. Meshes, visual captures, and physics objects still require preparation when loading. Invalid or incompatible caches are rejected.
+## Saving and Restoring a Zone
 
-Server saves are stored in `garrysmod/data/gvoxel/zones/<map>/`. Runtime saves are not included in this source repository.
+Administrators can work with **one active zone and one save per map**. With the GVoxel tool equipped, press **R → Save zone** and choose what to keep.
+
+| Save option | What comes back next session |
+| --- | --- |
+| **With destruction** | The zone with all edits committed at the time of the save, including holes and added material. |
+| **Without destruction** | The original scan, before any terrain edits. You can keep playing in the edited zone. |
+
+When the map opens again, GVoxel restores the last saved state. A new zone only persists after you save it. Edits made later stay in the current session until you save again.
+
+**R → Saved zones** lets administrators load a save, remove the active zone from play, or delete the save from disk. Removing the active zone keeps the save available for the next session.
+
+Restoring a save reuses the scanned terrain data. GVoxel still prepares meshes, textures, and collisions before the zone is ready. Server saves are stored in `garrysmod/data/gvoxel/zones/<map>/`.
 
 ## Installation
 
-For a ready-to-install runtime package, extract its **gvoxel** folder into `garrysmod/addons/` and restart the game or server.
+**From the Workshop**
 
-This repository is the development source project. In the reference workspace, place it under `garrysmod/addons/all source file/gvoxel_sources/` and run:
+Subscribe to GVoxel, let Garry’s Mod download it, then restart the game or server. Server operators must also install the addon on their server.
 
-```powershell
-python -B tools/deploy_runtime.py --write
-```
+**From GitHub**
 
-This deploys the runtime files to `garrysmod/addons/gvoxel/`.
+Download and extract this repository. Copy **`lua/` and `addon.json`** into `garrysmod/addons/gvoxel/`. The result should contain `garrysmod/addons/gvoxel/lua/autorun/gvoxel.lua`. Restart the game or server and keep one installed copy of GVoxel.
 
-As an administrator, enter `vm_give` in the console to obtain the tool, select an area, scan it, and start editing.
+**Getting started**
 
-Vehicle frameworks are optional. Install the frameworks and content required for the vehicles you want to use. GWater integration is not included in this active version.
+As an administrator, choose **Utilities → GVoxel → New zone** to equip the tool, or enter `vm_give` in the console. Press **R**, choose a **16 m** or **32 m** zone or a **Custom box**, then select **New zone**. Aim at the map or place the four custom box points, then press **R** again to scan. The status card shows elapsed time, the number of prepared blocks, and when the zone is ready.
+
+Vehicle frameworks and their content are optional. Install the framework and content for the vehicles you want to use.
 
 ## Languages
 
-The interface uses **English by default**. Open **Utilities → GVoxel → Language** to choose:
+The interface uses **English by default**. Open the tool panel and click a flag to switch between:
 
 **English · Français · Русский · Español · Italiano · Deutsch**
 
-Each player’s choice is saved locally. Menus, tool hints, HUD status, and usage notifications update with the selected language. Server notifications use the recipient’s language preference.
-
-Custom save names and console command names remain unchanged. Technical diagnostic logs are not translated. Language selection does not grant access to administrator-only tools.
+The language is saved per player and applies to menus, tool hints, HUD status, and usage notifications. Custom save names and console commands keep their original spelling.
 
 ## Tool Controls
 
 | Input | Action |
 | --- | --- |
-| **Hold R** | Open selection, size, and radius settings. |
-| **Tap R** | Scan the selected area. |
+| **Tap R** | Open the tool panel, or start scanning after selecting **New zone**. |
+| **Ctrl+H or hold R** | Open the tool panel while positioning a zone. |
 | **Left click** | Remove material. |
 | **Right click** | Add material. |
-| **Middle click in Custom block mode** | Place the four points: origin, X width, Y length, and height. |
+| **Middle click in Custom box mode** | Place the four points for the origin, X width, Y length, and height. |
 | **Middle click after selection** | Toggle between moving and locking the box. |
+
+You can bind `vm_menu` to open the panel and `vm_box_point` to place custom box points. The add-volume slider controls how much material is added with each edit.
 
 ## Multiplayer
 
-**Multiplayer synchronization is implemented, but complete testing with multiple players is still pending.**
+**Multiplayer synchronization is implemented. Full testing with multiple players is still in progress.**
 
-The server manages the zone, terrain modifications, and collisions. Clients receive the initial state and ordered edits. Players joining an existing session receive the information needed to reconstruct the current zone. The zone remains active when its creator disconnects.
+The server manages the zone, terrain edits, and collisions. Clients receive the initial scan and subsequent edits. Players joining a session in progress catch up to the current state, and the zone remains active when its creator disconnects.
 
-Client Lua files are distributed through Garry’s Mod’s server download mechanism, so other players do not need to copy the script manually. Required maps and external vehicle content must still be available to clients.
+Garry’s Mod distributes the client Lua files through its server download mechanism. Players still need the required map and any external vehicle content. Administrators manage and edit the zone, while other players can see and interact with it.
 
-Editing tools remain administrator-only. Other players can see the zone and interact with its physical environment.
-
-Latency and client preparation speed can affect edit confirmation times. A client that stops acknowledging updates can still delay operations waiting for its response.
+Latency and client preparation time can affect when edits appear. The server waits for participating clients to prepare an edit before applying the corresponding collision changes.
 
 ## Performance and Current Status
 
-GVoxel spreads preparation work across ticks and prioritizes local rebuilding. Reusable data is cached, while captures, background tasks, and additional views operate within defined budgets.
+GVoxel spreads scan and preparation work across server ticks and rebuilds the sections affected by an edit. BSP indexing and cached terrain data reduce repeated work. Repeated impacts are grouped, and bullet traces can reuse native map results through unchanged terrain.
 
-Performance depends on the map, zone size, materials, vehicles, installed addons, and hardware. No fixed FPS or excavation-time guarantee is provided.
+Rendering uses bounded texture captures and reusable background views. Performance varies with the map, zone size, materials, installed addons, vehicles, and hardware.
 
-Automated tests cover geometry, collision adaptations, caches, permissions, localization, and network logic. They do not replace in-game testing of rendering, driving, NPC behavior, performance, or real multiplayer sessions.
+Automated tests cover geometry, collision adaptations, saves, permissions, localization, and network behavior. In-game rendering, vehicle handling, NPC movement, and multiplayer performance are tested separately.
 
-Diagnostic commands include `vm_diagnose`, `vm_geometry_stats`, `vm_edit_stats`, and `vm_render_stats`.
+Use `vm_profile 10 run_name` to sample frame intervals, Lua memory, and GVoxel hook time for ten seconds. Other diagnostic commands include `vm_diagnose`, `vm_geometry_stats`, `vm_edit_stats`, `vm_render_stats`, `vm_hl2_wheel_stats`, and `vm_audio_stats`.
 
-## Development
+## Source Package
 
-- `lua/` — Shared, server, and client addon code.
-- `tools/` — Deployment and packaging utilities.
-- `tests/` — Automated checks and engine adapters.
-- `docs/images/` — README images and square project icon.
+The GitHub package includes the addon’s Lua sources, `addon.json`, this README, the changelog, and the project images.
 
-```powershell
-python -B tests/run_tests.py
-python -B tests/run_tests.py --zones
-python -B tests/run_tests.py --custom-block
-python -B tools/deploy_runtime.py --write
-python -B tools/build_workshop.py
-python -B tools/build_github.py
-```
+- `lua/autorun/` — Addon entry point.
+- `lua/gvoxel/sh_*.lua` — Shared geometry, language, collision, and compatibility logic.
+- `lua/gvoxel/sv_*.lua` — Terrain, physics, saves, and replication.
+- `lua/gvoxel/cl_*.lua` — Rendering, menus, local effects, and diagnostics.
+- `lua/weapons/weapon_voxel_crowbar/` — Selection and editing tool.
+- `docs/images/` — Project banner and [square icon](./docs/images/gvoxel-square-512.png).
 
-Tests use LuaJIT supplied with the Garry’s Mod installation. Some optional checks require the corresponding maps or Workshop addons.
-
-The Workshop build generates `dist/gvoxel.gma` and `dist/gvoxel-workshop.zip`. The GitHub export generates `dist/GVoxel-sources.zip` and an unpacked `dist/GVoxel/` directory. Neither command publishes automatically.
+After updating, restart the game or server and reconnect clients so everyone uses the same version.
 
 ## Reporting Issues
 
-Please include the map name, zone dimensions and location, reproduction steps, relevant vehicle or weapon addons, and console errors. For performance reports, include before-and-after measurements.
-
-Clearly distinguish automated test results from behavior observed directly in the game.
+Please include the map name, zone dimensions and location, steps to reproduce, relevant vehicle or weapon addons, and any console errors. For visual issues, screenshots from the affected angle help. For performance reports, include before-and-after measurements when available.
