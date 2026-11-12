@@ -4,6 +4,7 @@ if V.CloseScanMenu then
 	V.CloseScanMenu(false)
 end
 local metresConVar = CreateClientConVar("vm_zone_metres", "16", true, false, "Cote du cube analyse, en metres", 16, 32)
+local useMapBSP = CreateClientConVar("vm_scan_bsp", "1", true, false, "Use compiled map geometry when scanning")
 local showBounds = CreateClientConVar(
 	"vm_show_zone",
 	"1",
@@ -21,7 +22,7 @@ local wireMaterial = CreateMaterial("vm_scan_wire_v1", "UnlitGeneric", {
 	["$nocull"] = "1",
 })
 local menu, gesture = nil, {}
-local placementTrace
+local placementTrace, placing
 function V.SelectedMetres()
 	local value = metresConVar:GetInt()
 	return V.ValidScanSize(value) and value or 16
@@ -40,6 +41,9 @@ local function activeWeapon()
 end
 
 V.GetActiveVoxelTool = activeWeapon
+function V.IsPlacingZone()
+	return placing
+end
 local function sendSettings(metres, radius)
 	RunConsoleCommand("vm_zone_metres", tostring(metres))
 	net.Start("vm_scan_settings")
@@ -61,11 +65,13 @@ function V.CloseScanMenu(save)
 	gesture = {}
 end
 
-local blue = Color(39, 153, 240)
-local orange = Color(255, 151, 62)
-local background = Color(18, 25, 32, 250)
-local card = Color(43, 61, 75)
-local hover = Color(57, 80, 99)
+local blue = Color(0, 150, 253)
+local orange = Color(253, 151, 12)
+local background = Color(14, 22, 32, 247)
+local card = Color(29, 44, 59)
+local hover = Color(42, 63, 82)
+local selected = Color(18, 69, 108)
+local muted = Color(174, 195, 211)
 local accentText = Color(32, 21, 12)
 local flags = {en = "gb", fr = "fr", ru = "ru", es = "es", it = "it", de = "de"}
 local addPower = CreateClientConVar("vm_add_power", "100", true, true, "Addition volume percentage", 10, 100)
@@ -81,7 +87,7 @@ function V.OpenScanMenu()
 
 	local frame = vgui.Create("DFrame")
 	menu = frame
-	frame:SetSize(math.min(470, ScrW() - 16), 388)
+	frame:SetSize(math.min(480, ScrW() - 16), 468)
 	frame:SetPos(math.Clamp(lastX or ScrW() - frame:GetWide() - 24, 0, ScrW() - frame:GetWide()),
 		math.Clamp(lastY or 90, 0, math.max(0, ScrH() - frame:GetTall())))
 	frame:SetTitle("")
@@ -90,10 +96,11 @@ function V.OpenScanMenu()
 	frame:SetKeyboardInputEnabled(false)
 	frame.VMMetres = V.SelectedMetres()
 	frame.Paint = function(_, w, h)
-		draw.RoundedBox(9, 0, 0, w, h, background)
-		draw.SimpleText("GVoxel", "Trebuchet24", 15, 12, blue)
-		surface.SetDrawColor(orange)
-		surface.DrawRect(14, 43, w - 28, 2)
+		draw.RoundedBox(12, 0, 0, w, h, background)
+		draw.RoundedBox(4, 16, 14, 4, 26, blue)
+		draw.SimpleText("GVoxel", "Trebuchet24", 28, 12, color_white)
+		surface.SetDrawColor(card)
+		surface.DrawRect(16, 69, w - 32, 1)
 	end
 	frame.OnRemove = function()
 		lastX, lastY = frame:GetPos()
@@ -108,67 +115,91 @@ function V.OpenScanMenu()
 		local flag = vgui.Create("DImageButton", frame)
 		flag:SetImage("flags16/" .. flags[option[1]] .. ".png")
 		flag:SetSize(20, 16)
-		flag:SetPos(frame:GetWide() - 46 - (6 - i) * 24, 16)
+		flag:SetPos(frame:GetWide() - 36 - (#V.LanguageOptions - i) * 24, 44)
 		flag:SetTooltip(option[2])
 		flag.DoClick = function() RunConsoleCommand("gvoxel_language", option[1]) end
 	end
 
 	local content = vgui.Create("DPanel", frame)
 	content:Dock(FILL)
-	content:DockMargin(8, 26, 8, 5)
+	content:DockMargin(10, 52, 10, 9)
 	content:SetPaintBackground(false)
 
-	local function button(parent, label, action, accent)
+	local function button(parent, label, action, style, isSelected, isAvailable)
 		local control = vgui.Create("DButton", parent)
 		control:SetText("")
 		control.Paint = function(self, w, h)
-			draw.RoundedBox(5, 0, 0, w, h, accent and orange or (self:IsHovered() and hover or card))
-			draw.SimpleText(label(), "Trebuchet18", w / 2, h / 2,
-				accent and accentText or color_white, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+			local available = not isAvailable or isAvailable()
+			local hovered = available and self:IsHovered()
+			local active = isSelected and isSelected()
+			local fill = hovered and hover or card
+			local ink = available and color_white or muted
+			if style == "primary" and available then
+				fill, ink = hovered and color_white or orange, accentText
+			elseif active then
+				fill = selected
+			end
+			draw.RoundedBox(7, 0, 0, w, h, fill)
+			draw.SimpleText(label(), "Trebuchet18", w / 2, h / 2, ink, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+			if active then
+				draw.RoundedBox(2, 7, h - 4, w - 14, 2, blue)
+			end
 		end
-		control.DoClick = action
+		control.DoClick = function()
+			if not isAvailable or isAvailable() then action() end
+		end
 		return control
 	end
 
-	local create = button(content, function() return V.L("Nouvelle zone") end, function()
-		local function startPlacement()
-			RunConsoleCommand("vm_give")
-			if V.CustomBlockEnabled() then V.ResetCustomBlockSelection() end
+	local actions = vgui.Create("DPanel", content)
+	actions:Dock(TOP)
+	actions:SetTall(44)
+	actions:SetPaintBackground(false)
+	local create = button(actions, function() return V.L("Nouvelle zone") end, function()
+		placing = true
+		V.CloseScanMenu(true)
+	end, "primary", nil, function() return not V.GetClientScanState() end)
+	create:Dock(LEFT)
+	create:SetWide(math.floor((frame:GetWide() - 32) / 2))
+	create:DockMargin(0, 0, 8, 0)
+	button(actions, function() return V.L("Retirer la zone active") end, function()
+		local zone = V.GetClientScanState()
+		Derma_Query(V.L("Retirer cette zone du jeu ?"), "GVoxel", V.L("Retirer la zone active"), function()
+			if not activeWeapon() or V.GetClientScanState() ~= zone then return end
+			placing = nil
+			RunConsoleCommand("vm_scan_clear")
 			V.CloseScanMenu(true)
-		end
-		if V.GetClientScanState() then
-			Derma_Query(V.L("Une seule zone est autorisee. Retirer la zone actuelle avant d'en creer une autre."),
-				"GVoxel", V.L("Retirer la zone active"), function()
-					net.Start("vm_scan_cancel")
-					net.SendToServer()
-					startPlacement()
-				end, V.L("Annuler"))
-			return
-		end
-		startPlacement()
-	end, true)
-	create:Dock(TOP)
-	create:SetTall(34)
+		end, V.L("Annuler"))
+	end, nil, nil, V.GetClientScanState):Dock(FILL)
+
+	local function section(label)
+		local heading = vgui.Create("DLabel", content)
+		heading:Dock(TOP)
+		heading:DockMargin(2, 9, 0, 4)
+		heading:SetTall(16)
+		heading:SetTextColor(muted)
+		heading:SetText(V.L(label))
+	end
+	section("Dimensions / boite personnalisee")
 
 	local choices = vgui.Create("DPanel", content)
 	choices:Dock(TOP)
-	choices:DockMargin(0, 8, 0, 0)
 	choices:SetTall(31)
 	choices:SetPaintBackground(false)
 	for _, size in ipairs(V.ScanSizes) do
 		local option = button(choices, function()
-			return (not V.CustomBlockEnabled() and frame.VMMetres == size and "✓ " or "") .. size .. " m"
+			return size .. " × " .. size .. " m"
 		end, function()
 			frame.VMMetres = size
 			RunConsoleCommand("vm_custom_block", "0")
-		end)
+		end, nil, function() return not V.CustomBlockEnabled() and frame.VMMetres == size end)
 		option:Dock(LEFT)
 		option:DockMargin(0, 0, 5, 0)
 		option:SetWide(70)
 	end
 	local custom = button(choices, function()
-		return (V.CustomBlockEnabled() and "✓ " or "") .. V.L("Boite sur mesure")
-	end, function() RunConsoleCommand("vm_custom_block", "1") end)
+		return V.L("Boite sur mesure")
+	end, function() RunConsoleCommand("vm_custom_block", "1") end, nil, V.CustomBlockEnabled)
 	custom:Dock(FILL)
 
 	local points = vgui.Create("DPanel", content)
@@ -176,10 +207,31 @@ function V.OpenScanMenu()
 	points:DockMargin(0, 6, 0, 0)
 	points:SetTall(28)
 	points:SetPaintBackground(false)
-	local undo = button(points, function() return V.L("Retirer le dernier point") end, V.UndoCustomBlockSelection)
+	local undo = button(points, function() return V.L("Retirer le dernier point") end, V.UndoCustomBlockSelection, nil, nil, V.CustomBlockEnabled)
 	undo:Dock(LEFT)
 	undo:SetWide(math.floor((frame:GetWide() - 26) / 2))
-	button(points, function() return V.L("Recommencer la boite") end, V.ResetCustomBlockSelection):Dock(FILL)
+	button(points, function() return V.L("Recommencer la boite") end, V.ResetCustomBlockSelection, nil, nil, V.CustomBlockEnabled):Dock(FILL)
+
+	local modes = vgui.Create("DPanel", content)
+	modes:Dock(TOP)
+	modes:DockMargin(0, 9, 0, 0)
+	modes:SetTall(30)
+	modes:SetPaintBackground(false)
+	local bspMode = button(modes, function()
+		local data, done = V.GetBSPGeometry()
+		local label = data and "BSP pret" or (done and "BSP indisponible" or "Chargement du BSP")
+		return V.L(label)
+	end, function()
+		RunConsoleCommand("vm_scan_bsp", "1")
+		V.PrepareMapBSP()
+	end, nil, function() return useMapBSP:GetBool() end)
+	bspMode:SetTooltip(V.L("Utiliser la geometrie et les materiaux du BSP"))
+	bspMode:Dock(LEFT)
+	bspMode:SetWide(math.floor((frame:GetWide() - 24) / 2))
+	bspMode:DockMargin(0, 0, 5, 0)
+	button(modes, function()
+		return V.L("Analyse par rayons")
+	end, function() RunConsoleCommand("vm_scan_bsp", "0") end, nil, function() return not useMapBSP:GetBool() end):Dock(FILL)
 
 	local function slider(label, minimum, maximum, value)
 		local control = vgui.Create("DNumSlider", content)
@@ -231,23 +283,27 @@ function V.OpenScanMenu()
 	help:Dock(FILL)
 	help:SetWrap(true)
 	help:SetTextColor(color_white)
-	help:SetText(V.L("Commandes GVoxel"))
+	help:SetText(V.L("Ouvrir et placer une zone"))
 end
 
 local function requestScan()
+	if not activeWeapon() then return end
+	local data, done = V.GetBSPGeometry()
+	local byRays = not useMapBSP:GetBool() or (done and not data)
+	local suffix = byRays and "_rays" or ""
 	if V.CustomBlockEnabled() then
 		local low, high = V.CustomBlockScanBounds()
 		if not low then
 			LocalPlayer():ChatPrint("[GVoxel] " .. V.L(high))
 			return
 		end
-		net.Start("vm_scan_custom")
+		net.Start("vm_scan_custom" .. suffix)
 		net.WriteVector(low)
 		net.WriteVector(high)
 		net.SendToServer()
 		return
 	end
-	net.Start("vm_scan_request")
+	net.Start("vm_scan_request" .. suffix)
 	net.WriteUInt(V.SelectedMetres(), 6)
 	net.SendToServer()
 end
@@ -281,8 +337,13 @@ hook.Add("Think", "GVoxel.ReloadGesture", function()
 	if action == "menu" then
 		V.OpenScanMenu()
 	elseif action == "tap" then
-		requestScan()
+		if placing and not V.GetClientScanState() then
+			requestScan()
+		else
+			V.OpenScanMenu()
+		end
 	end
+	if not weapon or V.GetClientScanState() then placing = nil end
 	if IsValid(menu) and not weapon then
 		V.CloseScanMenu(false)
 	end
@@ -290,7 +351,7 @@ end)
 
 hook.Add("Think", "GVoxel.PlacementPreview", function()
 	local weapon = activeWeapon()
-	if not weapon or not showBounds:GetBool() or V.CustomBlockEnabled() then
+	if not weapon or not placing or not showBounds:GetBool() or V.CustomBlockEnabled() then
 		placementTrace = nil
 		return
 	end
@@ -308,12 +369,12 @@ hook.Add("PostDrawTranslucentRenderables", "GVoxel.SelectionCube", function(dept
 	if depth or sky3D or V.MaskInSkybox or V.RenderingReplacement or V.ComposingTerrain or not activeWeapon() then
 		return
 	end
-	V.DrawCustomBlockPreview()
+	if not scan then V.DrawCustomBlockPreview() end
 	if showBounds:GetBool() then
 		-- Placement uses the original BSP, exactly like the server scan.
 		-- A long voxel DDA here is both incorrect inside a hole and costly.
 		local tr = placementTrace or {}
-		if not V.CustomBlockEnabled() and tr.HitWorld and not tr.HitSky then
+		if placing and not V.CustomBlockEnabled() and tr.HitWorld and not tr.HitSky then
 			local half = V.SelectedMetres() * V.UnitsPerMetre / 2
 			render.DrawWireframeBox(
 				V.SnapScanPosition(tr.HitPos),
@@ -351,42 +412,59 @@ hook.Add("PostDrawTranslucentRenderables", "GVoxel.SelectionCube", function(dept
 end)
 
 hook.Add("HUDPaint", "GVoxel.ScanStatus", function()
+	if not activeWeapon() then return end
 	local scan = V.GetClientScanState()
-	if not scan or not activeWeapon() then
-		return
-	end
-	local text
-	if scan.phase == 0 then
-		text = string.format(V.L("Analyse de la zone : %d %%"), scan.ratio * 100)
+	if not scan and not placing then return end
+
+	local title, detail, ratio
+	if not scan then
+		title = V.L("Placer la zone")
+		detail = V.CustomBlockEnabled() and V.CustomBlockStatus() or V.L("Viser la carte puis appuyer sur R.")
+	elseif scan.visualReady then
+		title = V.L("Zone prete")
+		ratio = 1
+	elseif scan.phase == 0 then
+		title = string.format(V.L("Analyse de la zone : %d %%"), math.floor(scan.ratio * 100))
+		ratio = scan.ratio
 	elseif scan.densityReady and scan.built < scan.chunkCount then
-		text = string.format(V.L("Preparation du terrain : %d / %d blocs"), scan.built, scan.chunkCount)
+		title = V.L("Preparation des blocs")
+		ratio = scan.built / scan.chunkCount
 	elseif scan.phase ~= 2 then
-		text = V.L("Reception du terrain...")
-	elseif not scan.visualReady then
-		text = string.format(
-			V.L("Capture des textures du sol : %d / %d"),
-			scan.region.surfaceFinished or 0,
-			#(scan.region.surfaceList or {})
-		)
+		title = V.L("Reception du terrain...")
 	else
-		text = string.format(
-			V.L("Analyse terminee — %.1f s — %d rayons | %s — terrain voxel praticable"),
-			scan.elapsed,
-			scan.rays,
-			V.VisualReplacementEnabled() and V.L("Rendu voxel actif") or V.L("Rendu voxel desactive")
-		)
+		local done, total = scan.region.surfaceFinished or 0, #(scan.region.surfaceList or {})
+		if done < total then
+			title = string.format(V.L("Capture des textures du sol : %d / %d"), done, total)
+			ratio = done / total
+		else
+			title = V.L("Finalisation de la zone")
+		end
 	end
-	draw.SimpleTextOutlined(
-		text,
-		"Trebuchet18",
-		ScrW() / 2,
-		ScrH() - 180,
-		Color(255, 195, 85),
-		TEXT_ALIGN_CENTER,
-		TEXT_ALIGN_CENTER,
-		1,
-		color_black
-	)
+
+	local width = math.min(460, ScrW() - 32)
+	local x, y = (ScrW() - width) / 2, ScrH() - 187
+	draw.RoundedBox(10, x, y, width, 70, background)
+	draw.SimpleText(title, "Trebuchet24", x + 14, y + 8, scan and scan.visualReady and blue or color_white)
+	if scan then
+		local elapsed = ((scan.readyAt or SysTime()) - scan.clientStarted) * 1000
+		draw.SimpleText(string.format("%.0f ms", elapsed), "Trebuchet18",
+			x + width - 14, y + 12, orange, TEXT_ALIGN_RIGHT)
+		if scan.chunkCount > 0 then
+			detail = string.format(V.L("%d / %d blocs"), scan.built, scan.chunkCount)
+		end
+	end
+	if detail then
+		draw.DrawText(detail, "DermaDefault", x + 14, y + 36, muted)
+	end
+	if scan then
+		local track = width - 28
+		local length = ratio and track * math.Clamp(ratio, 0, 1) or track / 5
+		local offset = ratio and 0 or (track - length) * (0.5 - 0.5 * math.cos(RealTime() * 4))
+		draw.RoundedBox(2, x + 14, y + 57, track, 4, card)
+		if length >= 1 then
+			draw.RoundedBox(2, x + 14 + offset, y + 57, length, 4, scan.visualReady and blue or orange)
+		end
+	end
 end)
 
 -- Reopen with the current settings so all labels update without losing a draft.

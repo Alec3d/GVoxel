@@ -50,6 +50,72 @@ local function overlap(a, b, c, d)
 end
 V.BoundsOverlap = overlap
 
+local function tile(value)
+	return math.floor(value / 512)
+end
+
+local function buildBoundsIndex(items, checkpoint)
+	local rows, wide = {}, {}
+	for id, item in ipairs(items) do
+		local low, high = item.dispLow or item.low, item.dispHigh or item.high
+		local x0, x1, y0, y1 = tile(low.x), tile(high.x), tile(low.y), tile(high.y)
+		if (x1 - x0 + 1) * (y1 - y0 + 1) > 16 then
+			wide[#wide + 1] = id
+		else
+			for y = y0, y1 do
+				local row = rows[y]
+				if not row then row = {} rows[y] = row end
+				for x = x0, x1 do
+					local bin = row[x]
+					if not bin then bin = {} row[x] = bin end
+					bin[#bin + 1] = id
+				end
+			end
+		end
+		if checkpoint and id % 128 == 0 then checkpoint() end
+	end
+	return { rows = rows, wide = wide }
+end
+
+function V.IndexBSPBounds(data, checkpoint)
+	data.boundsIndex = {
+		faces = buildBoundsIndex(data.faces, checkpoint),
+		worldBrushes = buildBoundsIndex(data.worldBrushes or {}, checkpoint),
+	}
+end
+
+function V.BSPBoundsCandidates(data, kind, low, high, checkpoint)
+	local items = data[kind] or {}
+	local index = data.boundsIndex and data.boundsIndex[kind]
+	if not index then return items end
+	local ids, seen = {}, {}
+	local function collect(bin)
+		for i, id in ipairs(bin) do
+			if not seen[id] then
+				seen[id] = true
+				local item = items[id]
+				if overlap(low, high, item.dispLow or item.low, item.dispHigh or item.high) then
+					ids[#ids + 1] = id
+				end
+			end
+			if checkpoint and i % 128 == 0 then checkpoint() end
+		end
+	end
+	collect(index.wide)
+	for y = tile(low.y), tile(high.y) do
+		local row = index.rows[y]
+		if row then
+			for x = tile(low.x), tile(high.x) do
+				if row[x] then collect(row[x]) end
+			end
+		end
+	end
+	-- Keep BSP order for coincident faces and overlapping brush candidates.
+	table.sort(ids)
+	for i, id in ipairs(ids) do ids[i] = items[id] end
+	return ids
+end
+
 -- Source alternates the diagonal of adjacent displacement quads. A fixed
 -- diagonal changes the height of non-planar patches and their border joins.
 function V.ForDisplacementTriangles(face, emit, checkpoint)
@@ -301,6 +367,18 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 		data.lighting = stream:Read(lumps[lighting].length)
 	end
 	data.lightingHDR = readLighting ~= false and lighting == 53
+	if readLighting ~= false then
+		local indexID, sampleID = data.lightingHDR and 51 or 52, data.lightingHDR and 55 or 56
+		local index, samples = lumps[indexID], lumps[sampleID]
+		if index.compressed == 0 and samples.compressed == 0 and samples.version == 1
+			and index.length == #data.leaves * 4 and samples.length >= 28 and samples.length % 28 == 0
+		then
+			section(indexID)
+			data.ambientIndices = stream:Read(index.length)
+			section(sampleID)
+			data.ambientSamples = stream:Read(samples.length)
+		end
+	end
 	local count = section(facesID, 56)
 	assert(firstFace >= 0 and firstFace + faceCount <= count, "modele monde invalide")
 	local faceIDs = {}
@@ -359,6 +437,7 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 	-- Otherwise an elevated/sideways displacement can be outside the base
 	-- face's AABB and incorrectly enable brush-only reconstruction there.
 	local dispInfo, dispVerts = {}, {}
+	local dispAlpha = readLighting ~= false and {} or nil
 	for i = 1, section(26, 176) do
 		dispInfo[i] = { start = vec(), first = stream:ReadLong(), tri = stream:ReadLong(), power = stream:ReadLong() }
 		stream:Skip(152)
@@ -367,7 +446,12 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 	for i = 1, section(33, 20) do
 		local direction = vec()
 		local distance = stream:ReadFloat()
-		stream:Skip(4)
+		if dispAlpha then
+			local alpha = stream:ReadFloat()
+			dispAlpha[i] = alpha == alpha and math.max(0, math.min(255, alpha)) or 0
+		else
+			stream:Skip(4)
+		end
 		dispVerts[i] = direction * distance
 		tick(i)
 	end
@@ -390,14 +474,19 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 			local intervals = 2 ^ info.power
 			local width = intervals + 1
 			local grid = {}
+			local minAlpha, maxAlpha = 255, 0
 			for y = 0, intervals do
 				local a = p[1] + (p[2] - p[1]) * (y / intervals)
 				local b = p[4] + (p[3] - p[4]) * (y / intervals)
 				for x = 0, intervals do
-					local point = a
-						+ (b - a) * (x / intervals)
-						+ assert(dispVerts[info.first + y * width + x + 1], "sommet displacement absent")
-					grid[y * width + x + 1] = point
+					local index = y * width + x + 1
+					local point = a + (b - a) * (x / intervals)
+						+ assert(dispVerts[info.first + index], "sommet displacement absent")
+					grid[index] = point
+					if dispAlpha then
+						local alpha = dispAlpha[info.first + index]
+						minAlpha, maxAlpha = math.min(minAlpha, alpha), math.max(maxAlpha, alpha)
+					end
 					for _, axis in ipairs(axes) do
 						low[axis] = math.min(low[axis], point[axis])
 						high[axis] = math.max(high[axis], point[axis])
@@ -409,6 +498,11 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 			end
 			face.dispLow, face.dispHigh = low, high
 			face.dispGrid, face.dispWidth = grid, width
+			if dispAlpha then
+				-- Uniform patches can use a single authored texture. Mixed
+				-- patches still need Source's own blend in the surface capture.
+				face.dispAlphaMin, face.dispAlphaMax = minAlpha, maxAlpha
+			end
 		end
 		tick(i)
 	end
@@ -449,7 +543,7 @@ function V.BSPLeaf(data, p)
 	local index = data.head
 	for _ = 1, 1024 do
 		if index < 0 then
-			return data.leaves[-index]
+			return data.leaves[-index], -index
 		end
 		local node = data.nodes[index + 1]
 		local plane = data.planes[node.plane]
@@ -616,7 +710,7 @@ end
 function V.GetBSPGeometry()
 	return state.data, state.done, state.error
 end
-local function start()
+function V.PrepareMapBSP()
 	if state.thread or state.done then
 		return
 	end
@@ -626,10 +720,11 @@ local function start()
 		local data = V.ReadBSP(stream, coroutine.yield, not SERVER)
 		stream:Close()
 		state.stream = nil
+		V.IndexBSPBounds(data, coroutine.yield)
 		return data
 	end)
 end
-hook.Add("InitPostEntity", "GVoxel.ReadWorldGeometry", start)
+hook.Add("InitPostEntity", "GVoxel.ReadWorldGeometry", V.PrepareMapBSP)
 hook.Add("Think", "GVoxel.ReadWorldGeometry", function()
 	if not state.thread then
 		return
@@ -656,5 +751,5 @@ hook.Add("Think", "GVoxel.ReadWorldGeometry", function()
 end)
 -- Auto-refresh after InitPostEntity also starts the read, outside render hooks.
 if file and game then
-	start()
+	V.PrepareMapBSP()
 end

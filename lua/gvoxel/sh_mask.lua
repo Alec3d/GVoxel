@@ -135,6 +135,7 @@ function V.BuildBoundaryOpening(r, face, checkpoint)
 	if bsp and not r.bspFallback then
 		return V.BSPBoundaryOpening(r, face, checkpoint)
 	end
+	local boundaryBrushes = bsp and V.BSPBoundaryBrushes(r, face)
 	local densityField = bsp and V.BSPDensityBase(r) or r
 	local vertices = {}
 	local origin = face.vertices[1]
@@ -306,6 +307,7 @@ function V.BuildBoundaryOpening(r, face, checkpoint)
 	for j = 0, countV - 1 do
 		local upper, upperDensity, upperAir = row(j + 1)
 		local firstCheckpoint = checkpoint and (-j * r.nx) % 16
+		local bspRoot, bspDepth
 		if position and lowerAir == 0 and upperAir == 0 then
 			if checkpoint then
 				for i = firstCheckpoint, countU - 1, 16 do
@@ -331,9 +333,15 @@ function V.BuildBoundaryOpening(r, face, checkpoint)
 				end
 				if bsp and not V.BSPCellUsesDensity(r, x, y, z) then
 					local tile = { normal = normal, vertices = { a.pos, b.pos, c.pos, d.pos } }
-					for _, point in ipairs(V.BSPBoundaryOpening(r, tile, checkpoint)) do
-						vertexCount = vertexCount + 1
-						vertices[vertexCount] = point
+					if not V.ClipBSPTerrainOpening(r, tile, x, y, z, emitBSP, checkpoint) then
+						if bspRoot == nil then
+							bspRoot, bspDepth = V.BSPBoundaryRowRoot(r, normal,
+								{ lower[0].pos, lower[countU].pos, upper[countU].pos, upper[0].pos }, checkpoint)
+						end
+						for _, point in ipairs(V.BSPBoundaryOpening(r, tile, checkpoint, boundaryBrushes, bspRoot, bspDepth)) do
+							vertexCount = vertexCount + 1
+							vertices[vertexCount] = point
+						end
 					end
 				elseif position and da > 0 and db > 0 and dc > 0 and dd > 0 then
 					emitTile(a, b, c, d)

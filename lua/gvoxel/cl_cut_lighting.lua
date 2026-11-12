@@ -340,6 +340,7 @@ end
 
 local function rimLighting(r, rims, normal)
 	local best, score = nil, math.huge
+	local bestGround, groundScore = nil, math.huge
 	local step = r.step
 	for _, candidate in ipairs(rims) do
 		local alignment = normal:Dot(candidate.normal)
@@ -347,7 +348,12 @@ local function rimLighting(r, rims, normal)
 		if alignment >= -0.25 and s < score then
 			best, score = candidate, s
 		end
+		if normal.z > 0.65 and candidate.normal.z > 0.65 and alignment > 0.85
+			and candidate.tangent2 < (step * 0.15) ^ 2 and s < groundScore then
+			bestGround, groundScore = candidate, s
+		end
 	end
+	best = bestGround or best
 	if not best then
 		return
 	end
@@ -366,7 +372,7 @@ local function rimLighting(r, rims, normal)
 			total = total + w
 		end
 	end
-	return total == 1 and light or light / total, best.d2
+	return total == 1 and light or light / total, best.d2, normal:Dot(best.normal), bestGround ~= nil
 end
 
 function V.CutVertexLighting(r, point, normal, checkpoint)
@@ -379,17 +385,22 @@ function V.CutVertexLighting(r, point, normal, checkpoint)
 	if entry.light and entry.nx == x and entry.ny == y and entry.nz == z then
 		return entry.light
 	end
-	local light, d2
+	local light, d2, alignment, ground
 	if entry.rims then
-		light, d2 = rimLighting(r, entry.rims, normal)
+		light, d2, alignment, ground = rimLighting(r, entry.rims, normal)
 	end
-	if not d2 or d2 >= 0.00000001 then
+	-- Keep the nearest authored shadow on a shallow parallel dent. Fade
+	-- smoothly to interior lighting as depth or angle increases.
+	local distance = d2 and math.sqrt(d2)
+	local nativeDepth = alignment and math.min(r.step * (ground and 0.35 or 0.18), ground and 8 or 3)
+		* math.max(0, (alignment - 0.9) * 10) or 0
+	if not distance or distance > math.max(0.0001, nativeDepth) then
 		local fallback = black
 		if state.bins[entry.bin] then
 			fallback = irradiance(fallbackCube(r, state, entry, point, checkpoint), normal)
 		end
 		if light then
-			local t = 1 - math.sqrt(d2) / r.step
+			local t = 1 - (distance - nativeDepth) / (r.step - nativeDepth)
 			t = t * t * (3 - 2 * t)
 			light = fallback * (1 - t) + light * t
 		else
@@ -399,15 +410,21 @@ function V.CutVertexLighting(r, point, normal, checkpoint)
 	entry.nx, entry.ny, entry.nz, entry.light = x, y, z, light
 	return light
 end
-function V.EncodeCutLighting(vertices, checkpoint)
+local function validRadiance(value)
+	-- Invalid channels must not reach gamma encoding or set the gain for
+	-- every vertex in the batch. Finite HDR values remain in linear space.
+	return value >= 0 and value <= 65504 and value or 0
+end
+
+function V.EncodeCutLighting(vertices, checkpoint, freshCut)
 	-- Keep cached cell vertices immutable: different rebuilt batches may
 	-- choose different HDR scales while sharing these exact cell records.
 	local peak = 1
-	for i, vertex in ipairs(vertices) do
-		local c = vertex.cutLight
-		peak = math.max(peak, c.x, c.y, c.z)
-		if checkpoint and i % 192 == 0 then
-			checkpoint()
+	if not freshCut then
+		for i, vertex in ipairs(vertices) do
+			local c = vertex.cutLight
+			peak = math.max(peak, validRadiance(c.x), validRadiance(c.y), validRadiance(c.z))
+			if checkpoint and i % 192 == 0 then checkpoint() end
 		end
 	end
 	local result = {}
@@ -416,16 +433,27 @@ function V.EncodeCutLighting(vertices, checkpoint)
 		-- Source's UnlitGeneric vertex shader decodes vertex RGB with pow(2.2).
 		-- Interpolate linear light first; encode only at this upload boundary.
 		local c = vertex.cutLight
+		local red, green, blue = validRadiance(c.x), validRadiance(c.y), validRadiance(c.z)
+		local gain = inversePeak
+		if freshCut then
+			-- Compress extreme highlights locally. A sunlit probe must
+			-- never reduce precision or raise modulation for the whole cut.
+			local brightest = math.max(red, green, blue)
+			if brightest > 0.8 then
+				local excess = brightest - 0.8
+				gain = (0.8 + 0.2 * excess / (excess + 0.2)) / brightest
+			end
+		end
 		result[i] = {
 			pos = vertex.pos,
 			normal = vertex.normal,
 			u = vertex.u,
 			v = vertex.v,
 			color = Color(
-				math.floor((c.x * inversePeak) ^ (1 / 2.2) * 255 + 0.5),
-				math.floor((c.y * inversePeak) ^ (1 / 2.2) * 255 + 0.5),
-				math.floor((c.z * inversePeak) ^ (1 / 2.2) * 255 + 0.5),
-				255
+				math.floor((red * gain) ^ (1 / 2.2) * 255 + 0.5),
+				math.floor((green * gain) ^ (1 / 2.2) * 255 + 0.5),
+				math.floor((blue * gain) ^ (1 / 2.2) * 255 + 0.5),
+				vertex.color and vertex.color.a or 255
 			),
 		}
 		if checkpoint and i % 96 == 0 then

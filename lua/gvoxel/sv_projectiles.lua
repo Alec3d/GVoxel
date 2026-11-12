@@ -25,7 +25,7 @@ function V.GetProjectileStats()
 end
 local function region()
 	local r = V.GetServerScanRegion and V.GetServerScanRegion()
-	return r and r.revision > 0 and r.vehicleExterior and r.propPhysics and r or nil
+	return r and r.vehicleExterior and r.propPhysics and r or nil
 end
 local function restore(ent, state)
 	if IsValid(ent) then
@@ -86,6 +86,10 @@ local function contact(ent, state, hit, velocity)
 	end
 	ent:SetLocalVelocity(velocity)
 	candidates[ent] = CurTime() + 0.16
+	if hit.HitWorld and state.bolt and V.RecordBallisticImpact then
+		local damage = GetConVar("sk_plr_dmg_crossbow")
+		V.RecordBallisticImpact(ent:GetOwner(), hit, "crossbow_bolt", damage and damage:GetFloat())
+	end
 	stats.contacts = stats.contacts + 1
 	return true
 end
@@ -228,7 +232,7 @@ hook.Add("Tick", "GVoxel.Projectiles", function()
 		return
 	end
 	-- One local discovery after scan/load catches pre-existing projectiles.
-	if now >= nextSearch then
+	if r.revision > 0 and now >= nextSearch then
 		nextSearch = now + 0.5
 		for _, ent in
 			ipairs(ents.FindInBox(r.origin - Vector(256, 256, 256), r.origin + V.RegionSize(r) + Vector(256, 256, 256)))
@@ -241,7 +245,7 @@ hook.Add("Tick", "GVoxel.Projectiles", function()
 	for ent, retry in pairs(candidates) do
 		if not IsValid(ent) then
 			candidates[ent] = nil
-		elseif not flights[ent] and now >= retry then
+		elseif not flights[ent] and now >= retry and (r.revision > 0 or ent:GetClass() == "crossbow_bolt") then
 			local velocity = ent:GetVelocity()
 			local mt = ent:GetMoveType()
 			if velocity:LengthSqr() > 1 then
@@ -269,6 +273,7 @@ hook.Add("Tick", "GVoxel.Projectiles", function()
 					elseif mt == MOVETYPE_FLY or mt == MOVETYPE_FLYGRAVITY then
 						local state = {
 							region = r,
+							bolt = ent:GetClass() == "crossbow_bolt",
 							moveType = mt,
 							solid = ent:GetSolid(),
 							last = pos,

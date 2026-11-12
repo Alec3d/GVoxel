@@ -83,28 +83,27 @@ end
 
 if CLIENT then
 	local hudBackground = Color(18, 24, 34, 220)
-	local hudAccent = Color(255, 151, 62)
+	local hudAccent = Color(253, 151, 12)
 	local function binding(command, fallback)
 		return string.upper(input.LookupBinding(command) or fallback)
 	end
 
 	function SWEP:DrawHUD()
-		local region = GVoxel.GetClientScanRegion()
+		local scan = GVoxel.GetClientScanState()
+		if (scan and not scan.visualReady) or (GVoxel.IsPlacingZone and GVoxel.IsPlacingZone()) then return end
 		local action
-		if GVoxel.CustomBlockEnabled() then
-			action = GVoxel.CustomBlockStatus()
-		elseif region then
+		if scan then
 			action = binding("+attack", "Mouse1") .. " / " .. binding("+attack2", "Mouse2")
 				.. "  ·  " .. GVoxel.L("Gauche : creuser    Droite : ajouter")
 		else
-			action = binding("+reload", "R") .. "  ·  " .. GVoxel.L("R court : analyser le BSP    |    R maintenu : dimensions")
+			action = binding("+reload", "R") .. "  ·  " .. GVoxel.L("Ouvrir le menu des zones")
 		end
-		local hint = GVoxel.L("Ctrl+H avec l'outil en main")
+		local hint = scan and (binding("+reload", "R") .. "  ·  " .. GVoxel.L("Ouvrir le menu des zones"))
 		surface.SetFont("Trebuchet18")
-		local w = math.max(surface.GetTextSize(action), surface.GetTextSize(hint)) + 30
+		local w = math.max(surface.GetTextSize(action), hint and surface.GetTextSize(hint) or 0) + 30
 		local x, y = math.max(8, (ScrW() - w) / 2), ScrH() - 109
-		draw.RoundedBox(7, x, y, w, 52, hudBackground)
+		draw.RoundedBox(7, x, y, w, hint and 52 or 34, hudBackground)
 		draw.SimpleText(action, "Trebuchet18", x + 15, y + 8, color_white)
-		draw.SimpleText(hint, "Trebuchet18", x + 15, y + 29, hudAccent)
+		if hint then draw.SimpleText(hint, "Trebuchet18", x + 15, y + 29, hudAccent) end
 	end
 end

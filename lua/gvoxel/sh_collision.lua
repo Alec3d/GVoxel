@@ -103,8 +103,12 @@ local function polytope(points, normals, edges, checkpoint, indexedEdges)
 		local x, y, z = p.x, p.y, p.z
 		local index = (i - 1) * 3
 		coordinates[index + 1], coordinates[index + 2], coordinates[index + 3] = x, y, z
-		lowX, lowY, lowZ = math.min(lowX, x), math.min(lowY, y), math.min(lowZ, z)
-		highX, highY, highZ = math.max(highX, x), math.max(highY, y), math.max(highZ, z)
+		if x < lowX then lowX = x end
+		if y < lowY then lowY = y end
+		if z < lowZ then lowZ = z end
+		if x > highX then highX = x end
+		if y > highY then highY = y end
+		if z > highZ then highZ = z end
 	end
 	local planes = {
 		{ n = basis[1], low = lowX, high = highX },
@@ -130,7 +134,8 @@ local function polytope(points, normals, edges, checkpoint, indexedEdges)
 		local low, high = math.huge, -math.huge
 		for i = 1, #coordinates, 3 do
 			local d = coordinates[i] * x + coordinates[i + 1] * y + coordinates[i + 2] * z
-			low, high = math.min(low, d), math.max(high, d)
+			if d < low then low = d end
+			if d > high then high = d end
 		end
 		local normal = Vector(x, y, z)
 		planes[#planes + 1] = { n = normal, low = low, high = high }
@@ -426,14 +431,30 @@ end
 
 local function densityOccupancy(r, x, y, z)
 	local solid, air = false, false
-	for _, o in ipairs(V.CellOffsets) do
-		local d = V.Sample(r, x + o[1], y + o[2], z + o[3])
-		if d < 0 then
-			solid = true
-		elseif d > 0 then
-			air = true
+	if x >= 0 and y >= 0 and z >= 0
+		and x < V.RegionCells(r, "x") and y < V.RegionCells(r, "y") and z < V.RegionCells(r, "z")
+	then
+		local values = r.values
+		local first = V.Index(x, y, z, r)
+		local row = (r.nx or 32) + 1
+		local layer = row * ((r.ny or 32) + 1)
+		for dz = 0, layer, layer do
+			for dy = 0, row, row do
+				local index = first + dz + dy
+				local a, b = values[index], values[index + 1]
+				solid = solid or a < 0 or b < 0
+				air = air or a > 0 or b > 0
+				if solid and air then return 3 end
+			end
 		end
-		if solid and air then return 3 end
+	else
+		-- Compatibility for callers sampling a clamped boundary cell.
+		for _, o in ipairs(V.CellOffsets) do
+			local d = V.Sample(r, x + o[1], y + o[2], z + o[3])
+			solid = solid or d < 0
+			air = air or d > 0
+			if solid and air then return 3 end
+		end
 	end
 	return solid and 1 or 2
 end
@@ -551,13 +572,20 @@ function V.PrepareCollisionChunk(r, cx, cy, cz, checkpoint)
 	local z1 = math.min(z0 + 7, V.RegionCells(r, "z") - 1)
 	local prewarm = r.bsp and r.bspEdits and #r.bspEdits == 0 and V.PrepareBSPCollisionCell
 	local fallback = r.bspFallback
+	local terrain = r.bspTerrainCells
+	local edits = r.bspCellEditBins
+	local uniform = edits and V.BSPUniformChunkOccupancy(r, x0, y0, z0, checkpoint)
 	for z = z0, z1 do
 		for y = y0, y1 do
 			local first = V.Index(x0, y, z, r)
 			for x = x0, x1 do
 				local key = first + x - x0
 				if not cells[key] then
-					cells[key] = buildCellSolids(r, x, y, z, key, checkpoint, true)
+					if uniform and not edits[key] and not (fallback and fallback[key]) and not (terrain and terrain[key]) then
+						cells[key] = uniform == 1 and boxHull(r, x, y, z) or emptySolids
+					else
+						cells[key] = buildCellSolids(r, x, y, z, key, checkpoint, true)
+					end
 					if checkpoint then
 						checkpoint()
 					end

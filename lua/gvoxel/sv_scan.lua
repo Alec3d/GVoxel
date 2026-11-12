@@ -57,7 +57,7 @@ function V.CancelScan(ply, id)
 		V.Notify(ply, "Zone encore occupee : rejoindre une sortie avant de restaurer le BSP.")
 	end
 end
-function V.PlaceRegion(ply, metres, low, high)
+function V.PlaceRegion(ply, metres, low, high, byRays)
 	local custom = metres == 0
 	if not V.CanManageScan(ply) or (not custom and not V.ValidScanSize(metres)) then
 		return
@@ -104,10 +104,8 @@ function V.PlaceRegion(ply, metres, low, high)
             V.Notify(ply,"Cette zone chevauche une zone existante.") return
         end
     end
-	local scan = { ply = ply, region = r, index = 0, solids = 0, rays = 0, started = SysTime(), nextProgress = 0 }
-	scan.trace, scan.traceStats, scan.terrainSign = V.ColumnScanTrace(r, worldTrace, function(p)
-		return bit.band(util.PointContents(p), 16395) ~= 0
-	end)
+	local scan = { ply = ply, region = r, index = 0, solids = 0, rays = 0, started = SysTime(),
+		nextProgress = 0, byRays = byRays, traceStats = { rays = 0 } }
 	weapon:SetZoneMetres(metres)
 	V.BeginScanSession(scan)
 end
@@ -125,20 +123,24 @@ function V.RestoreCachedZone(record, ply)
     end
     if count>=V.MaxZones then return false,"Limite de zones atteinte." end
     local scan={ply=ply,region=r,index=0,solids=0,rays=0,started=SysTime(),nextProgress=0,
-        cachedRecord=record,traceStats={rays=0},savedKey=record.key,displayName=record.name}
+        cachedRecord=record,byRays=record.byRays,traceStats={rays=0},savedKey=record.key,displayName=record.name}
     V.BeginScanSession(scan)
     return scan
 end
-net.Receive("vm_scan_request", function(length, ply)
-	if length ~= 6 or not V.CanManageScan(ply) then return end
-	V.PlaceRegion(ply, net.ReadUInt(6))
-end)
-net.Receive("vm_scan_custom", function(length, ply)
-	-- WriteVector uses variable-width coordinate compression, unlike floats.
-	if length < 6 or length > 192 or not V.CanManageScan(ply) then return end
-	local low, high = net.ReadVector(), net.ReadVector()
-	V.PlaceRegion(ply, 0, low, high)
-end)
+local function registerScanRequests(suffix, byRays)
+	net.Receive("vm_scan_request" .. suffix, function(length, ply)
+		if length ~= 6 or not V.CanManageScan(ply) then return end
+		V.PlaceRegion(ply, net.ReadUInt(6), nil, nil, byRays)
+	end)
+	net.Receive("vm_scan_custom" .. suffix, function(length, ply)
+		-- WriteVector uses variable-width coordinate compression, unlike floats.
+		if length < 6 or length > 192 or not V.CanManageScan(ply) then return end
+		local low, high = net.ReadVector(), net.ReadVector()
+		V.PlaceRegion(ply, 0, low, high, byRays)
+	end)
+end
+registerScanRequests("", false)
+registerScanRequests("_rays", true)
 net.Receive("vm_scan_cancel", function(length, ply)
 	if length ~= 0 or not V.CanManageScan(ply) then return end
 	V.CancelScan(ply)
@@ -251,7 +253,10 @@ local function startEdit(scan, work, prepare)
 		end
 		-- The validated descriptor is enough to build a private client mesh.
 		-- Its publication still waits for server SAT and native collision.
-		if V.PrepareScanEdit then V.PrepareScanEdit(scan, work) end
+		if V.PrepareScanEdit and V.PrepareScanEdit(scan, work) == false then
+			scan.editWork = nil
+			return
+		end
 		nextPhase("clone")
 		work.field = V.CloneScanField(scan.region, checkpoint)
 		checkpoint()
@@ -265,7 +270,7 @@ local function startEdit(scan, work, prepare)
 		end
 		work.field.revision = work.revision
 		work.dirty = dirty
-        if not work.adding and V.EmitBlastDust then V.EmitBlastDust(scan,work) end
+        if not work.adding and work.source ~= "bullet" and V.EmitBlastDust then V.EmitBlastDust(scan,work) end
 		local blockedChunks
 		if V.StagePropEdit and V.PrepareCollisionChunk then
 			nextPhase("stage")
@@ -332,6 +337,264 @@ function V.EditScannedTerrain(ply, radius, adding)
 	r.nextEdit = CurTime() + 0.2
 	return true
 end
+-- Standard brushes are sampled on a tetrahedral lattice. Fit a shallow
+-- spherical cut to those same samples so a pellet does not disappear
+-- between nodes or turn into a full-depth tool stroke.
+local impactAxes = { "x", "y", "z" }
+local impactOffsets = { 0.35, 0.55, 0.8, 1.05 }
+local function impactBrushNodes(r, point)
+	local grid = (point - r.origin) / r.step
+	local node = Vector(math.floor(grid.x), math.floor(grid.y), math.floor(grid.z))
+	local fraction = grid - node
+	local axes = { "x", "y", "z" }
+	table.sort(axes, function(a, b) return fraction[a] > fraction[b] end)
+	local nodes, last = {}, 1
+	for i = 1, 4 do
+		local axis = axes[i]
+		local nextWeight = axis and fraction[axis] or 0
+		local weight = last - nextWeight
+		if weight > 0 then
+			local boundary = false
+			for _, component in ipairs(impactAxes) do
+				if node[component] <= 0 or node[component] >= V.RegionCells(r, component) then
+					boundary = true
+					break
+				end
+			end
+			nodes[#nodes + 1] = { point = r.origin + node * r.step, weight = weight, boundary = boundary }
+		end
+		if axis then node[axis] = node[axis] + 1 end
+		last = nextWeight
+	end
+	return nodes
+end
+
+local function impactBrushDistances(nodes, center)
+	local interior, weight = 0, 0
+	for _, node in ipairs(nodes) do
+		node.distance = math.sqrt(node.point:DistToSqr(center))
+		if not node.boundary then
+			interior = interior + node.distance * node.weight
+			weight = weight + node.weight
+		end
+	end
+	return interior, weight
+end
+
+local function impactBrushSample(nodes, interior, weight, radius, step)
+	local result = interior - weight * radius
+	for _, node in ipairs(nodes) do
+		if node.boundary then result = result + math.max(step, node.distance - radius) * node.weight end
+	end
+	return result
+end
+
+local function fitImpactBrush(r, point, normal, depth, penetration)
+	local surface = impactBrushNodes(r, point)
+	local interior = impactBrushNodes(r, point - normal * depth)
+	local maxRadius = math.ceil(r.step * 1.65)
+	for _, offset in ipairs(impactOffsets) do
+		local center = V.SnapScanPosition(point + normal * (offset * r.step))
+		local distance, weight = impactBrushDistances(surface, center)
+		local radius = math.max(1, math.ceil(distance + penetration))
+		if weight < 0.999999 then
+			-- Cage boundary nodes are fixed by the terrain mesh. Search
+			-- only when those nodes contribute to this impact point.
+			local low, high = radius, maxRadius + 1
+			while low < high do
+				local candidate = math.floor((low + high) / 2)
+				if impactBrushSample(surface, distance, weight, candidate, r.step) <= -penetration then
+					high = candidate
+				else
+					low = candidate + 1
+				end
+			end
+			radius = low
+		end
+		if radius <= maxRadius then
+			local below, belowWeight = impactBrushDistances(interior, center)
+			if impactBrushSample(interior, below, belowWeight, radius, r.step) > 0.125 then
+				return center, radius
+			end
+		end
+	end
+end
+
+local nativeImpactDamage = { weapon_shotgun = 8, weapon_ar2 = 8, crossbow_bolt = 100 }
+local lightWeapons = { weapon_pistol = true, weapon_smg1 = true, weapon_357 = true }
+local impactThreshold, impactDelay, impactInterval, impactLifetime, maxImpactSpots = 32, 0.035, 0.105, 12, 256
+local maxImpactDamage = 20000
+local impactNeighbors = {}
+for y = -256, 256, 256 do
+	for x = -1, 1 do impactNeighbors[#impactNeighbors + 1] = x + y end
+end
+local function removeImpactSpot(impacts, spot)
+	local bucket = impacts.bins[spot.bin]
+	bucket[spot.facing] = nil
+	if not next(bucket) then impacts.bins[spot.bin] = nil end
+	impacts.slots[spot.slot] = nil
+	local count = impacts.layers[spot.layer] - 1
+	impacts.layers[spot.layer] = count > 0 and count or nil
+	impacts.count = impacts.count - 1
+end
+
+local function impactSpot(impacts, r, point, normal, now)
+	local scale = impacts.scale
+	local origin = r.origin
+	local x = math.floor((point.x - origin.x) * scale)
+	local y = math.floor((point.y - origin.y) * scale)
+	local z = math.floor((point.z - origin.z) * scale)
+	-- Regions are at most 32 m across and bins at least seven Source
+	-- units wide, so each coordinate fits within this 256-wide stride.
+	local bin = x + y * 256 + z * 65536
+	local facing = math.floor(normal.x + 0.5) + 3 * math.floor(normal.y + 0.5) + 9 * math.floor(normal.z + 0.5)
+	local bucket = impacts.bins[bin]
+	local spot = bucket and bucket[facing]
+	if spot then return spot end
+
+	local nearest = impacts.patch2
+	for dz = -1, 1 do
+		if impacts.layers[z + dz] then
+			local layerBin = bin + dz * 65536
+			for _, offset in ipairs(impactNeighbors) do
+				local adjacent = impacts.bins[layerBin + offset]
+				if adjacent then
+					for _, candidate in pairs(adjacent) do
+						local distance = candidate.anchor:DistToSqr(point)
+						if distance < nearest and now - candidate.last <= impactLifetime then
+							local alignment = candidate.anchorNormal:Dot(normal)
+							if alignment > 0.65 or (alignment > -0.05 and distance < impacts.patch2 * 0.16) then
+								spot, nearest = candidate, distance
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	if spot then return spot end
+
+	local slot = impacts.cursor
+	if impacts.count == maxImpactSpots then
+		removeImpactSpot(impacts, impacts.slots[slot])
+	else
+		while impacts.slots[slot] do slot = slot % maxImpactSpots + 1 end
+	end
+	impacts.cursor = slot % maxImpactSpots + 1
+	bucket = impacts.bins[bin] or {}
+	impacts.bins[bin] = bucket
+	spot = { anchor = point, anchorNormal = normal, damage = 0, bin = bin, facing = facing, slot = slot, layer = z }
+	impacts.layers[z] = (impacts.layers[z] or 0) + 1
+	bucket[facing], impacts.slots[slot] = spot, spot
+	impacts.count = impacts.count + 1
+	return spot
+end
+function V.RecordBallisticImpact(ply, trace, weaponClass, amount)
+	local scan = V.GetScanSession()
+	if not scan or not scan.completed or scan.failed or not trace.HitWorld or trace.HitSky
+		or trace.StartSolid or not trace.HitNormal or trace.HitNormal:LengthSqr() < 0.5
+		or lightWeapons[weaponClass] or not V.CanEdit(ply, scan.region)
+	then
+		return false
+	end
+	local r = scan.region
+	if r.revision >= V.MaxEdits or not V.InScanCube(r, trace.HitPos) or V.GetServerMovementRegion(ply) ~= r then
+		return false
+	end
+	if amount == nil or amount == 0 then amount = nativeImpactDamage[weaponClass] end
+	if type(amount) ~= "number" or amount ~= amount or amount == math.huge
+		or amount < (nativeImpactDamage[weaponClass] and 1 or 14)
+	then
+		return false
+	end
+	local now = CurTime()
+	local impacts = scan.ballisticImpacts
+	if not impacts then
+		local patch = math.Clamp(r.step * 0.65, 7, 13)
+		impacts = { nextAt = now, count = 0, cursor = 1, scale = 1 / patch, patch2 = patch * patch, bins = {}, slots = {}, layers = {} }
+		scan.ballisticImpacts = impacts
+	end
+	local point, normal = trace.HitPos, trace.HitNormal
+	local spot = impactSpot(impacts, r, point, normal, now)
+	if spot.last and now - spot.last > impactLifetime then
+		spot.damage, spot.readyAt = 0, nil
+		spot.anchor, spot.anchorNormal = point, normal
+	end
+	spot.damage = math.min(maxImpactDamage, spot.damage + math.min(amount, 20))
+	spot.ply, spot.point, spot.normal, spot.last = ply, point, normal, now
+	if spot.damage >= impactThreshold and not spot.readyAt then
+		spot.readyAt = now + impactDelay
+		if not impacts.pending then impacts.nextAt = math.max(impacts.nextAt, spot.readyAt) end
+		impacts.pending = true
+		if V.EmitBallisticPreview then V.EmitBallisticPreview(scan, point + normal * 0.8) end
+	end
+	return true
+end
+
+local function prepareBallisticBrush(edit, field, point, normal, charge, checkpoint)
+	-- Engine hits may come from a swept projectile hull or from a surface
+	-- replaced since the shot. Fit against the current voxel triangle.
+	local direction = -normal
+	local hit = V.TraceScanRegion(field, point + normal * 3, direction,
+		math.min(20, field.step * 0.55 + 3), false, checkpoint)
+	if not hit or hit.HitNormal:Dot(normal) < 0.35 then return false end
+	point, normal = hit.HitPos, hit.HitNormal
+	local depth = math.Clamp(field.step * 0.28, 2.5, 9)
+	local back = V.TraceScanRegion(field, point - normal * 0.125, -normal, depth, false, checkpoint)
+	if back then
+		depth = math.min(depth, (point - back.HitPos):Dot(normal) * 0.65)
+		if depth < 1.25 then return false end
+	end
+	local penetration = math.min(depth * 0.5, 0.45 + (charge / impactThreshold - 1) * 0.65)
+	edit.center, edit.radius = fitImpactBrush(field, point, normal, depth, penetration)
+	if edit.center then return charge end
+	if charge > impactThreshold then
+		edit.center, edit.radius = fitImpactBrush(field, point, normal, depth, 0.45)
+		if edit.center then return impactThreshold end
+	end
+end
+
+local function nextBallisticEdit(scan, impacts, now)
+	impacts.nextAt = now + impactInterval
+	local r = scan.region
+	local selected, selectedKey, nextReady
+	for key, spot in pairs(impacts.slots) do
+		if now - spot.last > impactLifetime or not V.CanEdit(spot.ply, r) then
+			removeImpactSpot(impacts, spot)
+		elseif spot.readyAt then
+			if spot.readyAt > now then
+				nextReady = math.min(nextReady or spot.readyAt, spot.readyAt)
+			elseif not selected or spot.readyAt < selected.readyAt
+				or (spot.readyAt == selected.readyAt and key < selectedKey) then
+				selected, selectedKey = spot, key
+			end
+		end
+	end
+	if impacts.count == 0 then scan.ballisticImpacts = nil end
+	if not selected then
+		impacts.pending = nextReady ~= nil
+		impacts.nextAt = nextReady or now
+		return
+	end
+	local charge = math.min(impactThreshold * 4, selected.damage)
+	selected.readyAt = nil
+	local point, normal = selected.point, selected.normal
+	local anchor, anchorNormal = selected.anchor, selected.anchorNormal
+	local work = { author = selected.ply, adding = false, seed = 0, source = "bullet", queuedAt = SysTime() }
+	work.prepare = function(edit, field, checkpoint)
+		local spent = prepareBallisticBrush(edit, field, point, normal, charge, checkpoint)
+		if not spent and point:DistToSqr(anchor) > 0.25 then
+			spent = prepareBallisticBrush(edit, field, anchor, anchorNormal, charge, checkpoint)
+		end
+		-- Hits can keep arriving while geometry yields. Charge against the
+		-- current balance so new hits remain queued for the next edit.
+		selected.damage = math.max(0, selected.damage - (spent or impactThreshold))
+		selected.readyAt = selected.damage >= impactThreshold and (selected.readyAt or now) or nil
+		return spent
+	end
+	return work
+end
+
 function V.QueueTerrainExplosion(ply, work)
     local scan = work.zoneID and V.GetScanSession(work.zoneID) or V.GetScanSession(work.center)
 	if not scan or not scan.completed or (not work.system and (not V.GetServerMovementRegion(ply) or not V.CanEdit(ply, scan.region))) then
@@ -403,13 +666,20 @@ local function resume(thread, deadline, owner)
 	return coroutine.status(thread) == "dead"
 end
 local function sample(scan, deadline)
-	local data, done
-	if V.GetBSPGeometry then
-		data, done = V.GetBSPGeometry()
-	end
 	if not scan.geometryPrepared then
-		if not done and V.GetBSPGeometry then
-			return
+		local data, done
+		if not scan.byRays and V.GetBSPGeometry then
+			data, done = V.GetBSPGeometry()
+			if not done then return end
+			if not data then
+				if scan.cachedRecord and scan.cachedRecord.byRays == false then
+					V.Notify(scan.ply, "Le BSP est requis pour restaurer cette zone.")
+					V.SendScanProgress(scan, 3, 0)
+					V.RemoveScanSession(scan)
+					return
+				end
+				V.Notify(scan.ply, "BSP indisponible. Analyse par rayons.")
+			end
 		end
 		if data then
 			scan.geometryThread = scan.geometryThread
@@ -420,6 +690,9 @@ local function sample(scan, deadline)
 						end
 					end
 					V.PrepareBSPRegion(scan.region, data, checkpoint, not scan.cachedRecord)
+					if not scan.cachedRecord and scan.region.bspFallback then
+						scan.densityNodes = V.BSPScanDensityNodes(scan.region, checkpoint)
+					end
 					if V.PrepareVehicleExterior then
 						V.PrepareVehicleExterior(scan.region, data, checkpoint)
 					end
@@ -436,6 +709,12 @@ local function sample(scan, deadline)
 				return
 			end
 			scan.geometryThread = nil
+		end
+		local r = scan.region
+		if not scan.cachedRecord and (not r.bsp or r.bspFallback) then
+			scan.trace, scan.traceStats, scan.terrainSign = V.ColumnScanTrace(r, worldTrace, function(p)
+				return bit.band(util.PointContents(p), 16395) ~= 0
+			end)
 		end
 		scan.geometryPrepared = true
 	end
@@ -486,6 +765,7 @@ local function sample(scan, deadline)
 		scan.index = 33 ^ 3
 	end
 	local sampleStarted = scan.index < 33 ^ 3 and SysTime()
+	local fullDensity = math.floor(scan.region.step * 64 + 0.5) / 64
 	while scan.index < 33 ^ 3 and SysTime() < deadline do
 		local cells = scan.region.cells
 		if cells then
@@ -507,9 +787,17 @@ local function sample(scan, deadline)
 		local p, x, y, z = V.ScanPoint(scan.region, scan.index)
 		local r = scan.region
 		if not r.cells or (x <= r.cells.x and y <= r.cells.y and z <= r.cells.z) then
-			local solid = bit.band(util.PointContents(p), 16395) ~= 0
-			local value = V.ScanDensity(r, p, solid, scan.trace, scan.terrainSign)
-			r.values[V.Index(x, y, z, r)] = value
+			local value
+			local key = V.Index(x, y, z, r)
+			if scan.trace and (not scan.densityNodes or scan.densityNodes[key]) then
+				local solid = bit.band(util.PointContents(p), 16395) ~= 0
+				value = V.ScanDensity(r, p, solid, scan.trace, scan.terrainSign)
+			else
+				-- Exact cells use BSP faces and brush planes. Only occupancy
+				-- is needed in their auxiliary field, without engine traces.
+				value = V.BSPSolid(r.bsp, p) and -fullDensity or fullDensity
+			end
+			r.values[key] = value
 			if value < 0 then
 				scan.solids = scan.solids + 1
 			end
@@ -525,6 +813,7 @@ local function sample(scan, deadline)
 	if scan.index == 33 ^ 3 then
 		scan.trace = nil
 		scan.terrainSign = nil
+		scan.densityNodes = nil
 		scan.region.bspTerrainColumns = nil
 		scan.snapshot = { values = scan.initialValues or scan.region.values }
 		scan.initialValues = nil
@@ -547,6 +836,7 @@ local function tick(scan)
 	local deadline = math.min(V.ZoneTickDeadline or math.huge,SysTime() + scanBudget:GetFloat() / 1000)
 	if not scan.snapshot then
 		sample(scan, deadline)
+		if V.GetScanSession() ~= scan then return end
 	end
 	-- The immutable density can travel while the server prepares SAT and
 	-- native collision. The completion message still waits for both.
@@ -593,10 +883,14 @@ local function tick(scan)
 		return
 	end
 	local r = scan.region
-	if not scan.editWork and scan.explosions and #scan.explosions > 0 and V.ScanPeersReady(scan, r.revision) then
-		local work = table.remove(scan.explosions, 1)
-		if r.revision < V.MaxEdits and (work.system or V.CanEdit(work.author, r)) then
+	local queuedExplosion = scan.explosions and #scan.explosions > 0
+	local impacts = scan.ballisticImpacts
+	local now = impacts and CurTime()
+	if not scan.editWork and (queuedExplosion or impacts and impacts.pending and now >= impacts.nextAt) and V.ScanPeersReady(scan, r.revision) then
+		local work = queuedExplosion and table.remove(scan.explosions, 1) or nextBallisticEdit(scan, impacts, now)
+		if work and r.revision < V.MaxEdits and (work.system or V.CanEdit(work.author, r)) then
 			startEdit(scan, work, function(_, checkpoint)
+				if work.source == "bullet" then return work.prepare(work, r, checkpoint) end
 				if work.prepare and not work.prepare(work, r, checkpoint) then
 					return false
 				end

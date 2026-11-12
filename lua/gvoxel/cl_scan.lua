@@ -250,7 +250,7 @@ net.Receive("vm_scan_begin", function()
 		r = V.NewScanRegion(id, center, metres)
 	end
 	discard()
-	scan = { region = r, phase = 0, ratio = 0, solids = 0, rays = 0, elapsed = 0, nextLayer = 0, built = 0, chunkCount = 0 }
+	scan = { region = r, phase = 0, ratio = 0, solids = 0, rays = 0, elapsed = 0, nextLayer = 0, built = 0, chunkCount = 0, clientStarted = SysTime() }
 	if V.BeginSurfaceCapture then
 		V.BeginSurfaceCapture(scan.region)
 	end
@@ -367,6 +367,9 @@ local function publishPreparedEdit(frameStarted)
 		r.chunks[key] = chunk
 	end
 	V.PublishScanField(r, work.field)
+	-- Removing matter cannot newly block a light ray. Keep the previous
+	-- result on reused meshes while the new opening is sampled.
+	if work.addedMatter then r.lightOcclusionRevision = r.revision end
 	-- The server keeps the preceding field until this display swap.
 	net.Start("vm_scan_ready")
 	net.WriteUInt(r.id, 16)
@@ -605,6 +608,7 @@ hook.Add("Think", "GVoxel.ScanMeshes", function()
 		if scan.visualStaged and not V.ActivateVisualRegion(scan.region) then
 			return
 		end
+		scan.readyAt = SysTime()
 		scan.visualReady = true
 		net.Start("vm_scan_ready")
 		net.WriteUInt(scan.region.id, 16)
@@ -678,6 +682,7 @@ hook.Add("Think", "GVoxel.ScanMeshes", function()
 					cache.revision = job.edit.revision
 				end
 				editWork.field.revision = job.edit.revision
+				if changed and job.edit.adding then editWork.addedMatter = true end
 				editWork.applyJob = nil
 				for key, c in pairs(dirty) do
 					-- This frozen batch applies every stroke before building.

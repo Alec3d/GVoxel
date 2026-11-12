@@ -208,19 +208,20 @@ local function drawBatch(chunk, batch)
 	if V.DrawSurfaceBatch then
 		V.DrawSurfaceBatch(region, chunk, batch, true)
 	else
-		render.SetMaterial(V.SurfaceMaterial(batch))
-		V.DrawMesh(batch.mesh)
+		local material = V.SurfaceMaterial(batch)
+		if material then
+			render.SetMaterial(material)
+			V.DrawMesh(batch.mesh)
+		end
 	end
 end
 
 local function drawTerrain(frustum)
-	local visible = {}
 	local translucent
 	render.SuppressEngineLighting(true)
 	for _, chunk in pairs(region.chunks) do
 		if chunk.mesh and V.BoundsInView(frustum, chunk.low, chunk.high) then
 			stats.chunks = stats.chunks + 1
-			visible[#visible + 1] = chunk
 			if not chunk.batches or not V.DrawSurfaceBatch then
 				if not chunk.light or (chunk.nextLight or 0) <= RealTime() then
 					chunk.light = {}
@@ -254,28 +255,9 @@ local function drawTerrain(frustum)
 			matrixPushed = false
 		end
 	end
-	-- Enumerate projected lights once for the complete visible terrain.
-	render.RenderFlashlights(function()
-		for _, chunk in ipairs(visible) do
-			cam.PushModelMatrix(chunk.transform)
-			matrixPushed = true
-			if chunk.batches then
-				for _, batch in ipairs(chunk.batches) do
-					if not batch.translucent then
-						render.SetMaterial(
-							V.SurfaceFlashMaterial and V.SurfaceFlashMaterial(batch) or V.SurfaceMaterial(batch)
-						)
-						V.DrawMesh(batch.mesh)
-					end
-				end
-			else
-				render.SetMaterial(V.ScanSurfaceMaterial)
-				V.DrawMesh(chunk.mesh)
-			end
-			cam.PopModelMatrix()
-			matrixPushed = false
-		end
-	end)
+	-- Sandbox lamps are evaluated by DrawSurfaceBatch's bounded light
+	-- sampler. Replaying all engine projectors would also redraw the
+	-- player's flashlight over the replacement and its material blends.
 	render.SuppressEngineLighting(false)
 	render.ResetModelLighting(1, 1, 1)
 	render.SetLocalModelLights()
@@ -287,7 +269,11 @@ local function drawTranslucentTerrain(batches, forward)
 	for _, entry in ipairs(batches) do
 		entry.depth = (entry.batch.worldCenter or entry.chunk.lightOrigin):Dot(forward)
 	end
-	table.sort(batches, function(a, b) return a.depth > b.depth end)
+	table.sort(batches, function(a, b)
+		local aOverlay, bOverlay = a.batch.blendOverlay == true, b.batch.blendOverlay == true
+		if aOverlay ~= bOverlay then return aOverlay end
+		return a.depth > b.depth
+	end)
 	render.SetStencilTestMask(1)
 	render.SetStencilReferenceValue(1)
 	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
@@ -295,7 +281,9 @@ local function drawTranslucentTerrain(batches, forward)
 	for _, entry in ipairs(batches) do
 		cam.PushModelMatrix(entry.chunk.transform)
 		matrixPushed = true
+		if entry.batch.blendOverlay then render.OverrideDepthEnable(true, false) end
 		drawBatch(entry.chunk, entry.batch)
+		if entry.batch.blendOverlay then render.OverrideDepthEnable(false) end
 		cam.PopModelMatrix()
 		matrixPushed = false
 	end
@@ -909,8 +897,8 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 			frame = FrameNumber(),
 			region = region,
 			origin = origin,
-			angles = angles,
-			fov = fov,
+			forward = angles:Forward(),
+			right = angles.Right and angles:Right(),
 			frustum = frustum,
 			slots = {},
 			native = {},
@@ -1009,28 +997,43 @@ local function sealBackgroundDepth(portal)
 	render.OverrideAlphaWriteEnable(false)
 end
 
-local function renderNative()
-	stats.terrain = 0
-	stats.chunks = 0
+local function replacementView()
+	if not frameViews or frameViews.frame ~= FrameNumber() or frameViews.region ~= region then
+		return
+	end
 	local setup = render.GetViewSetup(true)
+	if setup.viewid and setup.viewid ~= (VIEW_MAIN or 0) then
+		return
+	end
+	local eye = setup.origin
+	local forward = setup.angles:Forward()
+	-- A scope, reflection or another view may share the player's eye position.
+	-- Its stencil and screen-space captures do not match the prepared camera.
+	if eye:DistToSqr(frameViews.origin) > 0.01
+		or forward:DistToSqr(frameViews.forward) > 1e-8
+		or (frameViews.right and setup.angles:Right():DistToSqr(frameViews.right) > 1e-8)
+	then
+		return
+	end
 	local w, h = setup.width or setup.w or ScrW(), setup.height or setup.h or ScrH()
 	local frustum = V.ViewFrustum(setup, w, h)
 	if not V.BoundsInView(frustum, region.origin, region.origin + V.RegionSize(region)) then
 		return
 	end
-	if not frameViews or frameViews.frame ~= FrameNumber() or frameViews.region ~= region then
-		return
-	end
-	local eye = setup.origin
-	if eye:DistToSqr(frameViews.origin) > 0.01 then
-		return
-	end
+	return eye, forward, frustum
+end
+
+local function renderNative(eye, forward, frustum)
 	volumeMask(eye)
 	preserveNativeBackgrounds()
 	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
-	-- This is the key step used by Mineable Worlds: discard the old surface
-	-- depth locally, then write real terrain depth in the current camera.
-	render.ClearBuffersObeyStencil(8, 8, 8, 255, true)
+	-- Reset depth inside the mask while retaining the original scene color.
+	-- An uncovered pixel at the BSP/voxel seam keeps the native image.
+	render.OverrideColorWriteEnable(true, false)
+	render.OverrideAlphaWriteEnable(true, false)
+	render.ClearBuffersObeyStencil(0, 0, 0, 0, true)
+	render.OverrideAlphaWriteEnable(false)
+	render.OverrideColorWriteEnable(false)
 	-- Both 1 (cleared solid) and 3 (native air) receive new voxel geometry.
 	-- In particular, adding matter must still occlude preserved scenery.
 	render.SetStencilTestMask(1)
@@ -1045,7 +1048,8 @@ local function renderNative()
 				render.SetStencilReferenceValue(2)
 				render.SetStencilCompareFunction(STENCILCOMPARISONFUNCTION_EQUAL)
 				render.SetStencilPassOperation(STENCILOPERATION_KEEP)
-				render.ClearBuffersObeyStencil(8, 8, 8, 255, true)
+				-- markOpening already depth-tested these pixels. Keep depth
+				-- until the exit plane replaces it after the color copy.
 				render.OverrideDepthEnable(true, false)
 				render.SetMaterial(slot.material)
 				render.DrawScreenQuad()
@@ -1061,7 +1065,7 @@ local function renderNative()
 	if translucent then
 		-- A pane blends with the finished exit and opaque terrain. It must
 		-- not contribute to aperture depth or the projected light pass.
-		drawTranslucentTerrain(translucent, setup.angles:Forward())
+		drawTranslucentTerrain(translucent, forward)
 	end
 end
 
@@ -1075,10 +1079,18 @@ hook.Add("PostDrawOpaqueRenderables", "GVoxel.ReplaceNativeTerrain", function(de
 	if render.GetRenderTarget() ~= nil then
 		return
 	end
+	stats.terrain = 0
+	stats.chunks = 0
+	local eye, forward, frustum = replacementView()
+	if not eye then
+		return
+	end
 	composing = true
 	V.ComposingTerrain = true
 	local started = SysTime()
-	local ok, err = xpcall(renderNative, debug.traceback)
+	local ok, err = xpcall(function()
+		renderNative(eye, forward, frustum)
+	end, debug.traceback)
 	cleanup()
 	stats.ms = (SysTime() - started) * 1000 + (stats.backgroundMS or 0)
 	if not ok then

@@ -281,13 +281,20 @@ function V.TraceVehicleTerrain(r, data, native)
 		Normal = delta:GetNormalized(),
 	}
 	local defaults = best
-	local function merge(hit, a, b, terrain)
+	local function merge(hit, a, b, terrain, preserve)
 		if not hit then
 			return
 		end
 		local fraction = a + (b - a) * (hit.Fraction or 1)
 		if hit.Hit and (fraction < best.Fraction or (fraction == 0 and hit.StartSolid)) then
-			best = hit
+			if preserve then
+				best = {}
+				for key, value in pairs(hit) do best[key] = value end
+				local normal = hit.HitNormal
+				best.HitNormal = Vector(normal.x, normal.y, normal.z)
+			else
+				best = hit
+			end
 			best.Fraction = fraction
 			best.HitPos = start + delta * fraction
 			if fraction > 0 then
@@ -327,9 +334,27 @@ function V.TraceVehicleTerrain(r, data, native)
 		merge(segment(0, 1, false), 0, 1)
 		original.mask = data.mask
 	end
-	local a, b = start + delta * first, start + delta * last
-	merge(V.TraceVoxelHull(r, a, b, mins, maxs), first, last, true)
-	merge(exteriorTrace(r, a, b, mins, maxs), first, last, true)
+	-- Ballistic callers can reuse an identical static ray. Entity and
+	-- exterior native-world queries above and below still run for each shot.
+	local memo = data.terrainMemo
+	local voxel, exterior
+	if memo and memo.revision == r.revision and memo.sx == start.x and memo.sy == start.y and memo.sz == start.z
+		and memo.fx == finish.x and memo.fy == finish.y and memo.fz == finish.z
+	then
+		voxel, exterior = memo.voxel, memo.exterior
+	else
+		local a, b = start + delta * first, start + delta * last
+		voxel = V.TraceVoxelHull(r, a, b, mins, maxs)
+		exterior = exteriorTrace(r, a, b, mins, maxs)
+		if memo then
+			memo.revision = r.revision
+			memo.sx, memo.sy, memo.sz = start.x, start.y, start.z
+			memo.fx, memo.fy, memo.fz = finish.x, finish.y, finish.z
+			memo.voxel, memo.exterior = voxel, exterior
+		end
+	end
+	merge(voxel, first, last, true, memo)
+	merge(exterior, first, last, true, memo)
 	if last < 1 - EPS then
 		merge(segment(math.min(1, last + EPS), 1, false), math.min(1, last + EPS), 1)
 	end

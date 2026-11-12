@@ -14,6 +14,16 @@ local function scanRays(step)
 	return rayStarts, rayDeltas
 end
 
+local function surfaceDistance(delta, planeDistance)
+	local distance = math.abs(planeDistance)
+	-- A nearly parallel ray may touch a finite face far from this lattice
+	-- point. Its infinite plane is not evidence for a zero-distance node.
+	if distance < 1 / 128 and delta:LengthSqr() > 1 / 64 then
+		return math.sqrt(delta:LengthSqr())
+	end
+	return distance
+end
+
 -- Sample the volume, not just a height map: six local ray directions refine
 -- brush occupancy and detect displacement surfaces near each lattice point.
 -- Providers are injected so this numerical part can be tested without a map.
@@ -26,10 +36,10 @@ function V.ScanDensity(r, p, solid, trace, terrainSign)
 		local delta = deltas[i]
 		local hit = trace(start, start + delta)
 		if hit.StartSolid and not hit.AllSolid and (hit.FractionLeftSolid or 0) > 0 then
-			local exit = start + delta * hit.FractionLeftSolid
+			local exit = p - (start + delta * hit.FractionLeftSolid)
 			distance = math.min(
 				distance,
-				hit.ExitNormal and math.abs((exit - p):Dot(hit.ExitNormal)) or math.sqrt(exit:DistToSqr(p))
+				hit.ExitNormal and surfaceDistance(exit, exit:Dot(hit.ExitNormal)) or exit:Length()
 			)
 		elseif
 			hit.HitWorld
@@ -38,8 +48,9 @@ function V.ScanDensity(r, p, solid, trace, terrainSign)
 			and not hit.StartSolid
 			and hit.HitTexture ~= "**studio**"
 		then
-			local planeDistance = (p - hit.HitPos):Dot(hit.HitNormal)
-			local d = math.abs(planeDistance)
+			local offset = p - hit.HitPos
+			local planeDistance = offset:Dot(hit.HitNormal)
+			local d = surfaceDistance(offset, planeDistance)
 			if V.RecordScanPlane and r.analysis and hit.HitTexture ~= "**displacement**" then
 				planeHits = planeHits or {}
 				planeHits[#planeHits + 1] = { hit = hit, distance = d }
@@ -80,7 +91,20 @@ function V.ScanPoint(r, index)
 	local z = math.floor(index / (33 * 33))
 	local y = math.floor(index / 33) % 33
 	local x = index % 33
-	return r.origin + Vector(x, y, z) * r.step, x, y, z
+	local origin, step = r.origin, r.step
+	local coordinates = r.scanCoordinates
+	if not coordinates or coordinates.ox ~= origin.x or coordinates.oy ~= origin.y
+		or coordinates.oz ~= origin.z or coordinates.step ~= step
+	then
+		coordinates = { ox = origin.x, oy = origin.y, oz = origin.z, step = step, x = {}, y = {}, z = {} }
+		for i = 0, 32 do
+			-- Preserve Source's float multiply and add rounding.
+			local p = origin + Vector(i, i, i) * step
+			coordinates.x[i], coordinates.y[i], coordinates.z[i] = p.x, p.y, p.z
+		end
+		r.scanCoordinates = coordinates
+	end
+	return Vector(coordinates.x[x], coordinates.y[y], coordinates.z[z]), x, y, z
 end
 
 -- Press/release semantics are independent of frame rate and SWEP prediction.

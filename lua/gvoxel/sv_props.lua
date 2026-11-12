@@ -660,14 +660,19 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 							if job.exterior then
 								return job.exterior.vertices
 							end
+							local current = physics.readyRevision == r.revision and physics.field ~= r
+							local previous = current and physics.colliders[job.key]
 							if not V.CollisionChunkMayHaveSurface(physics.field, job.x, job.y, job.z) then
-								return {}
+								return {}, current and previous == false
 							end
+							local cache = IsValid(previous) and r.terrainCache
+							local previousCells = cache and cache.revision == r.revision
+								and cache.physicsCells and cache.physicsCells[job.key] or nil
 							return V.BuildCollisionChunk(physics.field, job.x, job.y, job.z, function()
 								if SysTime() >= (job.deadline or 0) then
 									coroutine.yield()
 								end
-							end)
+							end, previousCells)
 						end)
 						physics.current = job
 					end
@@ -675,7 +680,7 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 					job.deadline = deadline
 					if not job.vertices then
 						local began = SysTime()
-						local ok, vertices = coroutine.resume(job.thread)
+						local ok, vertices, unchanged = coroutine.resume(job.thread)
 						cookStats.meshTotal = cookStats.meshTotal + (SysTime() - began) * 1000
 						if not ok then
 							physics.failed = true
@@ -684,9 +689,13 @@ hook.Add("Think", "GVoxel.PropPhysics", function()
 							break
 						end
 						if coroutine.status(job.thread) == "dead" then
-							job.vertices = vertices
-							job.offset = 1
-							job.collider = false
+							if unchanged then
+								physics.current = nil
+							else
+								job.vertices = vertices
+								job.offset = 1
+								job.collider = false
+							end
 						end
 					end
 					if job.vertices then

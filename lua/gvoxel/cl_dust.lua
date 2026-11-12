@@ -4,13 +4,41 @@ local V=GVoxel
 if V.ReleaseDust then V.ReleaseDust() end
 local enabled=CreateClientConVar("vm_blast_dust","1",true,false,"Short dust cover for voxel edits",0,1)
 local tokens,last,nativeAt=32,0,0
-local clouds={}
+local clouds, previews = {}, {}
 function V.ReleaseDust()
     for _,cloud in ipairs(clouds) do if cloud.emitter:IsValid() then cloud.emitter:Finish() end end
     clouds={}
+    for _, preview in ipairs(previews) do if preview.emitter:IsValid() then preview.emitter:Finish() end end
+    previews={}
 end
+
+local function previewImpact(point)
+    if not enabled:GetBool() or EyePos():DistToSqr(point) > 768^2 then return end
+    local emitter = ParticleEmitter(point)
+    if not emitter then return end
+    emitter:SetNoDraw(true)
+    if emitter.SetParticleCullRadius then emitter:SetParticleCullRadius(16) end
+    for _=1,3 do
+        local particle = emitter:Add("particle/particle_smokegrenade", point)
+        if particle then
+            particle:SetVelocity(VectorRand()*10)
+            particle:SetDieTime(0.25)
+            particle:SetStartAlpha(175) particle:SetEndAlpha(0)
+            particle:SetStartSize(2) particle:SetEndSize(6)
+            particle:SetColor(106,100,91)
+            particle:SetCollide(false) particle:SetLighting(false)
+        end
+    end
+    if #previews >= 6 then
+        local old = table.remove(previews,1)
+        if old.emitter:IsValid() then old.emitter:Finish() end
+    end
+    previews[#previews+1] = {emitter=emitter,expires=RealTime()+0.25}
+end
+
 net.Receive("vm_blast_dust",function()
     local p,radius,breaking=net.ReadVector(),net.ReadUInt(11),net.ReadBool()
+    if radius==4 and not breaking then previewImpact(p) return end
     if radius<16 or radius>1024 or EyePos():DistToSqr(p)>(2048+radius)^2 then return end
     if breaking then sound.Play("physics/concrete/concrete_break2.wav",p,70,math.random(94,106),0.65) end
     if not enabled:GetBool() then return end
@@ -54,15 +82,19 @@ net.Receive("vm_blast_dust",function()
     end
     clouds[#clouds+1]={emitter=emitter,expires=now+2}
 end)
-hook.Add("PostDrawTranslucentRenderables","GVoxel.DustCover",function(depth,_,sky)
-    if #clouds==0 or depth or sky or V.CapturingSurface or V.RenderingReplacement or V.ComposingTerrain then return end
-    local now=RealTime()
-    for index=#clouds,1,-1 do
-        local cloud=clouds[index]
+local function drawClouds(list, now)
+    for index=#list,1,-1 do
+        local cloud=list[index]
         if cloud.expires<=now or not cloud.emitter:IsValid() then
             if cloud.emitter:IsValid() then cloud.emitter:Finish() end
-            table.remove(clouds,index)
+            table.remove(list,index)
         else cloud.emitter:Draw() end
     end
+end
+hook.Add("PostDrawTranslucentRenderables","GVoxel.DustCover",function(depth,_,sky)
+    if (#clouds==0 and #previews==0) or depth or sky or V.CapturingSurface or V.RenderingReplacement or V.ComposingTerrain then return end
+    local now=RealTime()
+    drawClouds(clouds, now)
+    drawClouds(previews, now)
 end)
 hook.Add("ShutDown","GVoxel.ReleaseDust",V.ReleaseDust)

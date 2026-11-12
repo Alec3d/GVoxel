@@ -562,6 +562,7 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	r.bspDensityBase = nil
 	r.bspTerrainFaces = {}
 	r.bspTerrainCells = {}
+	r.bspCompiledTerrain = {}
 	r.bspFallbackUnknown = {}
 	r.bspDensityChoice = {}
 	r.bspDensityNodeSigns = {}
@@ -575,7 +576,8 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	-- Displacements have a separate collision representation. Keep the ray
 	-- reconstruction in volumes containing them rather than restoring their
 	-- underlying flat Hammer brush as if it were the displaced surface.
-	for index, face in ipairs(data.faces) do
+	local faces = V.BSPBoundsCandidates(data, "faces", r.origin, high, checkpoint)
+	for index, face in ipairs(faces) do
 		local faceLow, faceHigh = face.dispLow or face.low, face.dispHigh or face.high
 		if V.BoundsOverlap(faceLow, faceHigh, r.origin, high) then
 			local sheet = openTerrainFace(data, face)
@@ -666,8 +668,11 @@ function V.PrepareBSPRegion(r, data, checkpoint, columnSampling)
 	r.bspBrushes = {}
 	r.bspBrushBins = {}
 	r.bspBrushCells = {}
-	for index, brush in ipairs(data.worldBrushes or {}) do
-		if V.BoundsOverlap(brush.low, brush.high, r.origin - Vector(1, 1, 1), high + Vector(1, 1, 1)) then
+	local margin = Vector(1, 1, 1)
+	local brushLow, brushHigh = r.origin - margin, high + margin
+	local brushes = V.BSPBoundsCandidates(data, "worldBrushes", brushLow, brushHigh, checkpoint)
+	for index, brush in ipairs(brushes) do
+		if V.BoundsOverlap(brush.low, brush.high, brushLow, brushHigh) then
 			r.bspBrushes[#r.bspBrushes + 1] = brush
 			local lo, hi = (brush.low - r.origin) / (r.step * 8), (brush.high - r.origin) / (r.step * 8)
 			for z = math.max(0, math.floor(lo.z)), math.min(3, math.floor(hi.z)) do
@@ -945,12 +950,119 @@ function V.BSPFaceAt(r, point, normal, maxDistance)
 	return best
 end
 
+local function terrainProjectedArea(polygon)
+	local area, first = 0, polygon[1]
+	for i = 2, #polygon - 1 do
+		local a, b = polygon[i], polygon[i + 1]
+		area = area + (a.x - first.x) * (b.y - first.y) - (a.y - first.y) * (b.x - first.x)
+	end
+	return area * 0.5
+end
+
+local function joinedTerrainPatches(a, b)
+	local intersection = a.polygon
+	for _, side in ipairs(b.sides) do
+		intersection = V.ClipBSPPolygon(intersection, side.normal, side.distance)
+		if #intersection == 0 then return true end
+	end
+	if math.abs(terrainProjectedArea(intersection)) > 0.002 then return false end
+	for _, p in ipairs(intersection) do
+		local n = b.normal
+		local distance = p.x * n.x + p.y * n.y + p.z * n.z - b.distance
+		if math.abs(distance) > n.z / 32 then return false end
+	end
+	return true
+end
+
+-- Keep exact heightfield surfaces where the projected square is covered.
+-- Multiple authored patches must join at the same height without overlap.
+function V.BSPCellCompiledTerrain(r, x, y, z, key)
+	local cache = r.bspCompiledTerrain
+	if not cache then return end
+	key = key or V.Index(x, y, z, r)
+	local cached = cache[key]
+	if cached ~= nil then return cached or nil end
+	local contacts = r.bspTerrainCells[key]
+	if not contacts or r.bspFallbackUnknown[key] then return end
+	cache[key] = false
+	local lowX, lowY = x * r.step, y * r.step
+	local highX, highY = lowX + r.step, lowY + r.step
+	local area, patches, winding = 0, {}, {}
+	for _, tri in ipairs(contacts) do
+		if tri.normal.z <= 0.25 or not tri.source.displacement then return end
+		local polygon = tri.localPoints
+		if not polygon then
+			polygon = {}
+			for i, p in ipairs(tri.vertices) do polygon[i] = p - r.origin end
+			tri.localPoints = polygon
+		end
+		polygon = V.ClipBSPPolygon(polygon, boxNormals[1], highX)
+		polygon = V.ClipBSPPolygon(polygon, oppositeBoxNormals[1], -lowX)
+		polygon = V.ClipBSPPolygon(polygon, boxNormals[2], highY)
+		polygon = V.ClipBSPPolygon(polygon, oppositeBoxNormals[2], -lowY)
+		local signedArea = terrainProjectedArea(polygon)
+		if math.abs(signedArea) > EPS then
+			local positive = signedArea > 0
+			if winding[tri.source] ~= nil and winding[tri.source] ~= positive then return end
+			winding[tri.source] = positive
+			local sides = {}
+			for i, a in ipairs(polygon) do
+				local b = polygon[i % #polygon + 1]
+				local normal = Vector(b.y - a.y, a.x - b.x, 0)
+				if normal:LengthSqr() > EPS then
+					normal:Normalize()
+					if signedArea < 0 then normal = -normal end
+					sides[#sides + 1] = { normal = normal, distance = normal:Dot(a) }
+				end
+			end
+			area = area + math.abs(signedArea)
+			local patch = { polygon = polygon, sides = sides, normal = tri.normal,
+				distance = tri.normal:Dot(tri.localPoints[1]), source = tri.source }
+			for _, previous in ipairs(patches) do
+				if previous.source ~= patch.source and not joinedTerrainPatches(patch, previous) then return end
+			end
+			patches[#patches + 1] = patch
+		end
+	end
+	if math.abs(area - r.step * r.step) > r.step * 0.005 then return end
+	local first, coplanar = patches[1], true
+	for _, patch in ipairs(patches) do
+		local a, b = first.normal, patch.normal
+		coplanar = coplanar and a.x == b.x and a.y == b.y and a.z == b.z
+			and math.abs(first.distance - patch.distance) < 0.001
+		patch.polygon, patch.source = nil, nil
+	end
+	if coplanar then
+		first.sides = EMPTY
+		patches = { first }
+	end
+	cache[key] = patches
+	return patches
+end
+
+function V.BSPScanDensityNodes(r, checkpoint)
+	local nodes, visited = {}, 0
+	local row, layer = r.nx + 1, (r.nx + 1) * (r.ny + 1)
+	for key in pairs(r.bspFallback or EMPTY) do
+		local offset = key - 1
+		local x, y, z = offset % row, math.floor(offset % layer / row), math.floor(offset / layer)
+		if V.ActiveRegionCell(r, x, y, z) and not V.BSPCellCompiledTerrain(r, x, y, z, key) then
+			for _, o in ipairs(V.CellOffsets) do
+				nodes[key + o[1] + o[2] * row + o[3] * layer] = true
+			end
+		end
+		visited = visited + 1
+		if checkpoint and visited % 32 == 0 then checkpoint() end
+	end
+	return nodes
+end
+
 function V.BSPCellUsesDensity(r, x, y, z)
 	if not r.bsp then
 		return true
 	end
 	local key = V.Index(x, y, z, r)
-	if not r.bspFallback or not r.bspFallback[key] then
+	if not r.bspFallback or not r.bspFallback[key] or V.BSPCellCompiledTerrain(r, x, y, z, key) then
 		return false
 	end
 	if not r.bspDensityChoice or r.bspFallbackUnknown[key] then
@@ -1128,9 +1240,20 @@ local function occupancyRoot(r, x, y, z, half, checkpoint)
 	return index, depth, clipIndex, clipDepth
 end
 
+-- A whole chunk reduced to one BSP leaf can share its occupancy across
+-- unedited cells. Detail brushes can still occupy an otherwise empty leaf.
+function V.BSPUniformChunkOccupancy(r, x, y, z, checkpoint)
+	local _, _, index = occupancyRoot(r, x, y, z, r.step * 0.5, checkpoint)
+	if index >= 0 then return end
+	if r.bsp.leaves[-index].solid then return 1 end
+	local key = V.ChunkKey(math.floor(x / 8), math.floor(y / 8), math.floor(z / 8))
+	if not (r.bspBrushBins and r.bspBrushBins[key]) then return 2 end
+end
+
 -- Classify a whole unedited cell without constructing clipped leaf boxes.
 -- Most cells are entirely air/solid; only mixed leaves need polyhedra/SAT.
 function V.BSPCellOccupancy(r, x, y, z, checkpoint)
+	if V.BSPCellCompiledTerrain(r, x, y, z) then return 3 end
 	local cache = r.bspOccupancyRoots and r.bspOccupancy
 	local key = cache and V.Index(x, y, z, r)
 	local cached = key and cache[key]
@@ -1330,11 +1453,33 @@ local function clipBox(polygon, low, high)
 	return polygon
 end
 
+local function compiledTerrainLeaves(r, patches, low, x, y, z, key, checkpoint)
+	local index, depth = clipRoot(r, x, y, z, key, checkpoint)
+	local cell = box(low, low + Vector(r.step, r.step, r.step))
+	local pieces = {}
+	for _, patch in ipairs(patches) do
+		local prism = cell
+		for _, side in ipairs(patch.sides) do
+			prism = clip(prism, side.normal, side.distance)
+			if not prism then break end
+		end
+		if prism then
+			local solid, air = clipPair(prism, patch.normal, -patch.normal, patch.distance)
+			if solid then
+				pieces[#pieces + 1] = { faces = solid.faces, points = solid.points, solid = true }
+			end
+			if air then splitWorld(r, air, index, pieces, depth, checkpoint, true) end
+		end
+	end
+	return pieces
+end
+
 local function cellLeaves(r, x, y, z, needAir, checkpoint)
 	local cache, key = V.TerrainCellCache(r, "bspLeaves", x, y, z)
 	local density = V.BSPCellUsesDensity(r, x, y, z)
 	local brushes = cellBrushes(r, x, y, z, density)
-	needAir = needAir or #brushes > 0
+	local patches = V.BSPCellCompiledTerrain(r, x, y, z, key)
+	needAir = needAir or patches ~= nil or #brushes > 0
 	local existing = cache[key]
 	if existing and (not needAir or existing.hasAir) then
 		return existing
@@ -1342,7 +1487,9 @@ local function cellLeaves(r, x, y, z, needAir, checkpoint)
 	do
 		local low = Vector(x, y, z) * r.step
 		local pieces = {}
-		if density then
+		if patches then
+			pieces = compiledTerrainLeaves(r, patches, low, x, y, z, key, checkpoint)
+		elseif density then
 			-- Use the original density tetrahedra as the base solid, then the
 			-- SAME brush halfspaces as neighboring exact BSP cells. Mixing
 			-- max-at-nodes carving with exact CSG would open seams at joins.
@@ -1749,7 +1896,31 @@ local function baseOccupancy(r, x, y, z, checkpoint)
 	)
 end
 
-local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occupancy, clipIndex)
+local function clipTerrainFootprint(polygon, patch, probe)
+	for _, side in ipairs(patch.sides) do
+		if outsideSide(polygon, side.normal, side.distance, probe) then return {} end
+		polygon = V.ClipBSPPolygon(polygon, side.normal, side.distance)
+		if #polygon < 3 then break end
+	end
+	return polygon
+end
+
+local function clipBaseSurface(r, x, y, z, polygon, wantSolid, probe, emit, occupancy, clipIndex, structureOnly, checkpoint)
+	if not structureOnly and V.BSPCellCompiledTerrain(r, x, y, z) then
+		for _, piece in ipairs(cellLeaves(r, x, y, z, true, checkpoint)) do
+			if piece.solid == wantSolid then
+				local part = polygon
+				for _, face in ipairs(piece.faces) do
+					local n, d = face.normal, face.normal:Dot(face.vertices[1])
+					if outsideSide(part, n, d, probe) then part = {} break end
+					part = V.ClipBSPPolygon(part, n, d)
+					if #part < 3 then break end
+				end
+				if #part >= 3 then emit(part) end
+			end
+		end
+		return
+	end
 	if #polygon < 3 then
 		return
 	end
@@ -1945,7 +2116,35 @@ function V.BSPCell(r, x, y, z, checkpoint)
 	high = high or low + Vector(1, 1, 1) * r.step
 	local faces = r.bspFaceBins[key] or {}
 	local density = V.BSPCellUsesDensity(r, x, y, z)
-	if not density and r.bspTerrainFaces and r.bspTerrainFaces[key] then
+	local patches = V.BSPCellCompiledTerrain(r, x, y, z, key)
+	if patches then
+		local combined = {}
+		local function keep(part, normal, source)
+			if #part >= 3 then
+				combined[#combined + 1] = { vertices = part, normal = normal, localSpace = true, source = source }
+			end
+		end
+		for _, face in ipairs(faces) do
+			local polygon = {}
+			for _, p in ipairs(face.vertices) do polygon[#polygon + 1] = p - r.origin end
+			polygon = clipBox(polygon, low, high)
+			for _, patch in ipairs(patches) do
+				local part = clipTerrainFootprint(polygon, patch, face.normal)
+				local n, d = -patch.normal, -patch.distance
+				if #part >= 3 and not outsideSide(part, n, d, face.normal) then
+					keep(V.ClipBSPPolygon(part, n, d), face.normal, face)
+				end
+			end
+		end
+		-- Faces on a lattice plane retain the existing shell ownership.
+		for _, tri in ipairs(r.bspTerrainFaces[key] or EMPTY) do
+			local polygon = clipBox(tri.localPoints, low, high)
+			clipBaseSurface(r, x, y, z, polygon, false, tri.normal, function(part)
+				keep(part, tri.normal, tri.source)
+			end, nil, nil, true)
+		end
+		faces = combined
+	elseif not density and r.bspTerrainFaces and r.bspTerrainFaces[key] then
 		local combined = {}
 		for _, face in ipairs(faces) do
 			combined[#combined + 1] = face
@@ -2596,9 +2795,86 @@ function V.BSPCellSolids(r, x, y, z, checkpoint, originalMixed)
 	return cell.solids
 end
 
-function V.BSPBoundaryOpening(r, face, checkpoint)
+function V.ClipBSPTerrainOpening(r, tile, x, y, z, emit, checkpoint)
+	if not V.BSPCellCompiledTerrain(r, x, y, z) then return false end
+	local low = Vector(x, y, z) * r.step
+	local high = low + Vector(r.step, r.step, r.step)
+	local axis = tile.normal.x ~= 0 and "x" or tile.normal.y ~= 0 and "y" or "z"
+	local worldPlane = tile.vertices[1][axis]
+	local polygon = {}
+	-- Use the exact local corners of the cell hull. Subtracting the map
+	-- origin from a rounded world corner can put a whole tile outside it.
+	for i, corner in ipairs(tile.vertices) do
+		local p = corner - r.origin
+		for _, name in ipairs(names) do
+			p[name] = p[name] < (low[name] + high[name]) * 0.5 and low[name] or high[name]
+		end
+		polygon[i] = p
+	end
+	clipBaseSurface(r, x, y, z, polygon, false, -tile.normal, function(part)
+		local world = {}
+		for i, p in ipairs(part) do
+			local point = p + r.origin
+			point[axis] = worldPlane
+			world[i] = point
+		end
+		emit(world)
+	end, nil, nil, nil, checkpoint)
+	if checkpoint then checkpoint() end
+	return true
+end
+
+function V.BSPBoundaryBrushes(r, face)
+	local low, high = face.vertices[1], face.vertices[3]
+	local lo = Vector(math.min(low.x, high.x) - 1 / 64, math.min(low.y, high.y) - 1 / 64,
+		math.min(low.z, high.z) - 1 / 64)
+	local hi = Vector(math.max(low.x, high.x) + 1 / 64, math.max(low.y, high.y) + 1 / 64,
+		math.max(low.z, high.z) + 1 / 64)
+	local brushes = {}
+	for _, brush in ipairs(r.bspBrushes or EMPTY) do
+		if V.BoundsOverlap(lo, hi, brush.low, brush.high) then brushes[#brushes + 1] = brush end
+	end
+	return brushes
+end
+
+-- All tiles in a row can bypass a branch when the entire strip is
+-- strictly on one side. Near-coplanar strips keep the exact two-sided clip.
+function V.BSPBoundaryRowRoot(r, normal, corners, checkpoint)
+	local index, depth = r.bsp.head, 0
+	local outside = normal * 0.001
+	while index >= 0 do
+		local node = r.bsp.nodes[index + 1]
+		local plane = r.bsp.planes[node.plane]
+		local n = plane.normal
+		local d = plane.distance - n:Dot(outside)
+		local nx, ny, nz = n.x, n.y, n.z
+		local front, back = false, false
+		for _, p in ipairs(corners) do
+			local distance = polygonDistance(p, nx, ny, nz, d)
+			front = front or distance >= -EPS
+			back = back or distance <= EPS
+			if front and back then return index, depth end
+		end
+		index = front and node.front or node.back
+		depth = depth + 1
+		assert(depth < 1024, "arbre BSP trop profond")
+		if checkpoint and depth % 16 == 0 then checkpoint() end
+	end
+	return index, depth
+end
+
+function V.BSPBoundaryOpening(r, face, checkpoint, brushes, index, depth)
 	local vertices = {}
 	local visits = 0
+	local function emit(a, b, c, n)
+		vertices[#vertices + 1] = { pos = a, normal = n, u = 0, v = 0 }
+		vertices[#vertices + 1] = { pos = b, normal = n, u = 0, v = 0 }
+		vertices[#vertices + 1] = { pos = c, normal = n, u = 0, v = 0 }
+	end
+	local function emitPolygon(part)
+		triangles(part, face.normal, emit)
+	end
+	local outside = face.normal * 0.001
 	local function walk(polygon, index, depth)
 		if #polygon < 3 then
 			return
@@ -2608,13 +2884,7 @@ function V.BSPBoundaryOpening(r, face, checkpoint)
 		assert(depth < 1024, "arbre BSP trop profond")
 		if index < 0 then
 			if not r.bsp.leaves[-index].solid then
-				clipBrushSurface(polygon, r.bspBrushes or EMPTY, Vector(), false, face.normal, function(part)
-					triangles(part, face.normal, function(a, b, c, n)
-						for _, p in ipairs({ a, b, c }) do
-							vertices[#vertices + 1] = { pos = p, normal = n, u = 0, v = 0 }
-						end
-					end)
-				end, checkpoint)
+				clipBrushSurface(polygon, brushes or r.bspBrushes or EMPTY, polygonZero, false, face.normal, emitPolygon, checkpoint)
 			end
 			return
 		end
@@ -2622,10 +2892,25 @@ function V.BSPBoundaryOpening(r, face, checkpoint)
 		local plane = r.bsp.planes[node.plane]
 		-- Probe just outside the cube, so coplanar world surfaces choose the
 		-- external room rather than the solid side of a boundary wall.
-		local d = plane.distance - plane.normal:Dot(face.normal * 0.001)
-		walk(V.ClipBSPPolygon(polygon, -plane.normal, -d), node.front, depth + 1)
-		walk(V.ClipBSPPolygon(polygon, plane.normal, d), node.back, depth + 1)
+		local n = plane.normal
+		local d = plane.distance - n:Dot(outside)
+		local nx, ny, nz = n.x, n.y, n.z
+		local front, back = false, false
+		for _, p in ipairs(polygon) do
+			local distance = polygonDistance(p, nx, ny, nz, d)
+			front = front or distance >= -EPS
+			back = back or distance <= EPS
+			if front and back then break end
+		end
+		if front and back then
+			walk(V.ClipBSPPolygon(polygon, -n, -d), node.front, depth + 1)
+			walk(V.ClipBSPPolygon(polygon, n, d), node.back, depth + 1)
+		elseif front then
+			walk(polygon, node.front, depth + 1)
+		else
+			walk(polygon, node.back, depth + 1)
+		end
 	end
-	walk(face.vertices, r.bsp.head, 0)
+	walk(face.vertices, index or r.bsp.head, depth or 0)
 	return vertices
 end

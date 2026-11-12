@@ -11,7 +11,7 @@ function V.MakeZoneCache(scan,name,signature,checkpoint)
     local revision=r.revision
     local record={schema=2,map=game.GetMap(),signature=signature,name=name,metres=r.metres,
         base=xyz(r.base),origin=xyz(r.origin),step=r.step,cells=xyz(r.cells or Vector(32,32,32)),
-        values=values,planes={},history={}}
+        values=values,planes={},history={},byRays=r.bsp==nil}
     -- Edits publish a different values array. The original scan is immutable
     -- and can be serialized directly while a newer revision is being prepared.
     for index=1,33^3 do
@@ -35,6 +35,7 @@ function V.ValidateZoneCache(record,map,signature,checkpoint)
         return nil,"Cache obsolete : carte ou version differente."
     end
     if type(record.name)~="string" or #record.name>64 or not point(record.base) or not point(record.origin)
+        or (record.byRays~=nil and type(record.byRays)~="boolean")
         or not point(record.cells) or not finite(record.step,64) or record.step<=0 or record.step>V.UnitsPerMetre+0.0001
         or (record.metres~=0 and record.metres~=16 and record.metres~=32) then return nil,"Dimensions invalides." end
     for _,n in ipairs(record.cells) do if n<2 or n>32 or n~=math.floor(n) then return nil,"Grille invalide." end end

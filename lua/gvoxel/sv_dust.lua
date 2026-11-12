@@ -1,6 +1,25 @@
 -- One bounded visual event when a crater is accepted, never per victim/tick.
 local V=GVoxel
 util.AddNetworkString("vm_blast_dust")
+function V.EmitBallisticPreview(scan, point)
+    local now = CurTime()
+    if now < (scan.nextImpactPreview or 0) then return end
+    scan.nextImpactPreview = now + 0.10
+    local recipients = {}
+    for ply, peer in pairs(scan.peers) do
+        if IsValid(ply) and peer.done and not peer.failed and ply:GetPos():DistToSqr(point) < 768^2 then
+            recipients[#recipients + 1] = ply
+        end
+    end
+    if #recipients == 0 then return end
+    -- A reserved small radius is a cosmetic preview. The edit descriptor
+    -- and all physics still use the normal prepare/commit protocol.
+    net.Start("vm_blast_dust")
+    net.WriteVector(point)
+    net.WriteUInt(4, 11)
+    net.WriteBool(false)
+    net.Send(recipients)
+end
 function V.EmitBlastDust(scan,work)
     if work.dustSent then return end
     local now=CurTime()

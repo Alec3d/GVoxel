@@ -6,6 +6,8 @@ local session
 for _, name in ipairs({
 	"request",
 	"custom",
+	"request_rays",
+	"custom_rays",
 	"begin",
 	"progress",
 	"density",
@@ -156,7 +158,26 @@ local function sendDensity(scan, ply, peer, data)
 	net.Send(ply)
 	peer.nextLayer = peer.nextLayer + 1
 end
+local function finite(value)
+	return type(value) == "number" and math.abs(value) < math.huge
+end
+
+local function wireInteger(value, minimum)
+	return type(value) == "number" and value >= minimum and value <= 65535 and value == math.floor(value)
+end
+
+local function validStroke(stroke)
+	local center = stroke.center
+	return isvector(center) and finite(center.x) and finite(center.y) and finite(center.z)
+		and wireInteger(stroke.radius, 1) and type(stroke.adding) == "boolean"
+		and (stroke.seed == nil or wireInteger(stroke.seed, 0))
+		and (stroke.floorZ == nil or finite(stroke.floorZ))
+		and (stroke.plane == nil or V.ValidRemovalPlane(stroke.plane))
+end
+
 local function strokePacket(name, scan, ply, revision, stroke)
+	-- Check before opening the message, including when replaying a saved edit.
+	assert(validStroke(stroke), "invalid voxel stroke descriptor")
 	net.Start(name)
 	net.WriteUInt(scan.region.id, 16)
 	net.WriteUInt(revision, 16)
@@ -187,6 +208,7 @@ local function preparePeer(scan, work, ply, peer)
 	work.previewSent = true
 end
 function V.PrepareScanEdit(scan, work)
+	if not validStroke(work) then return false end
 	work.revision = work.revision or work.field.revision
 	work.previewReady = true
 	for ply, peer in pairs(scan.peers) do

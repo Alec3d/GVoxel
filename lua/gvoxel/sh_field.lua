@@ -641,7 +641,17 @@ end
 -- Static VPhysics needs positions only. Preserve refinement and winding while
 -- excluding sub-tolerance slivers. Avoid computing UVs and gradients.
 local emptyPhysicsCell = {}
-function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
+local function samePhysicsCell(current, previous)
+	if current == previous then return true end
+	if not previous or #current ~= #previous then return false end
+	for i, a in ipairs(current) do
+		local b = previous[i]
+		if a.x ~= b.x or a.y ~= b.y or a.z ~= b.z then return false end
+	end
+	return true
+end
+
+function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint, previousCells)
 	if not V.ActiveRegionCell(r, cx * 8, cy * 8, cz * 8) then
 		return {}
 	end
@@ -652,6 +662,8 @@ function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
 	local y1 = min(y0 + 7, V.RegionCells(r, "y") - 1)
 	local z1 = min(z0 + 7, V.RegionCells(r, "z") - 1)
 	local cells = V.TerrainCellCache(r, "physicsCells", x0, y0, z0)
+	if previousCells == cells then return vertices, true end
+	local identical = previousCells ~= nil
 	local converted = {}
 	local cellVertices
 	local function localPoint(point)
@@ -692,6 +704,7 @@ function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
 					-- cells without repeating tolerance tests or Vector construction.
 					cells[key] = cached
 				end
+				if identical and not samePhysicsCell(cached, previousCells[key]) then identical = false end
 				for _, point in ipairs(cached) do
 					vertices[#vertices + 1] = point
 				end
@@ -701,7 +714,7 @@ function V.BuildCollisionChunk(r, cx, cy, cz, checkpoint)
 			end
 		end
 	end
-	return vertices
+	return vertices, identical
 end
 
 local emptyRenderCell = {}
@@ -770,6 +783,8 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 			faceNormal = -faceNormal
 		end
 		local flat = r.bsp and not curved or brush and (brush.seed or brush.floorZ ~= nil or brush.plane)
+		local fineCut = not flat and brush and not nativeFace and not brush.adding and brush.radius
+			and brush.radius <= r.step * 1.65 + 1
 		for corner = 1, 3 do
 			local p = corner == 1 and a or corner == 2 and b or c
 			local data = vertexCache[p]
@@ -819,6 +834,7 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 				cell = currentCell,
 				nativeFace = nativeFace,
 				freshCut = corner == 1 and brush ~= nil and not nativeFace or nil,
+				fineCut = corner == 1 and fineCut or nil,
 			}
 		end
 	end

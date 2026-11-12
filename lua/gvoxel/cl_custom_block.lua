@@ -69,6 +69,7 @@ hook.Add("Think", "GVoxel.CustomBlockSelection", function()
 	local down = input.IsMouseDown(MOUSE_MIDDLE)
 	local allowed = V.CustomBlockEnabled()
 		and weapon
+		and not V.GetClientScanState()
 		and LocalPlayer():Alive()
 		and not gui.IsGameUIVisible()
 		and not gui.IsConsoleVisible()

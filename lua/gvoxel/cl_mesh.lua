@@ -33,7 +33,9 @@ function V.ReleaseChunkMeshes(chunk)
 	chunk.mesh = nil
 	for _, batch in ipairs(batches or {}) do
 		local object = batch.mesh
-		batch.mesh = nil
+		local flashMesh = batch.flashMesh
+		batch.mesh, batch.flashMesh = nil, nil
+		V.ReleaseMesh(flashMesh)
 		if mesh == object then
 			mesh = nil
 		end

@@ -23,6 +23,25 @@ local cutFallback = CreateMaterial("vm_cut_surface_v1", "UnlitGeneric", {
 	["$vertexcolor"] = "1",
 	["$vertexalpha"] = "0",
 })
+local dirtFallback = CreateMaterial("vm_cut_dirt_v1", "UnlitGeneric", {
+	["$basetexture"] = "nature/dirtfloor001a",
+	["$model"] = "1",
+	["$nocull"] = "1",
+	["$vertexcolor"] = "1",
+})
+local dirtAlbedo = CreateMaterial("vm_cut_dirt_albedo_v1", "UnlitGeneric", {
+	["$basetexture"] = "nature/dirtfloor001a",
+	["$model"] = "1",
+	["$nocull"] = "1",
+})
+-- Projected lights need a lit shader, even for the unknown cut material.
+-- The unlit diffuse fallback belongs only in the explicit additive pass.
+local dirtFlash = CreateMaterial("vm_cut_dirt_projected_v1", "VertexLitGeneric", {
+	["$basetexture"] = "nature/dirtfloor001a",
+	["$model"] = "1",
+	["$nocull"] = "1",
+	["$vertexcolor"] = "0",
+})
 local frames = {
 	{ normal = Vector(1, 0, 0), right = Vector(0, 1, 0), up = Vector(0, 0, 1), angles = Angle(0, 180, 0) },
 	{ normal = Vector(-1, 0, 0), right = Vector(0, -1, 0), up = Vector(0, 0, 1), angles = Angle(0, 0, 0) },
@@ -209,12 +228,15 @@ local function wallMaterial(variant, shader, name, params, projection)
 	return material
 end
 
-local function readMaterial(name)
+local function readMaterial(name, secondLayer)
 	local material = Material(name)
 	if material:IsError() then
 		return
 	end
-	local base = material:GetTexture("$basetexture")
+	local shader = material.GetShader and material:GetShader()
+	local secondary = material:GetTexture("$basetexture2")
+	local useSecond = secondLayer and shader == "WorldVertexTransition" and validTexture(secondary)
+	local base = useSecond and secondary or material:GetTexture("$basetexture")
 	if not validTexture(base) then
 		return
 	end
@@ -237,7 +259,7 @@ local function readMaterial(name)
 	local function flag(key, mask)
 		return getInt(key) == 1 or bit.band(flags, mask) ~= 0
 	end
-	local projection = materialProjection(material, "$basetexturetransform")
+	local projection = materialProjection(material, useSecond and "$basetexturetransform2" or "$basetexturetransform")
 	local params = {
 		["$basetexture"] = base:GetName(),
 		["$model"] = "1",
@@ -253,6 +275,13 @@ local function readMaterial(name)
 			params[key] = vectorParam(tint)
 		end
 	end
+	-- Newly exposed matter inherits the diffuse texture and tint. Native BSP
+	-- detail and reflection layers belong to the authored surface shader.
+	local cutAlbedo, cutParams = {}, {}
+	for key, value in pairs(params) do
+		cutAlbedo[key], cutParams[key] = value, value
+	end
+	cutParams["$vertexcolor"] = "1"
 	local detail = material:GetTexture("$detail")
 	local detailMode = getInt("$detailblendmode") or 0
 	local compatibleDetail = validTexture(detail) and detailMode >= 0 and detailMode <= 2
@@ -267,22 +296,19 @@ local function readMaterial(name)
 			if value then params[key] = tostring(value) end
 		end
 	end
-	local cutParams = {}
-	for key, value in pairs(params) do
-		cutParams[key] = value
-	end
-	cutParams["$vertexcolor"] = "1"
 	local result = {
 		materialName = name,
 		tileU = math.max(16, (base.GetMappingWidth and base:GetMappingWidth() or base:Width()) * 0.25),
 		tileV = math.max(16, (base.GetMappingHeight and base:GetMappingHeight() or base:Height()) * 0.25),
 		interior = wallMaterial("native_v3", "VertexLitGeneric", name, params, projection),
-		interiorCut = wallMaterial("reveal_v3", "UnlitGeneric", name, cutParams, projection),
+		interiorCut = wallMaterial("reveal_v4", "UnlitGeneric", name, cutParams, projection),
+		interiorCutLit = wallMaterial("reveal_lit_v4", "VertexLitGeneric", name, cutAlbedo, projection),
 	}
 	local surfaceParams = {}
-	for key, value in pairs(cutParams) do
+	for key, value in pairs(params) do
 		surfaceParams[key] = value
 	end
+	surfaceParams["$vertexcolor"] = "1"
 	surfaceParams["$opaquetexture"] = flag("$opaquetexture", 16777216) and "1" or nil
 	local alphaTest = flag("$alphatest", 256)
 	local reference = alphaTest and getFloat("$alphatestreference")
@@ -298,9 +324,15 @@ local function readMaterial(name)
 		surfaceParams["$alphatest"] = "1"
 		surfaceParams["$alphatestreference"] = alphaReference
 	end
-	local directMaterial, directCutout
+	local directMaterial, directCutout, directReveal
 	result.directLight = function(retained)
-		if retained and alphaTest then
+		if not retained then
+			if not directReveal then
+				directReveal = wallMaterial("reveal_direct_v4", "UnlitGeneric", name, cutAlbedo, projection)
+			end
+			return directReveal
+		end
+		if alphaTest then
 			if not directCutout then
 				local albedo = {}
 				for key, value in pairs(params) do
@@ -368,21 +400,28 @@ local function readMaterial(name)
 				surfaceParams[key] = tostring(value)
 			end
 		end
-		if not alphaTest and not translucent then
-			local adjacent = {}
-			for key, value in pairs(surfaceParams) do
-				adjacent[key] = value
-			end
-			tint = tint or Vector(1, 1, 1)
-			adjacent["$envmaptint"] = vectorParam(Vector(
-				math.Clamp(tint.x * 0.25, 0, 0.2),
-				math.Clamp(tint.y * 0.25, 0, 0.2),
-				math.Clamp(tint.z * 0.25, 0, 0.2)
-			))
-			result.adjacentCut = wallMaterial("adjacent_v3", "UnlitGeneric", name, adjacent, projection)
-		end
 	end
 	result.surfaceCut = wallMaterial("surface_v3", "UnlitGeneric", name, surfaceParams, projection)
+	if not alphaTest and not translucent and not baseMask and not normalMask and not selfIllum
+		and not tintByAlpha and not validTexture(secondary)
+	then
+		local blend
+		result.cutBlend = function()
+			if not blend then
+				-- Use only the diffuse shader inputs for the transition layer.
+				local layer = {
+					["$basetexture"] = params["$basetexture"], ["$color"] = params["$color"],
+					["$color2"] = params["$color2"], ["$model"] = "1", ["$nocull"] = "1",
+					["$translucent"] = "1", ["$vertexcolor"] = "1", ["$vertexalpha"] = "1",
+				}
+				blend = wallMaterial("cut_transition_v2", "UnlitGeneric", name, layer, projection)
+			end
+			return blend
+		end
+	end
+	result.directBaked = shader == "LightmappedGeneric" and not secondary and not cube and not detail and not projection
+		and not alphaTest and not translucent and not baseMask and not normalMask and not authoredMask
+		and not selfIllum and not tintByAlpha and not material:GetTexture("$bumpmap")
 	if translucent then
 		-- Preserve the same authored reflection when no BSP lightmap is
 		-- available. The engine samples the cubemap from the live view.
@@ -501,10 +540,12 @@ local function recoverMaterial(source, r, findFace)
 		return
 	end
 	local materials = r.surfaceMaterials
-	if materials[name] == nil then
-		materials[name] = readMaterial(name) or false
+	local secondLayer = texture and face.dispAlphaMin == 255
+	local key = secondLayer and (name .. "#2") or name
+	if materials[key] == nil then
+		materials[key] = readMaterial(name, secondLayer) or false
 	end
-	local definition = materials[name]
+	local definition = materials[key]
 	if not definition then
 		return
 	end
@@ -776,7 +817,21 @@ local function registerSources(r, item, vertices, checkpoint)
 			bounds[index].extremes = nil
 		end
 		recoverMaterial(source, r, false)
-		local planned = not source.translucent and planCapture(source, bounds[index], anchor.point, anchor.normal)
+		local lightmap = source.directBaked and V.SurfaceLightmap
+		-- Ground shadows need texel detail, especially along walls. Prefer
+		-- the engine capture there; blocked or exhausted captures fall back
+		-- to the original BSP luxels.
+		if lightmap and source.planeNormal.z < 0.65 and source.nativeFace and not source.nativeFace.displacement then
+			source.preferLightmap = V.SurfaceLightmap(r, source, anchor.point) ~= nil
+			for _, check in ipairs(source.captureChecks or {}) do
+				if not V.SurfaceLightmap(r, source, check) then
+					source.preferLightmap = false
+					break
+				end
+			end
+		end
+		local planned = not source.preferLightmap and not source.translucent
+			and planCapture(source, bounds[index], anchor.point, anchor.normal)
 		if not source.nativeFace then
 			local box = bounds[index]
 			local low, high = box.low - source.center, box.high - source.center
@@ -793,9 +848,9 @@ local function registerSources(r, item, vertices, checkpoint)
 		source.slot = slot or { material = V.ScanSurfaceMaterial, litMaterial = V.ScanSurfaceMaterial }
 		source.slotIndex = slotIndex or 0
 		source.ready = uncaptured
-		source.failed = uncaptured and not source.translucent
+		source.failed = uncaptured and not source.translucent and not source.preferLightmap
 		source.uncaptured = uncaptured
-		source.fallbackReason = not source.translucent
+		source.fallbackReason = not source.translucent and not source.preferLightmap
 			and (not planned and "camera BSP obstruee" or uncaptured and "budget de captures" or nil) or nil
 		sources[#sources + 1] = source
 		r.surfaceList[#r.surfaceList + 1] = source
@@ -1087,7 +1142,7 @@ local function mergeSurfacePart(group, source)
 end
 
 local function reuseSurfaceBatch(previous, partCount, checkpoint)
-	if #previous.partIds ~= partCount then
+	if #previous.partIds ~= partCount or (previous.flashMesh and not previous.flashMesh:IsValid()) then
 		return
 	end
 	local object = V.RetainMesh(previous.mesh)
@@ -1096,6 +1151,10 @@ local function reuseSurfaceBatch(previous, partCount, checkpoint)
 	end
 	if checkpoint then
 		checkpoint(object)
+	end
+	if previous.flashMesh then
+		V.RetainMesh(previous.flashMesh)
+		if checkpoint then checkpoint(previous.flashMesh) end
 	end
 	-- The native triangle stream is shared, while the new chunk keeps
 	-- independent lighting and ownership metadata.
@@ -1120,6 +1179,7 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 	local reach = r.step * 4
 	local candidates
 	local currentCell
+	local refinedCuts = 0
 	local cellCandidates
 	local worldByPosition = {}
 	local cutByPosition = {}
@@ -1239,19 +1299,21 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 			end
 		end
 	end
-	local function append(a, b, c, center, weight, source, normal, bakedUV, appearance, surfaceLight, adjacent, retained)
+	local function append(a, b, c, center, weight, source, normal, bakedUV, appearance, surfaceLight, adjacent, retained, nativeCut, blendAlpha)
 		local original = bakedUV ~= nil
+		local freshCut = not retained and not original
 		local material = original and source.slot.litMaterial
-			or appearance and (retained and appearance.surfaceAlbedo or appearance.interior)
-			or V.ScanSurfaceMaterial
+			or appearance and (freshCut and appearance.interiorCutLit or appearance.surfaceAlbedo or appearance.interior)
+			or (freshCut and dirtFlash or V.ScanSurfaceMaterial)
 		local flashMaterial = original and source.slot.material or material
 		local cutLighting = surfaceLight
 			or (not retained and not original and r.cutLighting ~= nil and r.cutLighting.sourceCount > 0 and V.CutVertexLighting ~= nil)
 		if cutLighting then
 			material = appearance
-					and (surfaceLight and appearance.surfaceCut or adjacent and appearance.adjacentCut or appearance.interiorCut)
-				or cutFallback
+					and (surfaceLight and appearance.surfaceCut or appearance.interiorCut)
+				or (freshCut and dirtFallback or cutFallback)
 		end
+		if blendAlpha then material = appearance.cutBlend() end
 		local projection, frame
 		if not original then
 			projection, frame = frameFor(normal)
@@ -1259,7 +1321,9 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		local key = source
 				and (original and (source.slotIndex .. ":surface") or ("wall:" .. source.identity .. ":" .. projection .. ":" .. (appearance and appearance.materialName or "plain")))
 			or "plain"
-		if cutLighting then
+		if blendAlpha then
+			key = key .. ":blend"
+		elseif cutLighting then
 			key = key .. (surfaceLight and ":lightmap" or adjacent and ":adjacent" or ":gradient")
 		elseif retained and not original then
 			key = key .. ":retained"
@@ -1271,13 +1335,15 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 				source = source,
 				baked = original,
 				retained = retained,
-				translucent = retained and appearance and appearance.translucent or nil,
+				translucent = blendAlpha ~= nil or (retained and appearance and appearance.translucent) or nil,
+				blendOverlay = blendAlpha ~= nil,
 				flashMaterial = flashMaterial,
 				directLight = appearance and appearance.directLight,
 				phongFlash = cutLighting and adjacent and appearance.adjacentFlash or nil,
 				phongTex = cutLighting and adjacent and appearance.tex or nil,
 				cutLighting = cutLighting,
 				surfaceLight = surfaceLight ~= nil,
+				freshCut = freshCut,
 				lightOrigin = appearance and appearance.lightOrigin or source and source.lightOrigin,
 				px = 0, py = 0, pz = 0,
 				nx = 0, ny = 0, nz = 0,
@@ -1293,8 +1359,11 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		group.nz = group.nz + normal.z * weight
 		group.weight = group.weight + weight
 		local tex = not original and appearance and appearance.tex
-			and ((retained or adjacent) and appearance.tex or foldedTexture(appearance, projection))
+			and ((retained or nativeCut) and appearance.tex or foldedTexture(appearance, projection))
 		local count = #group.vertices
+		-- Separate just the color layer from the opaque surface. UVs and
+		-- lighting continue to use the exact unshifted position.
+		local lift = blendAlpha and normal * math.min(r.step / 1024, 0.025)
 		for index = 1, 3 do
 			local old = index == 1 and a or index == 2 and b or c
 			local u, v = old.u, old.v
@@ -1304,25 +1373,82 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 			elseif appearance then
 				world = worldPoint(old)
 				u, v = tiledUV(appearance, world, frame, tex)
+			elseif freshCut then
+				world = worldPoint(old)
+				u, v = world:Dot(frame.right) / 128, -world:Dot(frame.up) / 128
 			end
 			group.vertices[count + index] = {
-				pos = old.pos,
+				pos = lift and old.pos + lift or old.pos,
 				normal = old.normal,
 				u = u,
 				v = v,
-				color = color_white,
+				color = blendAlpha and Color(255, 255, 255, blendAlpha[index]) or color_white,
 				cutLight = surfaceLight and surfaceLight[index]
 					or cutLighting and cutVertex(old, world)
 					or nil,
 			}
 		end
 	end
+	local blendWidth = math.min(r.step * 0.6, 12)
+	local transitionDistances = {}
+	local function patchScore(patch, point, normal, sharedVertex)
+		local distance
+		if sharedVertex then
+			local distances = transitionDistances[patch]
+			if not distances then distances = {} transitionDistances[patch] = distances end
+			distance = distances[point]
+			if distance == nil then
+				distance = patchDistance(patch, point, reach)
+				distances[point] = distance
+			end
+		else
+			distance = patchDistance(patch, point, reach)
+		end
+		return distance + (1 - normal:Dot(patch.planeNormal)) * r.step * 0.25
+	end
+	local function cutTransition(a, b, c, center, normal, patch, margin)
+		if not currentCell or not patch or not patch.cutBlend or not patch.nativeFace then return end
+		local extent = math.sqrt(math.max(a.pos:DistToSqr(b.pos), b.pos:DistToSqr(c.pos), c.pos:DistToSqr(a.pos)))
+		if margin > blendWidth + 2 * extent then return end
+		cellCandidates = cellCandidates or cellSources(r, neighbors(), currentCell, reach)
+		local other, score = nil, math.min(reach, patchScore(patch, center, normal) + blendWidth + 2 * extent)
+		for _, candidate in ipairs(cellCandidates) do
+			if candidate.cutBlend and candidate.nativeFace and candidate.materialName ~= patch.materialName then
+				local d = patchScore(candidate, center, normal)
+				if d < score then other, score = candidate, d end
+			end
+		end
+		if not other then return end
+		-- Choose the same layer order on both sides of a material boundary.
+		local base, overlay = patch, other
+		if overlay.materialName < base.materialName then base, overlay = overlay, base end
+		local alpha, low, high = {}, 255, 0
+		for i, vertex in ipairs({a, b, c}) do
+			local p, n = worldPoint(vertex), vertex.normal
+			local d = patchScore(base, p, n, true) - patchScore(overlay, p, n, true)
+			local t = math.Clamp(0.5 + d / (2 * blendWidth), 0, 1)
+			local opacity = math.floor(t * t * (3 - 2 * t) * 255 + 0.5)
+			alpha[i], low, high = opacity, math.min(low, opacity), math.max(high, opacity)
+		end
+		if high == 0 or low == 255 then return end
+		return base, overlay, alpha
+	end
+
 	local function splitCut(a, b, c, normal, depth, source, margin, center, weight)
 		center = center or triangleCenter(a, b, c)
 		if margin == nil then
 			source, margin = closest(center, normal)
 		end
 		local appearance, patch = appearanceAt(source, center, normal)
+		if appearance == patch then
+			local base, overlay, alpha = cutTransition(a, b, c, center, normal, patch, margin)
+			if base then
+				weight = weight or math.sqrt((b.pos - a.pos):Cross(c.pos - a.pos):LengthSqr())
+				append(a, b, c, center, weight, base, normal, nil, base)
+				append(a, b, c, center, weight, overlay, normal, nil, overlay, nil, nil, nil, nil, alpha)
+				return
+			end
+		end
 		local ab, bc, ca
 		local different = false
 		-- The normal chunk path already clips geometry to a voxel cell.
@@ -1368,19 +1494,33 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 				splitCut(middle, b, c, normal, depth + 1)
 			end
 		else
-			-- Only a small, nearly parallel continuation of a known BSP
-			-- finish can inherit its reduced specular response.
-			local adjacent = appearance and patch == appearance and patch.nativeFace and appearance.tex
-				and (appearance.adjacentCut or appearance.adjacentFlash)
+			-- A shallow, parallel dent keeps the actual BSP texture
+			-- coordinates, including on matte surfaces.
+			local nativeCut = appearance and patch == appearance and patch.nativeFace and appearance.tex
 				and normal:Dot(patch.planeNormal) > 0.95
-			if adjacent then
+			if nativeCut then
 				local limit = math.min(r.step * 0.3, 6)
-				adjacent = patchDistance(patch, worldPoint(a), limit) <= limit
+				nativeCut = patchDistance(patch, worldPoint(a), limit) <= limit
 					and patchDistance(patch, worldPoint(b), limit) <= limit
 					and patchDistance(patch, worldPoint(c), limit) <= limit
 			end
+			local adjacent = nativeCut and appearance.adjacentFlash ~= nil
 			weight = weight or math.sqrt((b.pos - a.pos):Cross(c.pos - a.pos):LengthSqr())
-			append(a, b, c, center, weight, patch, normal, nil, appearance, nil, adjacent)
+			if a.fineCut and refinedCuts < 2 and weight > math.max(8, r.step * r.step * 0.045)
+				and (a.normal:Dot(b.normal) < 0.98 or b.normal:Dot(c.normal) < 0.98 or c.normal:Dot(a.normal) < 0.98)
+			then
+				-- A centroid split adds a lighting sample to the curved
+				-- cut while preserving every edge shared with other cells.
+				refinedCuts = refinedCuts + 1
+				local middle = { pos = (a.pos + b.pos + c.pos) / 3,
+					normal = (a.normal + b.normal + c.normal):GetNormalized() }
+				local part = weight / 3
+				append(a, b, middle, triangleCenter(a, b, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+				append(b, c, middle, triangleCenter(b, c, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+				append(c, a, middle, triangleCenter(c, a, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+			else
+				append(a, b, c, center, weight, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+			end
 		end
 	end
 	local function triangle(i)
@@ -1411,7 +1551,7 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		if not r.surfaceFrozen and not face and type(a.cell) == "number" then
 			a.scanSource = source and source.identity
 		end
-		local proven = scanSource or (source and face and face == source.nativeFace)
+		local proven = not a.freshCut and (scanSource or (source and face and face == source.nativeFace))
 		local onSurface = proven or not a.freshCut and source and normal:Dot(source.planeNormal) > 0.9
 		if onSurface and not proven then
 			for j = i, i + 2 do
@@ -1427,7 +1567,8 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		-- The first mesh is entirely original terrain, including sampled
 		-- displacement vertices a few units away from their source plane.
 		-- Do not misclassify those vertices as freshly exposed underground soil.
-		local original = source and (onSurface or not r.surfaceFrozen) and not source.failed and not source.translucent
+		local original = source and (onSurface or not r.surfaceFrozen)
+			and not source.failed and not source.translucent and not source.preferLightmap
 		local bakedUV
 		if original then
 			bakedUV = captureUV
@@ -1495,7 +1636,7 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 			merge(cached.groups)
 		else
 			targetGroups = cell and {} or groups
-			currentCell, cellCandidates = cell, nil
+			currentCell, cellCandidates, refinedCuts = cell, nil, 0
 			for index = i, finish - 3, 3 do
 				triangle(index)
 			end
@@ -1511,22 +1652,24 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 	end
 	local batches = {}
 	local function buildBatch(key, group)
-		-- Keep normals in the vertex layout for the flashlight pass and a
-		-- possible native-material fallback, even when the main pass is unlit.
-		-- The PC UnlitGeneric layout retains normals AND vertex color. A
-		-- pending capture can therefore fall back to a lightmap-colored mesh
-		-- without changing its native vertex format or allocating another mesh.
-		local object = Mesh(group.phongFlash or (group.baked and group.source.slot.cutMaterial) or group.material)
+		-- The primary stream uses the color layout of the diffuse shader.
+		-- Masked Phong also needs tangents, in a separate projected-light mesh.
+		local object = Mesh((group.baked and group.source.slot.cutMaterial) or group.material)
 		if checkpoint then
 			checkpoint(object)
 		end
 		local meshVertices, cutScale = group.vertices, nil
 		if group.cutLighting then
-			meshVertices, cutScale = V.EncodeCutLighting(group.vertices, checkpoint)
+			meshVertices, cutScale = V.EncodeCutLighting(group.vertices, checkpoint, group.freshCut)
 		end
+		object:BuildFromTriangles(meshVertices)
+		if checkpoint then checkpoint() end
+		local flashMesh
 		if group.phongFlash then
-			local tex = group.phongTex
-			for i, vertex in ipairs(meshVertices) do
+			flashMesh = Mesh(group.phongFlash)
+			if checkpoint then checkpoint(flashMesh) end
+			local tex, vertices = group.phongTex, {}
+			for i, vertex in ipairs(group.vertices) do
 				local n = vertex.normal
 				local tangent = tex.v:Cross(n):GetNormalized()
 				if tangent:Dot(tex.u) < 0 then
@@ -1536,24 +1679,23 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 					tangent = n:Cross(tex.u):GetNormalized()
 				end
 				local handedness = n:Cross(tangent):Dot(tex.v) < 0 and -1 or 1
-				vertex.userdata = { tangent.x, tangent.y, tangent.z, handedness }
-				if checkpoint and i % 96 == 0 then
-					checkpoint()
-				end
+				vertices[i] = { pos = vertex.pos, normal = n, u = vertex.u, v = vertex.v,
+					color = vertex.color, userdata = { tangent.x, tangent.y, tangent.z, handedness } }
+				if checkpoint and i % 96 == 0 then checkpoint() end
 			end
-		end
-		object:BuildFromTriangles(meshVertices)
-		if checkpoint then
-			checkpoint()
+			flashMesh:BuildFromTriangles(vertices)
+			if checkpoint then checkpoint() end
 		end
 		local weight = math.max(group.weight, 0.000001)
 		local batch = {
 			mesh = object,
+			flashMesh = flashMesh,
 			material = group.material,
 			source = group.source,
 			baked = group.baked,
 			retained = group.retained,
 			translucent = group.translucent,
+			blendOverlay = group.blendOverlay,
 			flashMaterial = group.flashMaterial,
 			directLight = group.directLight,
 			phongFlash = group.phongFlash,
@@ -1561,6 +1703,7 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 			cutLighting = group.cutLighting,
 			cutScale = cutScale,
 			surfaceLight = group.surfaceLight,
+			freshCut = group.freshCut,
 			worldCenter = Vector(group.px / weight, group.py / weight, group.pz / weight),
 			normal = Vector(group.nx, group.ny, group.nz):GetNormalized(),
 		}
@@ -1772,6 +1915,7 @@ end)
 
 function V.SurfaceMaterial(batch)
 	if not textureEnabled:GetBool() then
+		if batch.blendOverlay then return end
 		return batch.cutLighting and cutFallback or V.ScanSurfaceMaterial
 	end
 	if
@@ -1812,7 +1956,12 @@ function V.SurfaceFlashMaterial(batch)
 	then
 		return (batch.retained and batch.source.surfaceAlbedo) or batch.source.interior or V.ScanSurfaceMaterial
 	end
-	return batch.phongFlash or batch.flashMaterial or batch.material
+	return (batch.flashMesh and batch.flashMesh:IsValid() and batch.phongFlash) or batch.flashMaterial or batch.material
+end
+
+function V.SurfaceFlashMesh(batch)
+	local mesh = textureEnabled:GetBool() and batch.flashMesh
+	return mesh and mesh:IsValid() and mesh or batch.mesh
 end
 
 function V.SurfaceDynamicMaterial(batch)
@@ -1844,6 +1993,8 @@ function V.SurfaceDirectLightMaterial(batch)
 			return slot.directLight
 		elseif batch.directLight then
 			return batch.directLight(batch.retained)
+		elseif batch.freshCut and not batch.source then
+			return dirtAlbedo
 		end
 	end
 	if not directFallback then
@@ -1858,11 +2009,10 @@ end
 
 concommand.Add("vm_texture_stats", function()
 	local count, hd = 0, 0
+	local pool = pools[active and active.surfaceHDR and "hdr" or "ldr"]
 	for _, slot in pairs(pool) do
 		count = count + 1
-		if slot.used and slot.size == HD_SIZE then
-			hd = hd + 1
-		end
+		if slot.used and slot.size == HD_SIZE then hd = hd + 1 end
 	end
 	print(
 		string.format(

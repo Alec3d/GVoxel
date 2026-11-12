@@ -67,6 +67,46 @@ local function texel(bytes, offset)
 	return r * scale, g * scale, b * scale
 end
 
+-- The BSP air leaf stores six directional colors per ambient probe.
+-- Reconstruct in linear RGB with the weighting used by VRAD.
+function V.SampleBSPAmbientCube(data, point)
+	local indices, samples = data and data.ambientIndices, data and data.ambientSamples
+	if not indices or not samples then return end
+	local leaf, leafID = V.BSPLeaf(data, point)
+	if not leaf or leaf.solid then return end
+	local at = (leafID - 1) * 4 + 1
+	local a, b, c, d = string.byte(indices, at, at + 3)
+	if not d then return end
+	local count, first = a + 256 * b, c + 256 * d
+	if count == 0 or (first + count) * 28 > #samples then return end
+	local low, high = leaf.low, leaf.high
+	local sx, sy, sz = (high.x - low.x) / 255, (high.y - low.y) / 255, (high.z - low.z) / 255
+	local px, py, pz = point.x - low.x, point.y - low.y, point.z - low.z
+	local cube, total = {}, 0
+	for side = 1, 18 do cube[side] = 0 end
+	for i = first * 28 + 1, (first + count - 1) * 28 + 1, 28 do
+		local x, y, z = string.byte(samples, i + 24, i + 26)
+		local dx, dy, dz = x * sx - px, y * sy - py, z * sz - pz
+		local weight = 1 / (dx * dx + dy * dy + dz * dz + 1)
+		total = total + weight
+		for side = 0, 5 do
+			local r, g, b = texel(samples, i + side * 4)
+			local j = side * 3
+			cube[j + 1], cube[j + 2], cube[j + 3] = cube[j + 1] + r * weight,
+				cube[j + 2] + g * weight, cube[j + 3] + b * weight
+		end
+	end
+	-- ColorRGBExp32ToVector restores the factor of 255 that is divided
+	-- out by the lightmap texture reader.
+	local gain = 255 / total
+	local result = {}
+	for side = 0, 5 do
+		local j = side * 3
+		result[side + 1] = Vector(cube[j + 1] * gain, cube[j + 2] * gain, cube[j + 3] * gain)
+	end
+	return result
+end
+
 function V.SamplePreparedBSPLightmap(map, point)
 	local u = point:Dot(map.u) + map.uo
 	local v = point:Dot(map.v) + map.vo

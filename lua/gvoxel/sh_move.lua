@@ -80,6 +80,21 @@ function V.TracePlayerTerrain(ply, r, start, finish, mins, maxs, options)
 		end
 	end
 	merge(nativeTrace(ply, start, finish, mins, maxs, true, options))
+	-- Ground Sand Lab predicts its published colliders with clientside entities.
+	local sand = CLIENT and GroundSandLab
+	if sand and sand.TracePlayerSand then
+		local hit = sand.TracePlayerSand(
+			start,
+			finish,
+			mins,
+			maxs,
+			options and options.mask or MASK_PLAYERSOLID,
+			options and options.group or COLLISION_GROUP_PLAYER_MOVEMENT
+		)
+		if hit then
+			merge(hit)
+		end
+	end
 	if outsideBlocked(ply, r, start, finish, mins, maxs, options) then
 		local delta = finish - start
 		local moving = delta.x ~= 0 or delta.y ~= 0 or delta.z ~= 0
