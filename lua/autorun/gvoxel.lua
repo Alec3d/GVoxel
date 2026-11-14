@@ -48,7 +48,6 @@ local client = {
 	"cl_custom_block",
 	"cl_tool",
 	"cl_diagnostics",
-	"cl_utilities",
 }
 local server = {
 	"sv_dust",

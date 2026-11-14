@@ -51,11 +51,12 @@ function V.CancelScan(ply, id)
     if not V.CanManageScan(ply) then return end
 	local scan = V.GetScanSession(id or (ply.GetPos and ply:GetPos()))
 	if not scan or not V.CanManageScan(ply) then
-		return
+		return false
 	end
 	if not release(scan) then
-		V.Notify(ply, "Zone encore occupee : rejoindre une sortie avant de restaurer le BSP.")
+		return false, "Zone encore occupee : rejoindre une sortie avant de restaurer le BSP."
 	end
+	return true
 end
 function V.PlaceRegion(ply, metres, low, high, byRays)
 	local custom = metres == 0
@@ -143,7 +144,8 @@ registerScanRequests("", false)
 registerScanRequests("_rays", true)
 net.Receive("vm_scan_cancel", function(length, ply)
 	if length ~= 0 or not V.CanManageScan(ply) then return end
-	V.CancelScan(ply)
+	local ok, err = V.CancelScan(ply)
+	if not ok and err then V.Notify(ply, err) end
 end)
 net.Receive("vm_scan_settings", function(length, ply)
 	if length ~= 13 or not V.CanManageScan(ply) then return end
@@ -207,7 +209,6 @@ function V.CommitScanEdit(scan)
 	}
 	scan.editWork = nil
     if V.ScheduleDetachedCleanup then V.ScheduleDetachedCleanup(scan,work) end
-    if V.MarkZoneCacheDirty then V.MarkZoneCacheDirty(scan) end
 end
 local function permitEdit(scan)
 	local work = scan.editWork
@@ -870,7 +871,10 @@ local function tick(scan)
 	if scan.prepared and not scan.completed and (not physics or (not physics.jobs and not physics.current)) then
 		scan.completed = true
         if V.RefreshVoxelVisibility then V.RefreshVoxelVisibility(scan.region) end
-        if V.EnsurePersistentZone then V.EnsurePersistentZone(scan) end
+        if not scan.savedKey and V.SaveZone then
+            local ok, err = V.SaveZone(scan, nil, scan.ply, true)
+            if not ok and IsValid(scan.ply) then V.Notify(scan.ply, err) end
+        end
 	end
 	if not streaming then
 		V.PumpScanReplication(scan, deadline)

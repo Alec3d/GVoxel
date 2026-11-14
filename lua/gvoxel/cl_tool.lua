@@ -72,13 +72,72 @@ local card = Color(29, 44, 59)
 local hover = Color(42, 63, 82)
 local selected = Color(18, 69, 108)
 local muted = Color(174, 195, 211)
+local danger, dangerHover = Color(155, 33, 44), Color(190, 42, 52)
 local accentText = Color(32, 21, 12)
 local flags = {en = "gb", fr = "fr", ru = "ru", es = "es", it = "it", de = "de"}
 local addPower = CreateClientConVar("vm_add_power", "100", true, true, "Addition volume percentage", 10, 100)
 local lastX, lastY
 
+-- Roboto ships with Garry's Mod. The extended glyph range includes Cyrillic.
+local fonts = {
+	brand = "GVoxel.MenuBrand",
+	action = "GVoxel.MenuAction",
+	label = "GVoxel.MenuLabel",
+	detail = "GVoxel.MenuDetail",
+	status = "GVoxel.ScanTitle",
+}
+if not V.ToolFontsRegistered then
+	for _, font in ipairs({
+		{ fonts.brand, 30, 900 },
+		{ fonts.action, 18, 700 },
+		{ fonts.label, 16, 600 },
+		{ fonts.detail, 14, 500 },
+		{ fonts.status, 21, 700 },
+	}) do
+		surface.CreateFont(font[1], {
+			font = system.IsLinux() and "Roboto-Regular" or "Roboto",
+			size = font[2],
+			weight = font[3],
+			antialias = true,
+			extended = true,
+		})
+	end
+	V.ToolFontsRegistered = true
+end
+
+local settingsIcon = Material("icon16/cog.png", "smooth")
+
+local function fitsFont(text, font, fallback, width)
+	surface.SetFont(font)
+	if surface.GetTextSize(text) <= width then return font end
+	return fallback
+end
+
 function V.GetAddPower()
 	return addPower:GetInt()
+end
+
+local function saveableZone()
+	local zone = V.GetClientScanState()
+	return zone and zone.visualReady and zone or nil
+end
+
+function V.OpenZoneSaveOptions(id, name)
+	local zone = saveableZone()
+	if not activeWeapon() or not zone or (id and zone.region.id ~= id) then return end
+	local function save(action)
+		if not activeWeapon() or saveableZone() ~= zone then return end
+		net.Start("vm_zones_action")
+		net.WriteString(action)
+		net.WriteUInt(zone.region.id, 16)
+		net.WriteString("")
+		net.WriteString((name or ""):sub(1, 64))
+		net.SendToServer()
+	end
+	Derma_Query(V.L("Choisir la version de la zone a sauvegarder"), V.L("Sauvegarder la zone"),
+		V.L("Avec destructions"), function() save("save") end,
+		V.L("Sans destructions"), function() save("save_clean") end,
+		V.L("Annuler"))
 end
 
 function V.OpenScanMenu()
@@ -87,7 +146,7 @@ function V.OpenScanMenu()
 
 	local frame = vgui.Create("DFrame")
 	menu = frame
-	frame:SetSize(math.min(480, ScrW() - 16), 468)
+	frame:SetSize(math.min(480, ScrW() - 16), 510)
 	frame:SetPos(math.Clamp(lastX or ScrW() - frame:GetWide() - 24, 0, ScrW() - frame:GetWide()),
 		math.Clamp(lastY or 90, 0, math.max(0, ScrH() - frame:GetTall())))
 	frame:SetTitle("")
@@ -97,8 +156,9 @@ function V.OpenScanMenu()
 	frame.VMMetres = V.SelectedMetres()
 	frame.Paint = function(_, w, h)
 		draw.RoundedBox(12, 0, 0, w, h, background)
-		draw.RoundedBox(4, 16, 14, 4, 26, blue)
-		draw.SimpleText("GVoxel", "Trebuchet24", 28, 12, color_white)
+		draw.RoundedBox(4, 16, 13, 4, 25, blue)
+		local edge = draw.SimpleText("G", fonts.brand, 29, 9, blue)
+		draw.SimpleText("Voxel", fonts.brand, 29 + edge, 9, orange)
 		surface.SetDrawColor(card)
 		surface.DrawRect(16, 69, w - 32, 1)
 	end
@@ -136,11 +196,22 @@ function V.OpenScanMenu()
 			local ink = available and color_white or muted
 			if style == "primary" and available then
 				fill, ink = hovered and color_white or orange, accentText
+			elseif style == "danger" and available then
+				fill = hovered and dangerHover or danger
 			elseif active then
 				fill = selected
 			end
 			draw.RoundedBox(7, 0, 0, w, h, fill)
-			draw.SimpleText(label(), "Trebuchet18", w / 2, h / 2, ink, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+			if label then
+				local text = label()
+				local font = (style == "primary" or style == "danger") and fonts.action or fonts.label
+				font = fitsFont(text, font, fonts.detail, w - 10)
+				draw.SimpleText(text, font, w / 2, h / 2, ink, TEXT_ALIGN_CENTER, TEXT_ALIGN_CENTER)
+			else
+				surface.SetMaterial(settingsIcon)
+				surface.SetDrawColor(ink)
+				surface.DrawTexturedRect(math.floor((w - 16) / 2), math.floor((h - 16) / 2), 16, 16)
+			end
 			if active then
 				draw.RoundedBox(2, 7, h - 4, w - 14, 2, blue)
 			end
@@ -155,28 +226,18 @@ function V.OpenScanMenu()
 	actions:Dock(TOP)
 	actions:SetTall(44)
 	actions:SetPaintBackground(false)
-	local create = button(actions, function() return V.L("Nouvelle zone") end, function()
+	local create = button(actions, function() return V.L("Creer une nouvelle zone") end, function()
 		placing = true
 		V.CloseScanMenu(true)
 	end, "primary", nil, function() return not V.GetClientScanState() end)
-	create:Dock(LEFT)
-	create:SetWide(math.floor((frame:GetWide() - 32) / 2))
-	create:DockMargin(0, 0, 8, 0)
-	button(actions, function() return V.L("Retirer la zone active") end, function()
-		local zone = V.GetClientScanState()
-		Derma_Query(V.L("Retirer cette zone du jeu ?"), "GVoxel", V.L("Retirer la zone active"), function()
-			if not activeWeapon() or V.GetClientScanState() ~= zone then return end
-			placing = nil
-			RunConsoleCommand("vm_scan_clear")
-			V.CloseScanMenu(true)
-		end, V.L("Annuler"))
-	end, nil, nil, V.GetClientScanState):Dock(FILL)
+	create:Dock(FILL)
 
 	local function section(label)
 		local heading = vgui.Create("DLabel", content)
 		heading:Dock(TOP)
 		heading:DockMargin(2, 9, 0, 4)
-		heading:SetTall(16)
+		heading:SetTall(20)
+		heading:SetFont(fonts.label)
 		heading:SetTextColor(muted)
 		heading:SetText(V.L(label))
 	end
@@ -195,7 +256,7 @@ function V.OpenScanMenu()
 		end, nil, function() return not V.CustomBlockEnabled() and frame.VMMetres == size end)
 		option:Dock(LEFT)
 		option:DockMargin(0, 0, 5, 0)
-		option:SetWide(70)
+		option:SetWide(79)
 	end
 	local custom = button(choices, function()
 		return V.L("Boite sur mesure")
@@ -238,7 +299,10 @@ function V.OpenScanMenu()
 		control:Dock(TOP)
 		control:SetTall(39)
 		control:SetText(V.L(label))
+		control.Label:SetFont(fonts.detail)
+		control.Label:SetWrap(true)
 		control.Label:SetTextColor(color_white)
+		control:GetTextArea():SetFont(fonts.label)
 		control:SetMinMax(minimum, maximum)
 		control:SetDecimals(0)
 		control:SetValue(value)
@@ -251,15 +315,31 @@ function V.OpenScanMenu()
 		if rounded ~= addPower:GetInt() then RunConsoleCommand("vm_add_power", tostring(rounded)) end
 	end
 
+	local remove = button(content, function() return V.L("Supprimer la zone") end, function()
+		local zone = V.GetClientScanState()
+		Derma_Query(V.L("Supprimer la zone et sa sauvegarde ?"), "GVoxel", V.L("Supprimer la zone"), function()
+			if not activeWeapon() or V.GetClientScanState() ~= zone then return end
+			net.Start("vm_zones_action")
+			net.WriteString("delete_zone")
+			net.WriteUInt(zone and zone.region.id or 0, 16)
+			net.WriteString("")
+			net.WriteString("")
+			net.SendToServer()
+			V.CloseScanMenu(true)
+		end, V.L("Annuler"))
+	end, "danger")
+	remove:Dock(BOTTOM)
+	remove:SetTall(34)
+	remove:DockMargin(0, 6, 0, 0)
+
 	local footer = vgui.Create("DPanel", content)
 	footer:Dock(BOTTOM)
 	footer:SetTall(30)
 	footer:SetPaintBackground(false)
-	local saved = button(footer, function() return V.L("Zones sauvegardees") end, function()
-		V.CloseScanMenu(true)
-		V.OpenSavedZones()
-	end)
-	local view = button(footer, function() return "⚙" end, function()
+	local save = button(footer, function() return V.L("Sauvegarder la zone") end, function()
+		V.OpenZoneSaveOptions()
+	end, "primary", nil, saveableZone)
+	local view = button(footer, nil, function()
 		local options = DermaMenu()
 		for _, setting in ipairs({
 			{"Afficher les limites des zones", "vm_show_zone"},
@@ -278,11 +358,12 @@ function V.OpenScanMenu()
 	view:Dock(RIGHT)
 	view:SetWide(34)
 	view:DockMargin(5, 0, 0, 0)
-	saved:Dock(FILL)
+	save:Dock(FILL)
 	local help = vgui.Create("DLabel", content)
 	help:Dock(FILL)
 	help:SetWrap(true)
-	help:SetTextColor(color_white)
+	help:SetFont(fonts.detail)
+	help:SetTextColor(muted)
 	help:SetText(V.L("Ouvrir et placer une zone"))
 end
 
@@ -443,26 +524,29 @@ hook.Add("HUDPaint", "GVoxel.ScanStatus", function()
 
 	local width = math.min(460, ScrW() - 32)
 	local x, y = (ScrW() - width) / 2, ScrH() - 187
-	draw.RoundedBox(10, x, y, width, 70, background)
-	draw.SimpleText(title, "Trebuchet24", x + 14, y + 8, scan and scan.visualReady and blue or color_white)
+	draw.RoundedBox(10, x, y, width, 74, background)
+	local accent = scan and scan.visualReady and blue or orange
+	draw.RoundedBox(3, x + 10, y + 12, 3, 17, accent)
+	local titleFont = fitsFont(title, fonts.status, fonts.label, width - 38)
+	draw.SimpleText(title, titleFont, x + 21, y + 8, color_white)
 	if scan then
 		local elapsed = ((scan.readyAt or SysTime()) - scan.clientStarted) * 1000
-		draw.SimpleText(string.format("%.0f ms", elapsed), "Trebuchet18",
-			x + width - 14, y + 12, orange, TEXT_ALIGN_RIGHT)
+		draw.SimpleText(string.format("%.0f ms", elapsed), fonts.action,
+			x + width - 14, y + 34, accent, TEXT_ALIGN_RIGHT)
 		if scan.chunkCount > 0 then
 			detail = string.format(V.L("%d / %d blocs"), scan.built, scan.chunkCount)
 		end
 	end
 	if detail then
-		draw.DrawText(detail, "DermaDefault", x + 14, y + 36, muted)
+		draw.DrawText(detail, fonts.detail, x + 21, y + 36, muted)
 	end
 	if scan then
 		local track = width - 28
 		local length = ratio and track * math.Clamp(ratio, 0, 1) or track / 5
 		local offset = ratio and 0 or (track - length) * (0.5 - 0.5 * math.cos(RealTime() * 4))
-		draw.RoundedBox(2, x + 14, y + 57, track, 4, card)
+		draw.RoundedBox(2, x + 14, y + 61, track, 4, card)
 		if length >= 1 then
-			draw.RoundedBox(2, x + 14 + offset, y + 57, length, 4, scan.visualReady and blue or orange)
+			draw.RoundedBox(2, x + 14 + offset, y + 61, length, 4, accent)
 		end
 	end
 end)

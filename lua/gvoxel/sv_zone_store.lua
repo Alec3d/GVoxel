@@ -1,6 +1,6 @@
 -- DATA files are runtime saves, not development sources. Work is queued outside net hooks.
 local V=GVoxel
-local library,restoreKeys={},{}
+local restoreKeys={}
 local saveJob,restoreJob
 local map=game.GetMap():lower():gsub("[^a-z0-9_-]","_")
 local folder="gvoxel/zones/"..map
@@ -61,23 +61,18 @@ local function writeAtomic(path,data)
     file.Delete(backup)
     return true
 end
-function V.GetZoneLibrary() return library end
-function V.MarkZoneCacheDirty(scan)
-    if scan.savedKey then scan.cacheDirtyAt=CurTime()+2 end
-end
-function V.EnsurePersistentZone(scan)
-    if scan.savedKey~=canonicalKey then
-        local ok,err=V.SaveZone(scan,scan.displayName,scan.ply)
-        if not ok then ErrorNoHalt("[GVoxel] Sauvegarde automatique : "..tostring(err).."\n") end
+function V.SaveZone(scan,name,ply,withoutEdits)
+    if not scan or not scan.completed or scan.failed or not scan.snapshot or scan.editWork then
+        return false,"Zone non prete ou modification en cours."
     end
-end
-function V.SaveZone(scan,name,ply)
-    if not scan or not scan.completed or scan.editWork then return false,"Zone ou BSP non pret." end
     if saveJob then return false,"Sauvegarde deja en cours." end
+    if name=="" then name=nil end
     name=tostring(name or scan.displayName or ("Zone "..scan.region.id)):gsub("%c",""):sub(1,64)
     if name=="" then name="Zone "..scan.region.id end
     scan.saving=true
-    saveJob={scan=scan,name=name,ply=ply}
+    -- The initial density and committed journal prefix are immutable. Edits
+    -- made while this job yields must not change the requested snapshot.
+    saveJob={scan=scan,name=name,ply=ply,revision=withoutEdits and 0 or scan.region.revision}
     return true
 end
 local function updateRestorePending()
@@ -86,35 +81,30 @@ end
 updateRestorePending()
 function V.ZoneLibraryAction(ply,action,id,key,name)
     if not V.CanManageScan(ply) then return false,"Administration requise." end
-    if action=="save" then return V.SaveZone(V.GetScanSession(id),name,ply) end
-    if action=="load" then
-        if not keyValid(key) then return false,"Nom de sauvegarde invalide." end
-        if V.ZoneRestorePending then return false,"Chargement de la zone sauvegardee en cours." end
-        if V.GetScanSession() then return false,"Limite de zones atteinte." end
-        restoreJob={key=key,ply=ply}
-        updateRestorePending()
-        return true
+    if action=="save" or action=="save_clean" then
+        if id==0 then return false,"Zone non prete ou modification en cours." end
+        return V.SaveZone(V.GetScanSession(id),name,ply,action=="save_clean")
     end
-    if action=="remove" then V.CancelScan(ply,id) return not V.GetScanSession(id) end
-    if action=="delete" then
-        if not keyValid(key) then return false,"Nom de sauvegarde invalide." end
-        if key==canonicalKey then
-            if saveJob then saveJob.scan.saving=nil saveJob=nil end
-            restoreKeys={}
-        else
-            for i=#restoreKeys,1,-1 do if restoreKeys[i]==key then table.remove(restoreKeys,i) end end
-        end
-        if restoreJob and (restoreJob.key==key or (key==canonicalKey and not restoreJob.ply)) then
-            restoreJob=nil
-        end
-        updateRestorePending()
-        file.Delete(folder.."/"..key)
-        file.Delete(folder.."/"..key..".previous.dat")
-        file.Delete(folder.."/"..key..".pending.dat")
-        file.Write(singleMarker,"1")
-        library[key]=nil
+    if action=="delete_zone" then
         local scan=V.GetScanSession()
-        if scan and scan.savedKey==key then scan.savedKey=nil scan.cacheDirtyAt=nil end
+        if id~=(scan and scan.region.id or 0) then return false,"Zone non prete ou modification en cours." end
+        if scan then
+            local released,err=V.CancelScan(ply,id)
+            if not released then return false,err end
+        end
+        if saveJob then saveJob.scan.saving=nil saveJob=nil end
+        restoreKeys,restoreJob={},nil
+        updateRestorePending()
+        local failed=false
+        for _,name in ipairs(file.Find(folder.."/zone_*.dat","DATA") or {}) do
+            local key=name:match("^(zone_%d+_%d+%.dat)%.%a+%.dat$") or name
+            if keyValid(key) then
+                local path=folder.."/"..name
+                file.Delete(path)
+                if file.Exists(path,"DATA") then failed=true end
+            end
+        end
+        if failed then return false,"Suppression de la sauvegarde impossible." end
         return true
     end
     return false,"Action inconnue."
@@ -145,7 +135,7 @@ hook.Add("PostCleanupMap","GVoxel.RestoreZoneCaches",discover)
 local function save(job)
     local bsp=signature()
     if not bsp then error("Zone ou BSP non pret.",0) end
-    local record,err=V.MakeZoneCache(job.scan,job.name,bsp,function() checkpoint(job) end)
+    local record,err=V.MakeZoneCache(job.scan,job.name,bsp,function() checkpoint(job) end,job.revision)
     if not record then error(err,0) end
     -- Native JSON, compression and the atomic write cannot yield internally.
     -- Give each its own tick after the cooperative record preparation.
@@ -161,33 +151,40 @@ local function save(job)
     local key=canonicalKey
     if not writeAtomic(folder.."/"..key,packed) then error("Ecriture du cache impossible",0) end
     file.Write(singleMarker,"1")
-    library={[key]={key=key,name=record.name}}
-    job.scan.savedKey=key job.scan.displayName=job.name job.scan.savedRevision=#record.history
-    if job.scan.region.revision>#record.history then V.MarkZoneCacheDirty(job.scan) end
+    job.scan.savedKey=key job.scan.displayName=job.name
 end
-local function resume(job,work)
-    job.deadline=SysTime()+0.001
+local function resume(job,work,deadline)
+    job.deadline=deadline or SysTime()+0.001
     if not job.thread then job.thread=coroutine.create(work) end
     return coroutine.resume(job.thread,job)
 end
+local function finishSave(job,ok,err)
+    job.scan.saving=nil saveJob=nil
+    if not ok then ErrorNoHalt("[GVoxel] Sauvegarde : "..tostring(err).."\n") end
+end
+
+hook.Add("ShutDown","GVoxel.FinishRequestedSave",function()
+    local job=saveJob
+    if not job or V.GetScanSession()~=job.scan then return end
+    local ok,err
+    repeat
+        ok,err=resume(job,save,math.huge)
+    until not ok or coroutine.status(job.thread)=="dead"
+    finishSave(job,ok,err)
+end)
+
 hook.Add("Think","GVoxel.ZoneStorage",function()
     local scan=V.GetScanSession()
-    if scan and scan.cacheDirtyAt and CurTime()>=scan.cacheDirtyAt and not scan.editWork and not saveJob then
-        if V.SaveZone(scan,scan.displayName) then scan.cacheDirtyAt=nil end
-    end
     local job=saveJob
     if job then
         if scan~=job.scan then
             job.scan.saving=nil saveJob=nil return
         end
-        if not job.thread and scan.editWork then return end
         local ok,err=resume(job,save)
         if not ok or coroutine.status(job.thread)=="dead" then
-            job.scan.saving=nil saveJob=nil
-            if not ok then ErrorNoHalt("[GVoxel] Sauvegarde : "..tostring(err).."\n") end
+            finishSave(job,ok,err)
             if IsValid(job.ply) then
                 V.Notify(job.ply,ok and "Zone sauvegardee." or tostring(err))
-                if V.SendZoneLibrary then V.SendZoneLibrary(job.ply) end
             end
         end
         return
@@ -197,25 +194,18 @@ hook.Add("Think","GVoxel.ZoneStorage",function()
         restoreJob={key=table.remove(restoreKeys,1)}
     end
     job=restoreJob
-    if job.ply and (not IsValid(job.ply) or not V.CanManageScan(job.ply)) then
-        restoreJob=nil updateRestorePending() return
-    end
     local ok,record,err=resume(job,read)
     if ok and coroutine.status(job.thread)~="dead" then return end
     if not ok then err=record record=nil end
     if record then
-        library={[job.key]={key=job.key,name=record.name}}
         if not scan or scan.savedKey~=job.key then
-            local _,message=V.RestoreCachedZone(record,job.ply)
+            local _,message=V.RestoreCachedZone(record)
             err=message
         end
         restoreKeys={}
     end
     restoreJob=nil nextRestore=CurTime()+0.25 updateRestorePending()
-    if job.ply then
-        if err then V.Notify(job.ply,tostring(err)) end
-        if V.SendZoneLibrary then V.SendZoneLibrary(job.ply) end
-    elseif err then
+    if err then
         ErrorNoHalt("[GVoxel] Cache "..job.key.." ignore : "..tostring(err).."\n")
     end
 end)

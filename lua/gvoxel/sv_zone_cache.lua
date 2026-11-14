@@ -5,10 +5,12 @@ local function point(p)
     return type(p)=="table" and #p==3 and finite(p[1]) and finite(p[2]) and finite(p[3])
 end
 local function xyz(p) return {p.x,p.y,p.z} end
-function V.MakeZoneCache(scan,name,signature,checkpoint)
-    if not scan.completed or not scan.snapshot or scan.editWork then return nil,"Zone non prete ou modification en cours." end
+function V.MakeZoneCache(scan,name,signature,checkpoint,revision)
+    if not scan.completed or not scan.snapshot or (revision==nil and scan.editWork) then
+        return nil,"Zone non prete ou modification en cours."
+    end
     local r,values=scan.region,scan.snapshot.values
-    local revision=r.revision
+    revision=revision or r.revision
     local record={schema=2,map=game.GetMap(),signature=signature,name=name,metres=r.metres,
         base=xyz(r.base),origin=xyz(r.origin),step=r.step,cells=xyz(r.cells or Vector(32,32,32)),
         values=values,planes={},history={},byRays=r.bsp==nil}
