@@ -1551,7 +1551,8 @@ local function brushNodeSample(r, op, p, key)
 	local value = cached[key]
 	if value == nil then
 		value = op.plane and (op.plane.sign*p[names[op.plane.axis]]-op.plane.distance)
-			or V.BrushSample(p, op.center, op.radius, op.seed, op.floorZ)
+			or (op.shape and V.SampleBrushShape(op.shape[1],p.x-op.center.x,p.y-op.center.y,p.z-op.center.z,
+				op.sx,op.sy,op.sz,op.ring)) or V.BrushSample(p, op.center, op.radius, op.seed, op.floorZ)
 		for _, axis in ipairs(names) do
 			if p[axis] < EPS or p[axis] > V.RegionAxisSize(r, axis) - EPS then
 				value = math.max(r.step, value)
@@ -2046,7 +2047,7 @@ local function fillWholeBrushCell(r, low, high, last, result, key)
 	-- journals without this index retain the conservative spherical-core test.
 
 	if not (last.fullCells and last.fullCells[key]) then
-		if last.plane then return false end
+		if last.plane or last.shape then return false end
 		if last.floorZ ~= nil and low.z <= last.floorZ + 1 / 64 then
 			return false
 		end
@@ -2448,7 +2449,7 @@ local function brushAxisDistances(center, first, last, step, extent)
 	return distances
 end
 
-function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
+function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane, shape)
 	if not r.bsp then
 		return
 	end
@@ -2461,13 +2462,18 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, p
 		fullCells = {},
 		floorZ = floorZ ~= nil and floorZ - r.origin.z or nil,
 	}
+	if shape then
+		op.shape=shape
+		op.sx,op.sy,op.sz,op.ring=V.BrushShapeDimensions(shape,radius)
+	end
 	if plane then op.plane={axis=plane.axis,sign=plane.sign,distance=plane.distance-plane.sign*r.origin[names[plane.axis]],cell=plane.cell} end
 	r.bspEdits[#r.bspEdits + 1] = op
 	local p, size = op.center, r.step * 8
-	local lowZ = op.floorZ ~= nil and math.max(p.z - radius, op.floorZ) or p.z - radius
-	for z = math.max(0, math.floor(lowZ / size)), math.min(3, math.floor((p.z + radius) / size)) do
-		for y = math.max(0, math.floor((p.y - radius) / size)), math.min(3, math.floor((p.y + radius) / size)) do
-			for x = math.max(0, math.floor((p.x - radius) / size)), math.min(3, math.floor((p.x + radius) / size)) do
+	local sx,sy,sz = op.sx or radius,op.sy or radius,op.sz or radius
+	local lowZ = op.floorZ ~= nil and math.max(p.z - sz, op.floorZ) or p.z - sz
+	for z = math.max(0, math.floor(lowZ / size)), math.min(3, math.floor((p.z + sz) / size)) do
+		for y = math.max(0, math.floor((p.y - sy) / size)), math.min(3, math.floor((p.y + sy) / size)) do
+			for x = math.max(0, math.floor((p.x - sx) / size)), math.min(3, math.floor((p.x + sx) / size)) do
 				local key = V.ChunkKey(x, y, z)
 				local list = {}
 				for i, value in ipairs(r.bspEditBins[key] or {}) do
@@ -2485,14 +2491,14 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, p
 		r.bspCellEditBins = {}
 	end
 	local step = r.step
-	local x0 = math.max(0, math.floor((p.x - radius) / step))
-	local y0 = math.max(0, math.floor((p.y - radius) / step))
+	local x0 = math.max(0, math.floor((p.x - sx) / step))
+	local y0 = math.max(0, math.floor((p.y - sy) / step))
 	local z0 = math.max(0, math.floor(lowZ / step))
-	local x1 = math.min(V.RegionCells(r, "x") - 1, math.floor((p.x + radius) / step))
-	local y1 = math.min(V.RegionCells(r, "y") - 1, math.floor((p.y + radius) / step))
-	local z1 = math.min(V.RegionCells(r, "z") - 1, math.floor((p.z + radius) / step))
+	local x1 = math.min(V.RegionCells(r, "x") - 1, math.floor((p.x + sx) / step))
+	local y1 = math.min(V.RegionCells(r, "y") - 1, math.floor((p.y + sy) / step))
+	local z1 = math.min(V.RegionCells(r, "z") - 1, math.floor((p.z + sz) / step))
 	local nearX, nearY, nearZ
-	if not op.plane then
+	if not op.plane and not shape then
 		nearX = brushAxisDistances(p.x, x0, x1, step, V.RegionAxisSize(r, "x"))
 		nearY = brushAxisDistances(p.y, y0, y1, step, V.RegionAxisSize(r, "y"))
 		nearZ = brushAxisDistances(p.z, z0, z1, step, V.RegionAxisSize(r, "z"))
@@ -2504,7 +2510,7 @@ function V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, p
 		for y = y0, y1 do
 			for x = x0, x1 do
 				if (not target or (x == target[1] and y == target[2] and z == target[3]))
-					and (op.plane or nearX[x] + nearY[y] + nearZ[z] < nearLimit) then
+					and (op.plane or shape or nearX[x] + nearY[y] + nearZ[z] < nearLimit) then
 					-- The actual quantized corner samples define all six
 					-- linear tetrahedra, including procedural explosions.
 					-- Strict signs prove the whole cell is missed or filled;
@@ -2548,7 +2554,7 @@ end
 function V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane)
 	local last = r.bspEdits[#r.bspEdits]
 	local localFloor = floorZ ~= nil and floorZ - r.origin.z or nil
-	if plane or (last and last.plane) then return false end
+	if plane or (last and (last.plane or last.shape)) then return false end
 	return last
 		and last.radius == radius
 		and last.adding == adding

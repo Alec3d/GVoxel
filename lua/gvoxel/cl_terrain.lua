@@ -6,6 +6,39 @@ local brushMaterial = CreateMaterial("vm_brush_v1", "UnlitGeneric", {
 	["$vertexcolor"] = "1",
 	["$vertexalpha"] = "1",
 })
+local function drawShape(center, shape, radius, color, depth)
+	local x,y,z,ring=V.BrushShapeDimensions(shape,radius)
+	local id=shape[1]
+	if id==2 then
+		render.DrawWireframeBox(center,angle_zero,Vector(-x,-y,-z),Vector(x,y,z),color,depth)
+		return
+	end
+	local segments=id==5 and 4 or 20
+	local phase=id==5 and math.pi/4 or 0
+	local scale=id==5 and math.sqrt(2) or 1
+	local function point(index,rx,ry,height)
+		local angle=index*math.pi*2/segments+phase
+		return center+Vector(math.cos(angle)*rx,math.sin(angle)*ry,height)
+	end
+	for i=0,segments-1 do
+		if id==6 then
+			for _, band in ipairs({{x,0},{ring-z,0},{ring,z},{ring,-z}}) do
+				render.DrawLine(point(i,band[1],band[1],band[2]),point(i+1,band[1],band[1],band[2]),color,depth)
+			end
+		else
+			local bottom=point(i,x*scale,y*scale,-z)
+			render.DrawLine(bottom,point(i+1,x*scale,y*scale,-z),color,depth)
+			if id==3 then
+				local top=point(i,x,y,z)
+				render.DrawLine(top,point(i+1,x,y,z),color,depth)
+				if i%5==0 then render.DrawLine(bottom,top,color,depth) end
+			elseif id==5 or i%5==0 then
+				render.DrawLine(bottom,center+Vector(0,0,z),color,depth)
+			end
+		end
+	end
+end
+
 function V.DrawBrushPreview(onTop)
 	if not showCursor:GetBool() then
 		return
@@ -42,7 +75,10 @@ function V.DrawBrushPreview(onTop)
 	-- depth cannot swallow the cursor inside an excavated voxel cavity.
 	cam.IgnoreZ(onTop and tr.VoxelScan or false)
 	render.OverrideDepthEnable(true, false)
-	render.DrawWireframeSphere(center, radius, 16, 12, color, not (onTop and tr.VoxelScan))
+	local depth = not (onTop and tr.VoxelScan)
+	local shape = V.GetLocalBrushShape and V.GetLocalBrushShape()
+	if shape then drawShape(center,shape,radius,color,depth)
+	else render.DrawWireframeSphere(center,radius,16,12,color,depth) end
 	render.DrawLine(tr.HitPos, tr.HitPos + tr.HitNormal * 24, color, not (onTop and tr.VoxelScan))
 	render.OverrideDepthEnable(false)
 	cam.IgnoreZ(false)

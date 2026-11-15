@@ -62,3 +62,88 @@ function V.BrushSample(p, center, radius, seed, floorZ)
 	local value = distance - radius * scale
 	return floorZ ~= nil and math.max(value, floorZ - p.z) or value
 end
+
+-- Shape dimensions are integer ratios of the tool scale, or an angle for cones.
+V.BrushShapes = {
+    { "Sphère", {} },
+    { "Boîte", { "Longueur (%)", "Largeur (%)", "Hauteur (%)" } },
+    { "Cylindre", { "Diamètre (%)", "Hauteur (%)" } },
+    { "Cône", { "Angle du cône (°)", "Hauteur (%)" } },
+    { "Pyramide", { "Longueur (%)", "Largeur (%)", "Hauteur (%)" } },
+    { "Tore", { "Diamètre (%)", "Épaisseur (%)" } },
+}
+
+function V.ValidBrushShape(shape)
+    if type(shape)~="table" or type(shape[1])~="number" then return false end
+    local entry=V.BrushShapes[shape[1]]
+    if not entry or shape[1]==1 or #shape~=#entry[2]+1 then return false end
+    for index,label in ipairs(entry[2]) do
+        local value=shape[index+1]
+        local angle=label=="Angle du cône (°)"
+        if type(value)~="number" or value<(angle and 10 or 25) or value>(angle and 60 or 100)
+            or value~=math.floor(value) then return false end
+    end
+    return true
+end
+
+function V.BrushShapeFromSettings(ply)
+    local function setting(name,default,low,high)
+        local value=ply:GetInfoNum(name,default)
+        if value~=value then return default end
+        return math.floor(math.Clamp(value,low,high)+0.5)
+    end
+    local id=setting("vm_brush_shape",1,1,#V.BrushShapes)
+    if id==1 then return end
+    local shape={id}
+    for index,label in ipairs(V.BrushShapes[id][2]) do
+        local angle=label=="Angle du cône (°)"
+        shape[index+1]=setting("vm_brush_shape_"..id.."_"..index,angle and 45 or 100,angle and 10 or 25,angle and 60 or 100)
+    end
+    return shape
+end
+
+function V.BrushShapeDimensions(shape,radius)
+    local id=shape[1]
+    local a,b,c=shape[2]*radius/100,shape[3]*radius/100,(shape[4] or 100)*radius/100
+    if id==2 or id==5 then return a,b,c end
+    if id==3 then return a,a,b end
+    if id==4 then
+        local slope=math.tan(math.rad(shape[2]))
+        local height=math.min(b,radius/(2*slope))
+        local base=2*height*slope
+        return base,base,height
+    end
+    local tube=a*shape[3]/225
+    return a,a,tube,a-tube
+end
+
+function V.SampleBrushShape(id,x,y,z,a,b,c,ring)
+    if id==2 then return math.max(math.abs(x)-a,math.abs(y)-b,math.abs(z)-c) end
+    if id==5 then
+        local taper=(c-z)/(2*c)
+        return math.max(-z-c,z-c,math.abs(x)-a*taper,math.abs(y)-b*taper)
+    end
+    local radial=math.sqrt(x*x+y*y)
+    if id==3 then return math.max(radial-a,math.abs(z)-c) end
+    if id==4 then return math.max(-z-c,z-c,radial-a*(c-z)/(2*c)) end
+    local offset=radial-ring
+    return math.sqrt(offset*offset+z*z)-c
+end
+
+function V.WriteBrushShape(shape)
+    net.WriteBool(shape~=nil)
+    if not shape then return end
+    net.WriteUInt(shape[1],3)
+    for index=2,#shape do net.WriteUInt(shape[index],7) end
+end
+
+function V.ReadBrushShape()
+    if not net.ReadBool() then return end
+    local id=net.ReadUInt(3)
+    local entry=V.BrushShapes[id]
+    local shape={id}
+    if entry then
+        for index=1,#entry[2] do shape[index+1]=net.ReadUInt(7) end
+    end
+    return shape
+end

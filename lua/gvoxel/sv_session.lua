@@ -173,6 +173,8 @@ local function validStroke(stroke)
 		and (stroke.seed == nil or wireInteger(stroke.seed, 0))
 		and (stroke.floorZ == nil or finite(stroke.floorZ))
 		and (stroke.plane == nil or V.ValidRemovalPlane(stroke.plane))
+		and (stroke.shape == nil or V.ValidBrushShape(stroke.shape) and stroke.radius <= 80
+			and not stroke.plane and not stroke.floorZ and (stroke.seed or 0) == 0)
 end
 
 local function strokePacket(name, scan, ply, revision, stroke)
@@ -190,6 +192,7 @@ local function strokePacket(name, scan, ply, revision, stroke)
 		net.WriteFloat(stroke.floorZ)
 	end
 	V.WriteEditPlane(stroke.plane)
+	V.WriteBrushShape(stroke.shape)
 	net.Send(ply)
 end
 local function edit(scan, ply, peer, revision, stroke)
@@ -234,8 +237,47 @@ end
 -- uniform layers can advance in the same tick without a dense-layer burst.
 local REPLICATION_BYTES = 8 * 1024
 local REPLICATION_PACKETS = 32
-local EDIT_PACKET_BYTES = 40 -- Upper bound including the optional clip plane and cell.
+local EDIT_PACKET_BYTES = 44 -- Upper bound including the optional clip plane and cell.
 local PROGRESS_PACKET_BYTES = 17
+-- Park unopened streams for remote players with no plausible view. Keep
+-- admitted peers synchronized: their edited movement depends on the journal.
+local function canStartStream(scan, ply, peer, allowProbe)
+	if peer.features or ply == scan.ply or not ply.GetShootPos or not ply.GetAimVector
+		or not V.ZoneDistanceSquared or ply.GetInfoNum and ply:GetInfoNum("vm_cull_occluded",1)==0 then return true end
+	local r=scan.region
+	local eye=ply:GetShootPos()
+	local distance=V.ZoneDistanceSquared(r,eye)
+	if distance<=768^2 then return true end
+	local center=r.origin+V.RegionSize(r)/2
+	local delta=center-eye
+	local forward=ply:GetAimVector()
+	local extent=V.RegionSize(r)
+	-- Broad view cone with a bounding sphere margin, independent of FOV zoom.
+	if delta:Dot(forward)<-extent:Length()/2 then return false end
+	local now=CurTime()
+	if peer.nextInterest and now<peer.nextInterest then return peer.interested end
+	if not allowProbe() then return false end
+	peer.nextInterest=now+math.max(0.25,(scan.pendingInterestCount or 0)/30)
+	peer.interested=true
+	-- PVS tests are broad and use native BSP. A positive result is sufficient.
+	-- A negative result is advisory on edited maps, since a new aperture may
+	-- reveal a region the original BSP did not expose.
+	if r.revision==0 and ply.TestPVS then
+		peer.interested=ply:TestPVS(center)
+		if not peer.interested then
+			local low,high=r.origin,r.origin+extent
+			for corner=0,7 do
+				local point=Vector(corner%2==0 and low.x or high.x,corner%4<2 and low.y or high.y,corner<4 and low.z or high.z)
+				if ply:TestPVS(point) then peer.interested=true break end
+			end
+		end
+	end
+	if peer.interested and util.TraceLine and MASK_OPAQUE then
+		peer.interested=not V.ZoneLineOfSightBlocked(r,eye,ply)
+	end
+	return peer.interested
+end
+
 function V.PumpScanReplication(scan, deadline)
 	if not scan.snapshot then
 		return
@@ -243,9 +285,18 @@ function V.PumpScanReplication(scan, deadline)
 	local peers, count = scan.replicationPeers, 0
 	local latest = #scan.history
 	local layers = V.RegionCells(scan.region, "z") + 1
+	local probes,pendingInterestCount=0,0
+	local function allowProbe()
+		if probes>=1 or SysTime()>=deadline then return false end
+		probes=probes+1
+		return true
+	end
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) then
-			if not peer.failed and (not peer.features or peer.nextLayer < layers
+			if not peer.features then pendingInterestCount=pendingInterestCount+1 end
+			local interested=not peer.failed and canStartStream(scan,ply,peer,allowProbe)
+			if not interested and not peer.features then peer.blocking=false end
+			if interested and (not peer.features or peer.nextLayer < layers
 				or (scan.completed and (not peer.done or peer.sent < latest))) then
 				if not peers then peers = {} scan.replicationPeers = peers end
 				count = count + 1
@@ -255,6 +306,7 @@ function V.PumpScanReplication(scan, deadline)
 			scan.peers[ply] = nil
 		end
 	end
+	scan.pendingInterestCount=pendingInterestCount
 	if peers then for i = #peers, count + 1, -1 do peers[i] = nil end end
 	if count == 0 then
 		return
@@ -322,7 +374,7 @@ end
 function V.PublishScanEdit(scan, work)
 	local revision = work.field.revision
 	scan.history[revision] =
-		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ, plane = work.plane }
+		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ, plane = work.plane, shape = work.shape }
 	work.sent = true
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) and not peer.failed and peer.done and peer.sent == revision - 1 then

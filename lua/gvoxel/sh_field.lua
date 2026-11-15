@@ -326,10 +326,11 @@ function V.ValidRemovalPlane(plane)
 	return true
 end
 
-function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
+function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane, shape)
+	if shape and (not V.ValidBrushShape(shape) or radius < 1 or radius > 80 or plane or floorZ or (seed and seed ~= 0)) then return {},false end
 	if plane and (adding or not r.bsp or not V.ValidRemovalPlane(plane)) then return {},false end
 	seed = seed and seed ~= 0 and seed or nil
-	if r.bsp and V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane) then
+	if not shape and r.bsp and V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane) then
 		return {}, false
 	end
 	if r.bsp then
@@ -338,20 +339,22 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 	local nx, ny, nz = V.RegionCells(r, "x") or nx, V.RegionCells(r, "y") or ny, V.RegionCells(r, "z") or nz
 	local step = r.step or V.Step
 	local q = center - r.origin
+	local sx,sy,sz,ring = radius,radius,radius,nil
+	if shape then sx,sy,sz,ring=V.BrushShapeDimensions(shape,radius) end
 	local planeAxis = plane and ({"x","y","z"})[plane.axis]
 	local localFloor = floorZ ~= nil and floorZ - r.origin.z or nil
 	local lo = {
-		max(1, floor((q.x - radius) / step)),
-		max(1, floor((q.y - radius) / step)),
-		max(1, floor((q.z - radius) / step)),
+		max(1, floor((q.x - sx) / step)),
+		max(1, floor((q.y - sy) / step)),
+		max(1, floor((q.z - sz) / step)),
 	}
 	if localFloor ~= nil then
 		lo[3] = max(lo[3], ceil(localFloor / step))
 	end
 	local hi = {
-		min(nx - 1, ceil((q.x + radius) / step)),
-		min(ny - 1, ceil((q.y + radius) / step)),
-		min(nz - 1, ceil((q.z + radius) / step)),
+		min(nx - 1, ceil((q.x + sx) / step)),
+		min(ny - 1, ceil((q.y + sy) / step)),
+		min(nz - 1, ceil((q.z + sz) / step)),
 	}
 	local dirty, changed = {}, false
 	local chunkWidth, chunkDepth = ceil(nx / 8), ceil(ny / 8)
@@ -369,7 +372,9 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 			local dy2 = (y * step - q.y) ^ 2
 			for x = lo[1], hi[1] do
 				local sample
-				if plane then
+				if shape then
+					sample = V.SampleBrushShape(shape[1],x*step-q.x,y*step-q.y,z*step-q.z,sx,sy,sz,ring)
+				elseif plane then
 					local value = plane.axis == 1 and x or plane.axis == 2 and y or z
 					sample = plane.sign * (r.origin[planeAxis] + value * step) - plane.distance
 				else
@@ -410,10 +415,10 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 	if r.bsp then
 		-- Thin BSP details can exist between lattice nodes. Their exact CSG
 		-- must update even when the coarse density samples did not change.
-		local lowZ = localFloor ~= nil and max(q.z - radius, localFloor) or q.z - radius
-		for cz = max(0, floor(lowZ / step / 8)), min(floor((nz - 1) / 8), floor((q.z + radius) / step / 8)) do
-			for cy = max(0, floor((q.y - radius) / step / 8)), min(floor((ny - 1) / 8), floor((q.y + radius) / step / 8)) do
-				for cx = max(0, floor((q.x - radius) / step / 8)), min(floor((nx - 1) / 8), floor((q.x + radius) / step / 8)) do
+		local lowZ = localFloor ~= nil and max(q.z - sz, localFloor) or q.z - sz
+		for cz = max(0, floor(lowZ / step / 8)), min(floor((nz - 1) / 8), floor((q.z + sz) / step / 8)) do
+			for cy = max(0, floor((q.y - sy) / step / 8)), min(floor((ny - 1) / 8), floor((q.y + sy) / step / 8)) do
+				for cx = max(0, floor((q.x - sx) / step / 8)), min(floor((nx - 1) / 8), floor((q.x + sx) / step / 8)) do
 					markChunk(cx, cy, cz)
 					changed = true
 				end
@@ -432,13 +437,13 @@ function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane
 		end
 		r.modifiedChunks = modified
 		if V.RecordBSPBrush then
-			V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane)
+			V.RecordBSPBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane, shape)
 		end
 		local low, high
 		low =
-			Vector(floor((q.x - radius) / step) - 2, floor((q.y - radius) / step) - 2, floor((q.z - radius) / step) - 2)
+			Vector(floor((q.x - sx) / step) - 2, floor((q.y - sy) / step) - 2, floor((q.z - sz) / step) - 2)
 		high =
-			Vector(floor((q.x + radius) / step) + 2, floor((q.y + radius) / step) + 2, floor((q.z + radius) / step) + 2)
+			Vector(floor((q.x + sx) / step) + 2, floor((q.y + sy) / step) + 2, floor((q.z + sz) / step) + 2)
 		V.InvalidateTerrainCaches(r, dirty, low, high)
 	end
 	return dirty, changed
@@ -782,7 +787,7 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 		else
 			faceNormal = -faceNormal
 		end
-		local flat = r.bsp and not curved or brush and (brush.seed or brush.floorZ ~= nil or brush.plane)
+		local flat = r.bsp and not curved or brush and (brush.seed or brush.floorZ ~= nil or brush.plane or brush.shape)
 		local fineCut = not flat and brush and not nativeFace and not brush.adding and brush.radius
 			and brush.radius <= r.step * 1.65 + 1
 		for corner = 1, 3 do

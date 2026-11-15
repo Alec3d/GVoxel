@@ -263,7 +263,7 @@ local function startEdit(scan, work, prepare)
 		checkpoint()
 		nextPhase("brush")
 		local dirty, changed =
-			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ, work.plane)
+			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ, work.plane, work.shape)
 		if not changed then
 			if V.AbortScanPreparation then V.AbortScanPreparation(scan, work) end
 			scan.editWork = nil
@@ -320,6 +320,7 @@ function V.EditScannedTerrain(ply, radius, adding)
 	end
 	local power = adding and ply.GetInfoNum and ply:GetInfoNum("vm_add_power", 100) or 100
 	radius = V.ScanBrushRadius(r, radius, power)
+	local shape = ply.GetInfoNum and V.BrushShapeFromSettings(ply)
 	local start, direction = ply:GetShootPos(), ply:GetAimVector()
 	startEdit(scan, {}, function(work, checkpoint)
 		local tr = V.TraceSculpt(ply, r, V.Reach, checkpoint, start, direction)
@@ -328,8 +329,9 @@ function V.EditScannedTerrain(ply, radius, adding)
 		end
 		work.center = V.SnapScanPosition(V.BrushCenter(tr, radius, adding))
 		work.radius = radius
+		work.shape = shape
 		work.adding = adding
-		if adding and V.BrushIntersectsBody and V.BrushIntersectsBody(work.center, radius) then
+		if adding and V.BrushIntersectsBody and V.BrushIntersectsBody(work.center, shape and radius * 1.733 or radius) then
 			V.Notify(ply, "Ajout bloque : un corps occupe cette zone.")
 			return false
 		end
@@ -751,10 +753,10 @@ local function sample(scan, deadline)
 			end
 			for i, stroke in ipairs(record.history) do
 				local center = Vector(unpack(stroke.center))
-				V.ApplyBrush(r, center, stroke.radius, stroke.adding, stroke.seed, checkpoint, stroke.floorZ, stroke.plane)
+				V.ApplyBrush(r, center, stroke.radius, stroke.adding, stroke.seed, checkpoint, stroke.floorZ, stroke.plane, stroke.shape)
 				r.revision = i
 				scan.history[i] = { center = center, radius = stroke.radius, adding = stroke.adding,
-					seed = stroke.seed, floorZ = stroke.floorZ, plane = stroke.plane }
+					seed = stroke.seed, floorZ = stroke.floorZ, plane = stroke.plane, shape = stroke.shape }
 				checkpoint()
 			end
 		end)

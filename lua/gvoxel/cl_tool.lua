@@ -76,6 +76,24 @@ local danger, dangerHover = Color(155, 33, 44), Color(190, 42, 52)
 local accentText = Color(32, 21, 12)
 local flags = {en = "gb", fr = "fr", ru = "ru", es = "es", it = "it", de = "de"}
 local addPower = CreateClientConVar("vm_add_power", "100", true, true, "Addition volume percentage", 10, 100)
+local shapeCVars = {}
+CreateClientConVar("vm_brush_shape", "1", true, true, "Sculpting brush shape", 1, #V.BrushShapes)
+for id, entry in ipairs(V.BrushShapes) do
+	shapeCVars[id] = {}
+	for index, label in ipairs(entry[2]) do
+		local angle = label == "Angle du cône (°)"
+		local name = "vm_brush_shape_" .. id .. "_" .. index
+		shapeCVars[id][index] = CreateClientConVar(name, angle and "45" or "100", true, true, label,
+			angle and 10 or 25, angle and 60 or 100)
+	end
+end
+local localBrushSettings = { GetInfoNum = function(_,name,default)
+	local value = GetConVar(name)
+	return value and value:GetInt() or default
+end }
+function V.GetLocalBrushShape()
+	return V.BrushShapeFromSettings(localBrushSettings)
+end
 local lastX, lastY
 
 -- Roboto ships with Garry's Mod. The extended glyph range includes Cyrillic.
@@ -315,6 +333,41 @@ function V.OpenScanMenu()
 		if rounded ~= addPower:GetInt() then RunConsoleCommand("vm_add_power", tostring(rounded)) end
 	end
 
+	local brush = button(content, function()
+		local shape = V.GetLocalBrushShape()
+		return V.L("Forme de brosse") .. " · " .. V.L(V.BrushShapes[shape and shape[1] or 1][1])
+	end, function()
+		local options = DermaMenu()
+		for id, entry in ipairs(V.BrushShapes) do
+			options:AddOption(V.L(entry[1]), function()
+				RunConsoleCommand("vm_brush_shape", tostring(id))
+				if #entry[2] == 0 then return end
+				local settings = vgui.Create("DFrame")
+				settings:SetSize(math.min(420, ScrW() - 16), 40 + #entry[2] * 44)
+				settings:Center()
+				settings:SetTitle(V.L(entry[1]))
+				settings:MakePopup()
+				for index, label in ipairs(entry[2]) do
+					local angle = label == "Angle du cône (°)"
+					local control = vgui.Create("DNumSlider", settings)
+					control:Dock(TOP)
+					control:SetTall(40)
+					control:SetText(V.L(label))
+					control.Label:SetFont(fonts.label)
+					control:GetTextArea():SetFont(fonts.label)
+					control:SetMinMax(angle and 10 or 25, angle and 60 or 100)
+					control:SetDecimals(0)
+					control:SetValue(shapeCVars[id][index]:GetInt())
+					control:SetConVar("vm_brush_shape_" .. id .. "_" .. index)
+				end
+			end)
+		end
+		options:Open()
+	end)
+	brush:Dock(TOP)
+	brush:SetTall(31)
+	brush:DockMargin(0, 2, 0, 0)
+
 	local remove = button(content, function() return V.L("Supprimer la zone") end, function()
 		local zone = V.GetClientScanState()
 		Derma_Query(V.L("Supprimer la zone et sa sauvegarde ?"), "GVoxel", V.L("Supprimer la zone"), function()
@@ -346,6 +399,7 @@ function V.OpenScanMenu()
 			{"Afficher le releve en fil de fer", "vm_show_wireframe"},
 			{"Afficher le viseur de creusement", "vm_show_cursor"},
 			{"Remplacer visuellement le BSP", "vm_replace_visual"},
+			{"Masquer les zones occultées", "vm_cull_occluded"},
 		}) do
 			local enabled = GetConVar(setting[2]):GetBool()
 			options:AddOption((enabled and "✓ " or "") .. V.L(setting[1]), function()

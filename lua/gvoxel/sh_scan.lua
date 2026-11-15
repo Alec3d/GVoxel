@@ -148,3 +148,26 @@ function V.ReadEditPlane()
     if net.ReadBool() then plane.cell={net.ReadUInt(5),net.ReadUInt(5),net.ReadUInt(5)} end
     return plane
 end
+
+function V.ZoneLineOfSightBlocked(r, eye, viewer)
+	local high = r.origin + V.RegionSize(r)
+	local low = r.origin
+	local requests = {start=eye, mask=MASK_OPAQUE, filter=viewer}
+	-- The nearest point and all eight corners sample the volume's silhouette.
+	-- Any unblocked sample keeps both terrain and aperture composition active.
+	for index=0,8 do
+		local point
+		if index==0 then
+			point=Vector(math.Clamp(eye.x,low.x,high.x),math.Clamp(eye.y,low.y,high.y),math.Clamp(eye.z,low.z,high.z))
+		else
+			local corner=index-1
+			point=Vector(corner%2==0 and low.x or high.x,corner%4<2 and low.y or high.y,corner<4 and low.z or high.z)
+		end
+		requests.endpos=point
+		local hit=util.TraceLine(requests)
+		if not hit or not hit.Hit or hit.StartSolid or hit.HitPos:DistToSqr(point)<=12^2 then
+			return false
+		end
+	end
+	return true
+end

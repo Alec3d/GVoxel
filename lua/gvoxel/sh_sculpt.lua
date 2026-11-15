@@ -106,7 +106,7 @@ function V.TraceScanRegion(r, start, direction, reach, occlusionOnly, checkpoint
 			end
 			local normal = bestNormal
 			if bestBrush then
-				normal = (bestBrush.seed or bestBrush.floorZ ~= nil or bestBrush.plane) and bestNormal
+				normal = (bestBrush.seed or bestBrush.floorZ ~= nil or bestBrush.plane or bestBrush.shape) and bestNormal
 					or (p - r.origin - bestBrush.center):GetNormalized() * (bestBrush.adding and 1 or -1)
 			elseif not r.bsp or bestCurved then
 				normal = V.Normal(r, p)

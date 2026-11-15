@@ -843,6 +843,20 @@ end
 
 -- Secondary views finish BEFORE the engine sets up its main world/viewmodel
 -- camera. No RenderView call can overwrite that setup during compositing.
+local occlusionEnabled = CreateClientConVar("vm_cull_occluded", "1", true, true, "Cull occluded voxel zones")
+local occlusion
+
+local function occluded(r, eye)
+	if not occlusionEnabled:GetBool() or not V.ZoneDistanceSquared or not util.TraceLine
+		or V.ZoneDistanceSquared(r, eye) <= 256^2 then return false end
+	local now = RealTime()
+	if occlusion and occlusion.region == r and now < occlusion.expires
+		and eye:DistToSqr(occlusion.eye) <= 24^2 then return occlusion.hidden end
+	local hidden=V.ZoneLineOfSightBlocked(r,eye,LocalPlayer())
+	occlusion={region=r,eye=eye,hidden=hidden,expires=now+(hidden and 0.15 or 0.35)}
+	return hidden
+end
+
 hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fov)
 	if preparing or V.RenderingReplacement or V.CapturingSurface or not V.VisualReplacementEnabled() then
 		return
@@ -904,6 +918,10 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 			native = {},
 		}
 		if not V.BoundsInView(frustum, region.origin, region.origin + V.RegionSize(region)) then
+			return
+		end
+		if occluded(region, origin) then
+			frameViews = nil
 			return
 		end
 		local hdr = IMAGE_FORMAT_RGBA16161616F and render.GetHDREnabled and render.GetHDREnabled()
