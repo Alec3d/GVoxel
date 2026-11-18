@@ -167,7 +167,7 @@ end)
 
 function V.CommitScanEdit(scan)
 	local work = scan.editWork
-	if not work or not work.sent or work.thread or not V.ScanPeersReady(scan, work.field.revision) then
+	if not work or not work.sent or work.thread or (not work.breach and not V.ScanPeersReady(scan, work.field.revision)) then
 		return
 	end
 	if V.PropEditReady and not V.PropEditReady(scan.region, work.field.revision) then
@@ -208,14 +208,23 @@ function V.CommitScanEdit(scan)
 		floorZ = work.floorZ,
 	}
 	scan.editWork = nil
+	if work.breach and V.EmitBlastDust then V.EmitBlastDust(scan, work) end
     if V.ScheduleDetachedCleanup then V.ScheduleDetachedCleanup(scan,work) end
+end
+local function abortEdit(scan, work)
+	if V.AbortScanPreparation then V.AbortScanPreparation(scan, work) end
+	if V.AbortPropEdit then V.AbortPropEdit(scan.region) end
+	scan.editWork = nil
 end
 local function permitEdit(scan)
 	local work = scan.editWork
 	if not work or work.thread or work.sent or not work.field or scan.failed then return end
 	if V.PropEditReady and not V.PropEditReady(scan.region, work.field.revision) then return end
+	if work.breach and (not V.VehicleBreachContact(scan, work)
+		or not V.TryEnrollVoxelVehicle(scan.region, work.breach.vehicle, false, true)) then return end
 	work.sentAt = SysTime()
 	V.PublishScanEdit(scan, work)
+	if work.breach then V.CommitScanEdit(scan) end
 end
 
 function V.OnPropEditPrepared(r)
@@ -265,13 +274,20 @@ local function startEdit(scan, work, prepare)
 		local dirty, changed =
 			V.ApplyBrush(work.field, work.center, work.radius, work.adding, work.seed, checkpoint, work.floorZ, work.plane, work.shape)
 		if not changed then
-			if V.AbortScanPreparation then V.AbortScanPreparation(scan, work) end
-			scan.editWork = nil
+			abortEdit(scan, work)
 			return
 		end
 		work.field.revision = work.revision
 		work.dirty = dirty
-        if not work.adding and work.source ~= "bullet" and V.EmitBlastDust then V.EmitBlastDust(scan,work) end
+		if work.breach then
+			nextPhase("clearance")
+			if not V.ValidateVehicleBreach(work.field, work, checkpoint) then
+				abortEdit(scan, work)
+				return
+			end
+		elseif not work.adding and work.source ~= "bullet" and V.EmitBlastDust then
+			V.EmitBlastDust(scan, work)
+		end
 		local blockedChunks
 		if V.StagePropEdit and V.PrepareCollisionChunk then
 			nextPhase("stage")
@@ -310,7 +326,7 @@ function V.EditScannedTerrain(ply, radius, adding)
 	if
 		not V.CanEdit(ply, r)
 		or not V.ScanPeersReady(scan, r.revision)
-		or scan.editWork
+		or (scan.editWork and (not scan.editWork.breach or scan.editWork.breach.point or scan.editWork.sent))
 		or (scan.explosions and #scan.explosions > 0)
 	then
 		return false
@@ -318,6 +334,7 @@ function V.EditScannedTerrain(ply, radius, adding)
 	if (r.nextEdit or 0) > CurTime() or r.revision >= V.MaxEdits then
 		return false
 	end
+	if scan.editWork then abortEdit(scan, scan.editWork) end
 	local power = adding and ply.GetInfoNum and ply:GetInfoNum("vm_add_power", 100) or 100
 	radius = V.ScanBrushRadius(r, radius, power)
 	local shape = ply.GetInfoNum and V.BrushShapeFromSettings(ply)
@@ -798,7 +815,7 @@ local function sample(scan, deadline)
 			else
 				-- Exact cells use BSP faces and brush planes. Only occupancy
 				-- is needed in their auxiliary field, without engine traces.
-				value = V.BSPSolid(r.bsp, p) and -fullDensity or fullDensity
+				value = V.BSPScanNodeSolid(r, p, scan.index, x) and -fullDensity or fullDensity
 			end
 			r.values[key] = value
 			if value < 0 then
@@ -818,6 +835,7 @@ local function sample(scan, deadline)
 		scan.terrainSign = nil
 		scan.densityNodes = nil
 		scan.region.bspTerrainColumns = nil
+		scan.region.bspScanRow, scan.region.bspScanRoot = nil, nil
 		scan.snapshot = { values = scan.initialValues or scan.region.values }
 		scan.initialValues = nil
 		scan.traceStats = nil
@@ -892,8 +910,16 @@ local function tick(scan)
 	local queuedExplosion = scan.explosions and #scan.explosions > 0
 	local impacts = scan.ballisticImpacts
 	local now = impacts and CurTime()
-	if not scan.editWork and (queuedExplosion or impacts and impacts.pending and now >= impacts.nextAt) and V.ScanPeersReady(scan, r.revision) then
-		local work = queuedExplosion and table.remove(scan.explosions, 1) or nextBallisticEdit(scan, impacts, now)
+	local hasBallistics=impacts and impacts.pending and now>=impacts.nextAt
+	if scan.editWork and scan.editWork.breach and not scan.editWork.sent then
+		local contact = V.VehicleBreachContact(scan, scan.editWork)
+		if contact == nil or ((queuedExplosion or hasBallistics) and not contact and not scan.editWork.breach.point) then
+			abortEdit(scan, scan.editWork)
+		end
+	end
+	if not scan.editWork and (queuedExplosion or hasBallistics) and V.ScanPeersReady(scan, r.revision) then
+		local work = queuedExplosion and table.remove(scan.explosions, 1)
+			or (hasBallistics and nextBallisticEdit(scan, impacts, now))
 		if work and r.revision < V.MaxEdits and (work.system or V.CanEdit(work.author, r)) then
 			startEdit(scan, work, function(_, checkpoint)
 				if work.source == "bullet" then return work.prepare(work, r, checkpoint) end
@@ -904,6 +930,12 @@ local function tick(scan)
 				return V.VoxelHullOverlaps(r, work.center, -e, e, checkpoint)
 			end)
 		end
+	end
+	if not scan.editWork and not queuedExplosion and not hasBallistics and V.NextVehicleBreach
+		and (scan.vehicleImpacts and next(scan.vehicleImpacts) or (scan.nextVehicleSearch or 0) <= CurTime())
+		and r.revision < V.MaxEdits then
+		local breach = V.NextVehicleBreach(scan)
+		if breach then startEdit(scan, breach, function(work, checkpoint) return V.PrepareVehicleBreach(r, work, checkpoint) end) end
 	end
 	local work = scan.editWork
 	if not work then

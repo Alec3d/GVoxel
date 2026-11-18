@@ -217,7 +217,7 @@ local function drawBatch(chunk, batch)
 end
 
 local function drawTerrain(frustum)
-	local translucent
+	local transitions, translucent
 	render.SuppressEngineLighting(true)
 	for _, chunk in pairs(region.chunks) do
 		if chunk.mesh and V.BoundsInView(frustum, chunk.low, chunk.high) then
@@ -240,7 +240,10 @@ local function drawTerrain(frustum)
 			matrixPushed = true
 			if chunk.batches then
 				for _, batch in ipairs(chunk.batches) do
-					if batch.translucent then
+					if batch.blendOverlay then
+						transitions = transitions or {}
+						transitions[#transitions + 1] = { chunk = chunk, batch = batch }
+					elseif batch.translucent then
 						translucent = translucent or {}
 						translucent[#translucent + 1] = { chunk = chunk, batch = batch }
 					else
@@ -255,38 +258,63 @@ local function drawTerrain(frustum)
 			matrixPushed = false
 		end
 	end
-	-- Sandbox lamps are evaluated by DrawSurfaceBatch's bounded light
-	-- sampler. Replaying all engine projectors would also redraw the
-	-- player's flashlight over the replacement and its material blends.
 	render.SuppressEngineLighting(false)
 	render.ResetModelLighting(1, 1, 1)
 	render.SetLocalModelLights()
 	stats.terrain = stats.terrain + 1
-	return translucent
+	return transitions, translucent
 end
 
-local function drawTranslucentTerrain(batches, forward)
+local function drawTerrainFlashlights(frustum)
+	render.SetStencilTestMask(4)
+	render.SetStencilReferenceValue(4)
+	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
+	render.OverrideDepthEnable(true, false)
+	render.OverrideAlphaWriteEnable(true, false)
+	render.SetColorModulation(1, 1, 1)
+	render.SetBlend(1)
+	render.RenderFlashlights(function()
+		for _, chunk in pairs(region.chunks) do
+			if chunk.batches and V.BoundsInView(frustum, chunk.low, chunk.high) then
+				cam.PushModelMatrix(chunk.transform)
+				matrixPushed = true
+				for _, batch in ipairs(chunk.batches) do
+					if not batch.translucent and batch.flashMesh and batch.flashMesh:IsValid() then
+						render.SetMaterial(V.SurfaceFlashMaterial(batch))
+						batch.flashMesh:Draw()
+					end
+				end
+				cam.PopModelMatrix()
+				matrixPushed = false
+			end
+		end
+	end)
+	render.OverrideAlphaWriteEnable(false)
+	render.OverrideDepthEnable(false)
+end
+
+local function drawTranslucentTerrain(batches, forward, mask)
 	for _, entry in ipairs(batches) do
 		entry.depth = (entry.batch.worldCenter or entry.chunk.lightOrigin):Dot(forward)
 	end
 	table.sort(batches, function(a, b)
-		local aOverlay, bOverlay = a.batch.blendOverlay == true, b.batch.blendOverlay == true
-		if aOverlay ~= bOverlay then return aOverlay end
 		return a.depth > b.depth
 	end)
-	render.SetStencilTestMask(1)
-	render.SetStencilReferenceValue(1)
+	render.SetStencilTestMask(mask)
+	render.SetStencilReferenceValue(mask)
 	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
 	render.SuppressEngineLighting(true)
+	render.OverrideAlphaWriteEnable(true, false)
+	render.OverrideDepthEnable(true, false)
 	for _, entry in ipairs(batches) do
 		cam.PushModelMatrix(entry.chunk.transform)
 		matrixPushed = true
-		if entry.batch.blendOverlay then render.OverrideDepthEnable(true, false) end
 		drawBatch(entry.chunk, entry.batch)
-		if entry.batch.blendOverlay then render.OverrideDepthEnable(false) end
 		cam.PopModelMatrix()
 		matrixPushed = false
 	end
+	render.OverrideDepthEnable(false)
+	render.OverrideAlphaWriteEnable(false)
 end
 
 local function firstPersonModel(ent, me, viewmodel)
@@ -1055,7 +1083,15 @@ local function renderNative(eye, forward, frustum)
 	-- Both 1 (cleared solid) and 3 (native air) receive new voxel geometry.
 	-- In particular, adding matter must still occlude preserved scenery.
 	render.SetStencilTestMask(1)
-	local translucent = drawTerrain(frustum)
+	-- Track the pixels actually covered by opaque voxel geometry. Projection
+	-- and material blend passes can then share its depth and coverage.
+	render.SetStencilWriteMask(4)
+	render.SetStencilReferenceValue(5)
+	render.SetStencilPassOperation(STENCILOPERATION_REPLACE)
+	local transitions, translucent = drawTerrain(frustum)
+	render.SetStencilWriteMask(255)
+	render.SetStencilReferenceValue(1)
+	render.SetStencilPassOperation(STENCILOPERATION_KEEP)
 	redrawEntities()
 	render.SetStencilTestMask(255)
 	for _, portal in ipairs(portals) do
@@ -1069,8 +1105,10 @@ local function renderNative(eye, forward, frustum)
 				-- markOpening already depth-tested these pixels. Keep depth
 				-- until the exit plane replaces it after the color copy.
 				render.OverrideDepthEnable(true, false)
+				render.OverrideAlphaWriteEnable(true, false)
 				render.SetMaterial(slot.material)
 				render.DrawScreenQuad()
+				render.OverrideAlphaWriteEnable(false)
 				render.OverrideDepthEnable(false)
 				sealBackgroundDepth(portal)
 				-- Claim only pixels that were just filled. Later openings
@@ -1080,10 +1118,19 @@ local function renderNative(eye, forward, frustum)
 			end
 		end
 	end
+	if transitions then
+		-- A color transition needs an opaque voxel at this pixel. Composite
+		-- it before projecting light, without touching openings or cutouts.
+		drawTranslucentTerrain(transitions, forward, 4)
+		render.SuppressEngineLighting(false)
+	end
+	if render.RenderFlashlights and V.UseNativeVoxelFlashlight and V.UseNativeVoxelFlashlight(region) then
+		drawTerrainFlashlights(frustum)
+	end
 	if translucent then
 		-- A pane blends with the finished exit and opaque terrain. It must
 		-- not contribute to aperture depth or the projected light pass.
-		drawTranslucentTerrain(translucent, forward)
+		drawTranslucentTerrain(translucent, forward, 1)
 	end
 end
 

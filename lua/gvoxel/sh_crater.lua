@@ -73,8 +73,19 @@ V.BrushShapes = {
     { "Tore", { "Diamètre (%)", "Épaisseur (%)" } },
 }
 
+-- Internal cut: half-extents in two-unit steps, then yaw in half-turn steps of 1/128.
+V.VehicleBreachShape = 7
+
 function V.ValidBrushShape(shape)
     if type(shape)~="table" or type(shape[1])~="number" then return false end
+    if shape[1] == V.VehicleBreachShape then
+        if #shape ~= 5 then return false end
+        for i = 2, 5 do
+            local n = shape[i]
+            if type(n) ~= "number" or n < (i == 5 and 0 or 1) or n > 127 or n ~= math.floor(n) then return false end
+        end
+        return true
+    end
     local entry=V.BrushShapes[shape[1]]
     if not entry or shape[1]==1 or #shape~=#entry[2]+1 then return false end
     for index,label in ipairs(entry[2]) do
@@ -84,6 +95,14 @@ function V.ValidBrushShape(shape)
             or value~=math.floor(value) then return false end
     end
     return true
+end
+
+function V.ValidShapedStroke(shape, radius, adding, seed, floorZ, plane)
+    if not V.ValidBrushShape(shape) or plane or floorZ or (seed or 0) ~= 0 then return false end
+    if shape[1] == V.VehicleBreachShape then
+        return not adding and radius == 2 * math.max(shape[2], shape[3], shape[4])
+    end
+    return radius >= 1 and radius <= 80
 end
 
 function V.BrushShapeFromSettings(ply)
@@ -104,6 +123,12 @@ end
 
 function V.BrushShapeDimensions(shape,radius)
     local id=shape[1]
+    if id == V.VehicleBreachShape then
+        local a, b, c = 2 * shape[2], 2 * shape[3], 2 * shape[4]
+        local angle = shape[5] * math.pi / 128
+        local cos, sin = math.cos(angle), math.sin(angle)
+        return a * math.abs(cos) + b * math.abs(sin), a * math.abs(sin) + b * math.abs(cos), c, {cos, sin, a, b}
+    end
     local a,b,c=shape[2]*radius/100,shape[3]*radius/100,(shape[4] or 100)*radius/100
     if id==2 or id==5 then return a,b,c end
     if id==3 then return a,a,b end
@@ -119,6 +144,9 @@ end
 
 function V.SampleBrushShape(id,x,y,z,a,b,c,ring)
     if id==2 then return math.max(math.abs(x)-a,math.abs(y)-b,math.abs(z)-c) end
+    if id==V.VehicleBreachShape then
+        return math.max(math.abs(x*ring[1]+y*ring[2])-ring[3], math.abs(y*ring[1]-x*ring[2])-ring[4], math.abs(z)-c)
+    end
     if id==5 then
         local taper=(c-z)/(2*c)
         return math.max(-z-c,z-c,math.abs(x)-a*taper,math.abs(y)-b*taper)
@@ -142,7 +170,9 @@ function V.ReadBrushShape()
     local id=net.ReadUInt(3)
     local entry=V.BrushShapes[id]
     local shape={id}
-    if entry then
+    if id == V.VehicleBreachShape then
+        for index=2,5 do shape[index]=net.ReadUInt(7) end
+    elseif entry then
         for index=1,#entry[2] do shape[index+1]=net.ReadUInt(7) end
     end
     return shape

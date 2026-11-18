@@ -327,7 +327,7 @@ function V.ValidRemovalPlane(plane)
 end
 
 function V.ApplyBrush(r, center, radius, adding, seed, checkpoint, floorZ, plane, shape)
-	if shape and (not V.ValidBrushShape(shape) or radius < 1 or radius > 80 or plane or floorZ or (seed and seed ~= 0)) then return {},false end
+	if shape and not V.ValidShapedStroke(shape, radius, adding, seed, floorZ, plane) then return {},false end
 	if plane and (adding or not r.bsp or not V.ValidRemovalPlane(plane)) then return {},false end
 	seed = seed and seed ~= 0 and seed or nil
 	if not shape and r.bsp and V.BSPBrushUnchanged(r, center, radius, adding, seed, floorZ, plane) then
@@ -777,10 +777,10 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 	local cells = V.TerrainCellCache(r, "renderCells", cx * 8, cy * 8, cz * 8)
 	local currentCell
 	local function emit(a, b, c, outward, curved, brush, nativeFace, cross)
-		if not cross then
-			cross = (b - a):Cross(c - a)
-			if cross:LengthSqr() < 0.000001 then return end
-		end
+		cross = cross or (b - a):Cross(c - a)
+		local areaSquared = cross:LengthSqr()
+		if areaSquared < 0.000001 then return end
+		local weight = sqrt(areaSquared)
 		local faceNormal = cross:GetNormalized()
 		if cross:Dot(outward) > 0 then
 			b, c = c, b
@@ -790,6 +790,8 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 		local flat = r.bsp and not curved or brush and (brush.seed or brush.floorZ ~= nil or brush.plane or brush.shape)
 		local fineCut = not flat and brush and not nativeFace and not brush.adding and brush.radius
 			and brush.radius <= r.step * 1.65 + 1
+		local reliefCut = not fineCut and curved == true and brush and not nativeFace and not brush.adding
+			and not brush.shape and not brush.plane and brush.floorZ == nil
 		for corner = 1, 3 do
 			local p = corner == 1 and a or corner == 2 and b or c
 			local data = vertexCache[p]
@@ -838,8 +840,11 @@ function V.BuildChunk(r, cx, cy, cz, checkpoint)
 				v = v,
 				cell = currentCell,
 				nativeFace = nativeFace,
+				faceNormal = corner == 1 and faceNormal or nil,
+				faceWeight = corner == 1 and weight or nil,
 				freshCut = corner == 1 and brush ~= nil and not nativeFace or nil,
 				fineCut = corner == 1 and fineCut or nil,
+				reliefCut = corner == 1 and reliefCut or nil,
 			}
 		end
 	end

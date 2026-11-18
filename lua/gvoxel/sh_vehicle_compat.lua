@@ -46,13 +46,22 @@ local entryPoints = {
 	PhysicsUpdate = true,
 }
 local function family(ent)
+	local class = ent.GetClass and ent:GetClass()
+	if class == "lvs_wheeldrive_wheel" or class == "gmod_sent_vehicle_fphysics_wheel"
+		or class == "empire_vp_wheel" or class == "glide_wheel" then
+		return
+	end
 	if ent.IsGlideVehicle == true then
 		return "Glide"
 	end
 	if ent.LVS == true then
 		return "LVS"
 	end
-	if ent.GetClass and ent:GetClass() == "gmod_sent_vehicle_fphysics_base" then
+	if class == "empire_vp_vehicle" then
+		return "EVP"
+	end
+	if class == "gmod_sent_vehicle_fphysics_base" or ent.IsSimfphyscar == true
+		or (type(ent.IsSimfphyscar) == "function" and ent:IsSimfphyscar()) then
 		return "Simfphys"
 	end
 	if ent.IsVehicle and ent:IsVehicle() then
@@ -82,6 +91,8 @@ function V.GetVoxelVehicleRoot(ent)
 			else
 				return
 			end
+		elseif ent.GetClass and ent:GetClass() == "empire_vp_wheel" and ent.GetNW2Entity then
+			ent = ent:GetNW2Entity("EVPChassis")
 		else
 			local getBase = ent.GetBase or ent.GetBaseEnt
 			if getBase then
@@ -331,12 +342,14 @@ local componentBases = {
 	glide_missile = true,
 	lvs_wheeldrive_wheel = true,
 	gmod_sent_vehicle_fphysics_wheel = true,
+	empire_vp_wheel = true,
 }
 local function frameworkClass(name, t, seen)
 	if V.IsVoxelProjectileClass and V.IsVoxelProjectileClass(name, t) then
 		return true
 	end
-	if t.IsGlideVehicle or t.LVS or name == "gmod_sent_vehicle_fphysics_base" or componentBases[name] then
+	if t.IsGlideVehicle or t.LVS or name == "gmod_sent_vehicle_fphysics_base" or name == "empire_vp_vehicle"
+		or componentBases[name] then
 		return true
 	end
 	if not t.Base or seen[t.Base] then

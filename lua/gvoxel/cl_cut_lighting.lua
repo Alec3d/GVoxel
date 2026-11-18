@@ -340,7 +340,7 @@ end
 
 local function rimLighting(r, rims, normal)
 	local best, score = nil, math.huge
-	local bestGround, groundScore = nil, math.huge
+	local aligned, alignedScore = nil, math.huge
 	local step = r.step
 	for _, candidate in ipairs(rims) do
 		local alignment = normal:Dot(candidate.normal)
@@ -348,12 +348,14 @@ local function rimLighting(r, rims, normal)
 		if alignment >= -0.25 and s < score then
 			best, score = candidate, s
 		end
-		if normal.z > 0.65 and candidate.normal.z > 0.65 and alignment > 0.85
-			and candidate.tangent2 < (step * 0.15) ^ 2 and s < groundScore then
-			bestGround, groundScore = candidate, s
+		-- A perpendicular dark wall can be closer than the authored floor or
+		-- wall this cut continues. Prefer the facing luxel near its own face.
+		if alignment > 0.85 and candidate.d2 < (step * 0.5) ^ 2
+			and candidate.tangent2 < (step * 0.15) ^ 2 and s < alignedScore then
+			aligned, alignedScore = candidate, s
 		end
 	end
-	best = bestGround or best
+	best = aligned or best
 	if not best then
 		return
 	end
@@ -372,7 +374,8 @@ local function rimLighting(r, rims, normal)
 			total = total + w
 		end
 	end
-	return total == 1 and light or light / total, best.d2, normal:Dot(best.normal), bestGround ~= nil
+	return total == 1 and light or light / total, best.d2, normal:Dot(best.normal),
+		aligned ~= nil and normal.z > 0.65 and best.normal.z > 0.65
 end
 
 function V.CutVertexLighting(r, point, normal, checkpoint)

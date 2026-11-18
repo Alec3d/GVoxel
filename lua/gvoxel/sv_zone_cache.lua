@@ -64,7 +64,7 @@ function V.ValidateZoneCache(record,map,signature,checkpoint)
         if type(s)~="table" or not point(s.center) or not finite(s.radius,65536) or s.radius<1 or s.radius~=math.floor(s.radius) or type(s.adding)~="boolean"
             or not finite(s.seed,65536) or s.seed<0 or s.seed~=math.floor(s.seed)
             or (s.floorZ~=nil and not finite(s.floorZ))
-            or (s.shape~=nil and (not V.ValidBrushShape(s.shape) or s.radius>80 or s.seed~=0 or s.floorZ~=nil or s.plane~=nil))
+            or (s.shape~=nil and not V.ValidShapedStroke(s.shape,s.radius,s.adding,s.seed,s.floorZ,s.plane))
             or (s.plane~=nil and (s.adding or s.seed~=0 or s.floorZ~=nil or not V.ValidRemovalPlane(s.plane))) then return nil,"Operation invalide." end
         if checkpoint and index%32==0 then checkpoint() end
     end

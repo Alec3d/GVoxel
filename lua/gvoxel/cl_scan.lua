@@ -400,7 +400,7 @@ net.Receive("vm_scan_edit", function()
 	if not scan or scan.region.id ~= id then
 		return
 	end
-	if (plane and not V.ValidRemovalPlane(plane)) or (shape and not V.ValidBrushShape(shape)) then buildFailed("Invalid fragment plane: vm_resync") return end
+	if (plane and not V.ValidRemovalPlane(plane)) or (shape and not V.ValidShapedStroke(shape, radius, adding, seed, floorZ, plane)) then buildFailed("Invalid edit descriptor: vm_resync") return end
 	if revision ~= (scan.receivedRevision or 0) + 1 then
 		buildFailed("Modification hors sequence : vm_resync pour retenter")
 		return
@@ -448,7 +448,7 @@ net.Receive("vm_scan_prepare", function()
 		return
 	end
 	scan.preparingRevision = revision
-	if (plane and not V.ValidRemovalPlane(plane)) or (shape and not V.ValidBrushShape(shape)) then buildFailed("Invalid fragment plane: vm_resync") return end
+	if (plane and not V.ValidRemovalPlane(plane)) or (shape and not V.ValidShapedStroke(shape, radius, adding, seed, floorZ, plane)) then buildFailed("Invalid edit descriptor: vm_resync") return end
 	editQueue[1] = {
 		revision = revision,
 		center = center,

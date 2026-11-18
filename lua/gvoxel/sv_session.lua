@@ -173,8 +173,7 @@ local function validStroke(stroke)
 		and (stroke.seed == nil or wireInteger(stroke.seed, 0))
 		and (stroke.floorZ == nil or finite(stroke.floorZ))
 		and (stroke.plane == nil or V.ValidRemovalPlane(stroke.plane))
-		and (stroke.shape == nil or V.ValidBrushShape(stroke.shape) and stroke.radius <= 80
-			and not stroke.plane and not stroke.floorZ and (stroke.seed or 0) == 0)
+		and (stroke.shape == nil or V.ValidShapedStroke(stroke.shape, stroke.radius, stroke.adding, stroke.seed, stroke.floorZ, stroke.plane))
 end
 
 local function strokePacket(name, scan, ply, revision, stroke)

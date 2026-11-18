@@ -4,7 +4,7 @@ local V = GVoxel
 local axes = { "x", "y", "z" }
 local basis = { Vector(1, 0, 0), Vector(0, 1, 0), Vector(0, 0, 1) }
 local EPS = 0.00001
-local emptySolids, originalMixedPending = {}, {}
+local emptySolids, originalMixedPending, fullCell = {}, {}, {}
 local function boxPlane(planes, i, cell, step)
 	local slices = planes[i]
 	local plane = slices[cell]
@@ -93,7 +93,7 @@ local function planarCell(r, x, y, z, points, densities)
 end
 
 local edgeDelta = Vector()
-local function polytope(points, normals, edges, checkpoint, indexedEdges)
+local function polytope(points, normals, edges, checkpoint, indexedEdges, bounds)
 	-- Read each Source vertex once. The three mandatory world axes
 	-- are already normalized and need no duplicate search or projections.
 	local coordinates = {}
@@ -110,7 +110,7 @@ local function polytope(points, normals, edges, checkpoint, indexedEdges)
 		if y > highY then highY = y end
 		if z > highZ then highZ = z end
 	end
-	local planes = {
+	local planes = bounds and { bounds[1], bounds[2], bounds[3] } or {
 		{ n = basis[1], low = lowX, high = highX },
 		{ n = basis[2], low = lowY, high = highY },
 		{ n = basis[3], low = lowZ, high = highZ },
@@ -393,6 +393,31 @@ function V.DensityCellPlanes(r, x, y, z)
 	return result
 end
 
+local function pieceBounds(piece)
+	if piece.voxelBounds then return piece.voxelBounds end
+	-- Clipped pieces share their vertex list with the renderer. Keep the
+	-- cheap axis intervals even when no body ever reaches this fragment.
+	if not piece.points then return end
+	local lowX, lowY, lowZ = math.huge, math.huge, math.huge
+	local highX, highY, highZ = -math.huge, -math.huge, -math.huge
+	for _, point in ipairs(piece.points) do
+		local x, y, z = point.x, point.y, point.z
+		if x < lowX then lowX = x end
+		if y < lowY then lowY = y end
+		if z < lowZ then lowZ = z end
+		if x > highX then highX = x end
+		if y > highY then highY = y end
+		if z > highZ then highZ = z end
+	end
+	piece.voxelBounds = {
+		{ n = basis[1], low = lowX, high = highX },
+		{ n = basis[2], low = lowY, high = highY },
+		{ n = basis[3], low = lowZ, high = highZ },
+		deferredPiece = piece,
+	}
+	return piece.voxelBounds
+end
+
 function V.BSPPieceHull(piece, checkpoint)
 	if piece.voxelHull then
 		return piece.voxelHull
@@ -425,7 +450,8 @@ function V.BSPPieceHull(piece, checkpoint)
 			end
 		end
 	end
-	piece.voxelHull = polytope(vertices, normals, edges, checkpoint, true)
+	local hull = polytope(vertices, normals, edges, checkpoint, true, piece.voxelBounds)
+	piece.voxelHull = piece.voxelHull or hull
 	return piece.voxelHull
 end
 
@@ -465,7 +491,7 @@ local function buildCellSolids(r, x, y, z, key, checkpoint, prepare)
 	if not r.bsp then
 		local occupancy = densityOccupancy(r, x, y, z)
 		if occupancy == 2 then return emptySolids end
-		if occupancy == 1 then return boxHull(r, x, y, z) end
+		if occupancy == 1 then return fullCell end
 	end
 
 	local usesDensity = unedited and V.BSPCellUsesDensity(r, x, y, z)
@@ -475,7 +501,7 @@ local function buildCellSolids(r, x, y, z, key, checkpoint, prepare)
 			return emptySolids
 		end
 		if occupancy == 1 then
-			return boxHull(r, x, y, z)
+			return fullCell
 		end
 		-- Untouched distant architecture remains native until a voxel
 		-- query reaches it. Record its exact occupancy now, and build
@@ -493,7 +519,7 @@ local function buildCellSolids(r, x, y, z, key, checkpoint, prepare)
 		if prepare and r.revision == 0 and not V.BSPCollisionNearFocus(r, x, y, z, 240) then
 			local occupancy = densityOccupancy(base, x, y, z)
 			if occupancy == 2 then return emptySolids end
-			if occupancy == 1 then return boxHull(r, x, y, z) end
+			if occupancy == 1 then return fullCell end
 			return originalMixedPending
 		end
 		return cellSolids(base, x, y, z, checkpoint)
@@ -501,7 +527,8 @@ local function buildCellSolids(r, x, y, z, key, checkpoint, prepare)
 	local solids = {}
 	if r.bsp then
 		for _, piece in ipairs(V.BSPCellSolids(r, x, y, z, checkpoint, unedited and not usesDensity)) do
-			solids[#solids + 1] = V.BSPPieceHull(piece, checkpoint)
+			solids[#solids + 1] = piece.voxelHull or (not unedited and pieceBounds(piece))
+				or V.BSPPieceHull(piece, checkpoint)
 			if checkpoint then
 				checkpoint()
 			end
@@ -528,15 +555,25 @@ cellSolids = function(r, x, y, z, checkpoint)
 		solids = buildCellSolids(r, x, y, z, key, checkpoint)
 		cache[key] = solids
 	end
+	if solids == fullCell then
+		solids = boxHull(r, x, y, z)
+		cache[key] = solids
+	end
 	return solids
 end
-V.DensityCellSolids = cellSolids
+function V.DensityCellSolids(r, x, y, z, checkpoint)
+	local solids = cellSolids(r, x, y, z, checkpoint)
+	for i, hull in ipairs(solids) do
+		if hull.deferredPiece then solids[i] = V.BSPPieceHull(hull.deferredPiece, checkpoint) end
+	end
+	return solids
+end
 
 -- Connectivity needs vertices only while analyzing fragments. Reuse the
 -- geometry already cached for these hulls rather than retaining another copy
 -- on every movement collider (including on clients).
 function V.CollisionSolidPoints(r, x, y, z, checkpoint)
-	local hulls = cellSolids(r, x, y, z, checkpoint)
+	local hulls = V.DensityCellSolids(r, x, y, z, checkpoint)
 	if #hulls == 0 or (#hulls == 1 and #hulls[1] == 3) then return hulls, emptySolids end
 	local points = {}
 	local key = V.Index(x, y, z, r)
@@ -582,11 +619,11 @@ function V.PrepareCollisionChunk(r, cx, cy, cz, checkpoint)
 				local key = first + x - x0
 				if not cells[key] then
 					if uniform and not edits[key] and not (fallback and fallback[key]) and not (terrain and terrain[key]) then
-						cells[key] = uniform == 1 and boxHull(r, x, y, z) or emptySolids
+						cells[key] = uniform == 1 and fullCell or emptySolids
 					else
 						cells[key] = buildCellSolids(r, x, y, z, key, checkpoint, true)
 					end
-					if checkpoint then
+					if checkpoint and not uniform then
 						checkpoint()
 					end
 				end
@@ -594,6 +631,7 @@ function V.PrepareCollisionChunk(r, cx, cy, cz, checkpoint)
 					prewarm(r, x, y, z, checkpoint)
 				end
 			end
+			if checkpoint and uniform then checkpoint() end
 		end
 	end
 end
@@ -612,9 +650,14 @@ function V.CollisionCacheStats(r)
 			for _, solids in pairs(cells) do
 				result.cells = result.cells + 1
 				if solids == originalMixedPending then result.pendingOriginal = result.pendingOriginal + 1 end
-				result.solids = result.solids + #solids
-				for _, planes in ipairs(solids) do
-					result.axes = result.axes + #planes
+				if solids == fullCell then
+					result.solids, result.axes = result.solids + 1, result.axes + 3
+				else
+					result.solids = result.solids + #solids
+					for _, planes in ipairs(solids) do
+						local resolved = planes.deferredPiece and planes.deferredPiece.voxelHull
+						result.axes = result.axes + #(resolved or planes)
+					end
 				end
 			end
 		end
@@ -622,14 +665,29 @@ function V.CollisionCacheStats(r)
 	return result
 end
 
-local function sweep(poly, center, extent, delta, pointCast)
+local function sweep(poly, center, extent, delta, pointCast, checkpoint)
 	local first, last = -math.huge, math.huge
 	local normal, reverse
 	local inside = true
-	for _, plane in ipairs(poly) do
+	local index = 1
+	while true do
+		local plane = poly[index]
+		if not plane and poly.deferredPiece then
+			if first > 1 or last < 0 then return end
+			poly = V.BSPPieceHull(poly.deferredPiece, checkpoint)
+			plane = poly[index]
+		end
+		if not plane then break end
 		local n = plane.n
-		local radius = math.abs(n.x) * extent.x + math.abs(n.y) * extent.y + math.abs(n.z) * extent.z
-		local p, d = center:Dot(n), delta:Dot(n)
+		local axis = axes[index]
+		local radius, p, d
+		if axis and n == basis[index] then
+			radius, p, d = extent[axis], center[axis], delta[axis]
+		else
+			radius = math.abs(n.x) * extent.x + math.abs(n.y) * extent.y + math.abs(n.z) * extent.z
+			p, d = center:Dot(n), delta:Dot(n)
+		end
+		index = index + 1
 		local low, high = plane.low - radius, plane.high + radius
 		if p <= low + EPS or p >= high - EPS then
 			inside = false
@@ -714,7 +772,7 @@ function V.VoxelHullOverlaps(r, position, mins, maxs, checkpoint)
     local pointCast=extent:LengthSqr()<1e-16
     for z=lo.z,hi.z do for y=lo.y,hi.y do for x=lo.x,hi.x do
         for _,poly in ipairs(cellSolids(r,x,y,z,checkpoint)) do
-            local _,_,inside=sweep(poly,center,extent,zero,pointCast)
+            local _,_,inside=sweep(poly,center,extent,zero,pointCast,checkpoint)
             if inside then return true end
         end
         if checkpoint then checkpoint() end
@@ -803,7 +861,7 @@ function V.TraceVoxelHull(r, start, finish, mins, maxs, checkpoint)
 			break
 		end
 		for _, poly in ipairs(cellSolids(r, cell.x, cell.y, cell.z, checkpoint)) do
-			local fraction, normal, inside = sweep(poly, center, extent, delta, pointCast)
+			local fraction, normal, inside = sweep(poly, center, extent, delta, pointCast, checkpoint)
 			if fraction and (fraction < result.Fraction or inside) then
 				result.Hit = true
 				result.Fraction = fraction

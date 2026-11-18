@@ -16,6 +16,7 @@ local directRegion, directJob
 local directBatches, directQueue, directCursor = {}, {}, 1
 local lightTools, nextToolSearch = {}, 0
 local activeDirectLights, lightEpoch, lastEmitterCount = false, 0, 0
+local lastFlashlightMode
 local toolClasses = { "gmod_light", "gmod_lamp" }
 local MAX_DIRECT_BATCHES, DIRECT_PROBES, MAX_TOOLS_PER_CLASS = 512, 6, 8
 V.VoxelSunBlocked = nil
@@ -24,6 +25,19 @@ local function positive(v)
 end
 local function solid(p)
 	return util.PointContents and bit.band(util.PointContents(p), CONTENTS_SOLID) ~= 0
+end
+
+local function localFlashlight(r)
+	local ply = LocalPlayer and LocalPlayer()
+	if not IsValid(ply) or not ply.FlashlightIsOn or not ply:FlashlightIsOn() then return end
+	local point = ply:EyePos()
+	local buried = r.revision > 0 and V.InScanCube(r, point) and solid(point)
+	return ply, point, not buried and render.RenderFlashlights ~= nil
+end
+
+function V.UseNativeVoxelFlashlight(r)
+	local _, _, native = localFlashlight(r)
+	return native
 end
 local function dynamic(p, n)
 	local color = render.ComputeDynamicLighting and render.ComputeDynamicLighting(p, n)
@@ -173,6 +187,7 @@ local function resetDirectLighting(r)
 	directBatches, directQueue, directCursor = {}, {}, 1
 	lightTools, nextToolSearch = {}, 0
 	activeDirectLights, lightEpoch, lastEmitterCount = false, 0, 0
+	lastFlashlightMode = nil
 end
 
 local function emitterColor(color, brightness)
@@ -180,7 +195,7 @@ local function emitterColor(color, brightness)
 	return Vector(color.r / 255, color.g / 255, color.b / 255) * brightness
 end
 
-local function sandboxEmitters(now)
+local function sandboxEmitters(now, nativeProjectors)
 	if now >= nextToolSearch then
 		nextToolSearch = now + 0.25
 		lightTools = {}
@@ -200,7 +215,7 @@ local function sandboxEmitters(now)
 	local emitters = {}
 	for _, tool in ipairs(lightTools) do
 		local ent = tool.entity
-		if IsValid(ent) and not ent:IsDormant() and ent.GetOn and ent:GetOn() then
+		if (not nativeProjectors or not tool.spot) and IsValid(ent) and not ent:IsDormant() and ent.GetOn and ent:GetOn() then
 			local range = tool.spot and ent:GetDistance() or ent:GetLightSize()
 			local brightness = math.min(tool.spot and 8 or 6, ent:GetBrightness())
 			-- Sandbox's LightWorld variable is the dlight `noworld` flag.
@@ -300,10 +315,19 @@ hook.Add("Think", "GVoxel.LiveSurfaceLighting", function()
 	if not r then return end
 	if V.GetClientScanRegion and V.GetClientScanRegion() ~= r then resetDirectLighting(nil) return end
 	local now, frame = RealTime(), FrameNumber()
-	local emitters = sandboxEmitters(now)
+	local ply, position, nativeProjectors = localFlashlight(r)
+	local mode = nativeProjectors and "native" or ply and "voxel" or nil
+	local emitters = sandboxEmitters(now, nativeProjectors)
+	if mode == "voxel" then
+		-- The engine shadow map still contains the original BSP. When the
+		-- camera is inside removed material, trace the torch through the edit.
+		table.insert(emitters, 1, { entity = ply, pos = position, direction = ply:GetAimVector(),
+			range = 768, cone = math.cos(math.rad(25)), color = Vector(1.2, 1.2, 1.2) })
+	end
 	activeDirectLights = #emitters > 0
-	if #emitters ~= lastEmitterCount then
+	if #emitters ~= lastEmitterCount or mode ~= lastFlashlightMode then
 		lastEmitterCount, lightEpoch = #emitters, lightEpoch + 1
+		lastFlashlightMode = mode
 	end
 	if not activeDirectLights then
 		if #directQueue > 0 then directBatches, directQueue, directCursor = {}, {}, 1 end

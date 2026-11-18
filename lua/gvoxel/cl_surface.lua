@@ -42,6 +42,14 @@ local dirtFlash = CreateMaterial("vm_cut_dirt_projected_v1", "VertexLitGeneric",
 	["$nocull"] = "1",
 	["$vertexcolor"] = "0",
 })
+-- The Source flashlight permutation requests a tangent stream even on a
+-- diffuse receiver. Use a material with that layout at mesh creation time.
+local flashLayout = CreateMaterial("vm_flashlight_mesh_layout_v1", "VertexLitGeneric", {
+	["$basetexture"] = "color/white",
+	["$bumpmap"] = "dev/flat_normal",
+	["$model"] = "1",
+	["$vertexalpha"] = "1",
+})
 local frames = {
 	{ normal = Vector(1, 0, 0), right = Vector(0, 1, 0), up = Vector(0, 0, 1), angles = Angle(0, 180, 0) },
 	{ normal = Vector(-1, 0, 0), right = Vector(0, -1, 0), up = Vector(0, 0, 1), angles = Angle(0, 0, 0) },
@@ -61,6 +69,33 @@ local function frameFor(normal)
 	if z > best + 0.00001 then index, best = 5, z end
 	if -z > best + 0.00001 then index = 6 end
 	return index, frames[index]
+end
+
+local function flashlightVertices(vertices, tex, checkpoint)
+	local output, tangents = {}, {}
+	for i, vertex in ipairs(vertices) do
+		local n = vertex.normal
+		local data = tangents[n]
+		if not data then
+			local right, up
+			if tex then
+				right, up = tex.u, tex.v
+			else
+				local _, frame = frameFor(n)
+				right, up = frame.right, frame.up
+			end
+			local tangent = up:Cross(n):GetNormalized()
+			if tangent:Dot(right) < 0 then tangent = -tangent end
+			if tangent:LengthSqr() < 0.5 then tangent = n:Cross(right):GetNormalized() end
+			local handedness = n:Cross(tangent):Dot(up) < 0 and -1 or 1
+			data = { tangent.x, tangent.y, tangent.z, handedness }
+			tangents[n] = data
+		end
+		output[i] = { pos = vertex.pos, normal = n, u = vertex.u, v = vertex.v,
+			color = color_white, userdata = data }
+		if checkpoint and i % 96 == 0 then checkpoint() end
+	end
+	return output
 end
 
 local function acquire(source, hdr)
@@ -818,9 +853,8 @@ local function registerSources(r, item, vertices, checkpoint)
 		end
 		recoverMaterial(source, r, false)
 		local lightmap = source.directBaked and V.SurfaceLightmap
-		-- Ground shadows need texel detail, especially along walls. Prefer
-		-- the engine capture there; blocked or exhausted captures fall back
-		-- to the original BSP luxels.
+		-- A captured floor retains the full texel detail of native shadows.
+		-- Uncapturable surfaces can still use their compiled BSP luxels.
 		if lightmap and source.planeNormal.z < 0.65 and source.nativeFace and not source.nativeFace.displacement then
 			source.preferLightmap = V.SurfaceLightmap(r, source, anchor.point) ~= nil
 			for _, check in ipairs(source.captureChecks or {}) do
@@ -1361,9 +1395,6 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		local tex = not original and appearance and appearance.tex
 			and ((retained or nativeCut) and appearance.tex or foldedTexture(appearance, projection))
 		local count = #group.vertices
-		-- Separate just the color layer from the opaque surface. UVs and
-		-- lighting continue to use the exact unshifted position.
-		local lift = blendAlpha and normal * math.min(r.step / 1024, 0.025)
 		for index = 1, 3 do
 			local old = index == 1 and a or index == 2 and b or c
 			local u, v = old.u, old.v
@@ -1378,7 +1409,7 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 				u, v = world:Dot(frame.right) / 128, -world:Dot(frame.up) / 128
 			end
 			group.vertices[count + index] = {
-				pos = lift and old.pos + lift or old.pos,
+				pos = old.pos,
 				normal = old.normal,
 				u = u,
 				v = v,
@@ -1506,18 +1537,34 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 			end
 			local adjacent = nativeCut and appearance.adjacentFlash ~= nil
 			weight = weight or math.sqrt((b.pos - a.pos):Cross(c.pos - a.pos):LengthSqr())
-			if a.fineCut and refinedCuts < 2 and weight > math.max(8, r.step * r.step * 0.045)
+			local relief = a.reliefCut and currentCell and refinedCuts == 0 and not nativeCut
+				and weight > math.max(32, r.step * r.step * 0.3)
+			local fine = a.fineCut and refinedCuts < 2 and weight > math.max(8, r.step * r.step * 0.045)
 				and (a.normal:Dot(b.normal) < 0.98 or b.normal:Dot(c.normal) < 0.98 or c.normal:Dot(a.normal) < 0.98)
-			then
+			if relief or fine then
 				-- A centroid split adds a lighting sample to the curved
 				-- cut while preserving every edge shared with other cells.
 				refinedCuts = refinedCuts + 1
 				local middle = { pos = (a.pos + b.pos + c.pos) / 3,
 					normal = (a.normal + b.normal + c.normal):GetNormalized() }
 				local part = weight / 3
-				append(a, b, middle, triangleCenter(a, b, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
-				append(b, c, middle, triangleCenter(b, c, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
-				append(c, a, middle, triangleCenter(c, a, middle), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+				if relief then
+					local longest = math.sqrt(math.max(a.pos:DistToSqr(b.pos), b.pos:DistToSqr(c.pos), c.pos:DistToSqr(a.pos)))
+					-- Recess only the centre. The boundary, material seams and
+					-- collision silhouette keep their production coordinates.
+					middle.pos = middle.pos - normal * math.min(0.75, weight / longest * 0.1)
+				end
+				local function appendPart(first, second)
+					local vertex = middle
+					if relief then
+						local slope = (middle.pos - first.pos):Cross(second.pos - first.pos):GetNormalized()
+						vertex = { pos = middle.pos, normal = (middle.normal + slope):GetNormalized() }
+					end
+					append(first, second, vertex, triangleCenter(first, second, vertex), part, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
+				end
+				appendPart(a, b)
+				appendPart(b, c)
+				appendPart(c, a)
 			else
 				append(a, b, c, center, weight, patch, normal, nil, appearance, nil, adjacent, nil, nativeCut)
 			end
@@ -1526,10 +1573,15 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 	local function triangle(i)
 		local a, b, c = vertices[i], vertices[i + 1], vertices[i + 2]
 		local center = triangleCenter(a, b, c)
-		local cross = (b.pos - a.pos):Cross(c.pos - a.pos)
-		local normal = type(a.cell) == "number" and a.nativeFace and a.normal == b.normal and a.normal == c.normal
-			and a.normal or cross:GetNormalized() * -1
-		local weight = math.sqrt(cross:LengthSqr())
+		-- The triangulator already has these values in zone coordinates.
+		-- Standalone batches can still supply just positions and normals.
+		local normal, weight = a.faceNormal, a.faceWeight
+		if not normal then
+			local cross = (b.pos - a.pos):Cross(c.pos - a.pos)
+			normal = type(a.cell) == "number" and a.nativeFace and a.normal == b.normal and a.normal == c.normal
+				and a.normal or cross:GetNormalized() * -1
+			weight = math.sqrt(cross:LengthSqr())
+		end
 		local face = a.nativeFace or a.surfaceFace
 		local scanSource = r.surfaceFrozen and not a.freshCut and a.scanSource and r.surfaceList[a.scanSource]
 		local source = scanSource or (face and own and own[face])
@@ -1652,8 +1704,8 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 	end
 	local batches = {}
 	local function buildBatch(key, group)
-		-- The primary stream uses the color layout of the diffuse shader.
-		-- Masked Phong also needs tangents, in a separate projected-light mesh.
+		-- Keep static vertex colors and the projector's tangent layout in
+		-- separate streams. The flashlight always samples untinted albedo.
 		local object = Mesh((group.baked and group.source.slot.cutMaterial) or group.material)
 		if checkpoint then
 			checkpoint(object)
@@ -1665,25 +1717,10 @@ function V.BuildSurfaceBatches(r, item, vertices, checkpoint, previousBatches)
 		object:BuildFromTriangles(meshVertices)
 		if checkpoint then checkpoint() end
 		local flashMesh
-		if group.phongFlash then
-			flashMesh = Mesh(group.phongFlash)
+		if not group.translucent then
+			flashMesh = Mesh(group.phongFlash or flashLayout)
 			if checkpoint then checkpoint(flashMesh) end
-			local tex, vertices = group.phongTex, {}
-			for i, vertex in ipairs(group.vertices) do
-				local n = vertex.normal
-				local tangent = tex.v:Cross(n):GetNormalized()
-				if tangent:Dot(tex.u) < 0 then
-					tangent = -tangent
-				end
-				if tangent:LengthSqr() < 0.5 then
-					tangent = n:Cross(tex.u):GetNormalized()
-				end
-				local handedness = n:Cross(tangent):Dot(tex.v) < 0 and -1 or 1
-				vertices[i] = { pos = vertex.pos, normal = n, u = vertex.u, v = vertex.v,
-					color = vertex.color, userdata = { tangent.x, tangent.y, tangent.z, handedness } }
-				if checkpoint and i % 96 == 0 then checkpoint() end
-			end
-			flashMesh:BuildFromTriangles(vertices)
+			flashMesh:BuildFromTriangles(flashlightVertices(group.vertices, group.phongTex, checkpoint))
 			if checkpoint then checkpoint() end
 		end
 		local weight = math.max(group.weight, 0.000001)
@@ -1792,6 +1829,9 @@ local function finishCapture(source, failed, reason)
 				batch.material = source.surfaceAlbedo or source.interior or V.ScanSurfaceMaterial
 				batch.flashMaterial = batch.material
 				batch.baked = false
+			end
+			if batch.flashMesh and batch.flashMesh:IsValid() then
+				batch.flashMesh:BuildFromTriangles(flashlightVertices(pending.fallback or pending.vertices))
 			end
 		end
 	end
@@ -1960,7 +2000,7 @@ function V.SurfaceFlashMaterial(batch)
 end
 
 function V.SurfaceFlashMesh(batch)
-	local mesh = textureEnabled:GetBool() and batch.flashMesh
+	local mesh = batch.flashMesh
 	return mesh and mesh:IsValid() and mesh or batch.mesh
 end
 

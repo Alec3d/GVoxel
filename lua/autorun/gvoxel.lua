@@ -61,6 +61,7 @@ local server = {
 	"sv_blasts",
 	"sv_props",
 	"sv_vehicles",
+	"sv_glide_breach",
 	"sv_hl2_wheels",
 	"sv_projectiles",
 	"sv_nav_graph",

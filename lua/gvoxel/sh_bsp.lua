@@ -539,8 +539,8 @@ function V.ReadBSP(stream, checkpoint, readLighting)
 	return data
 end
 
-function V.BSPLeaf(data, p)
-	local index = data.head
+function V.BSPLeaf(data, p, root)
+	local index = root or data.head
 	for _ = 1, 1024 do
 		if index < 0 then
 			return data.leaves[-index], -index
@@ -562,8 +562,8 @@ function V.BSPBrushContains(brush, p)
 	end
 	return true
 end
-function V.BSPSolid(data, p)
-	local leaf = V.BSPLeaf(data, p)
+function V.BSPSolid(data, p, root)
+	local leaf = V.BSPLeaf(data, p, root)
 	if leaf.solid then
 		return true
 	end
@@ -573,6 +573,28 @@ function V.BSPSolid(data, p)
 		end
 	end
 	return false
+end
+
+-- All rounded lattice points on a row lie between these two endpoints.
+-- Reuse the BSP path until the first plane that splits the row.
+function V.BSPScanNodeSolid(r, p, index, x)
+	local data = r.bsp
+	local start = index - x
+	if r.bspScanRow ~= start then
+		local left = x == 0 and p or V.ScanPoint(r, start)
+		local right = V.ScanPoint(r, start + (r.cells and r.cells.x or 32))
+		local root = data.head
+		for _ = 1, 1024 do
+			if root < 0 then break end
+			local node = data.nodes[root + 1]
+			local plane = data.planes[node.plane]
+			local leftFront = plane.normal:Dot(left) >= plane.distance
+			if leftFront ~= (plane.normal:Dot(right) >= plane.distance) then break end
+			root = leftFront and node.front or node.back
+		end
+		r.bspScanRow, r.bspScanRoot = start, root
+	end
+	return V.BSPSolid(data, p, r.bspScanRoot)
 end
 
 local function uint(bytes, pos)

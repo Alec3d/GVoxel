@@ -120,7 +120,7 @@ function V.ReleaseVehicleRegion(r)
 	end
 	return true
 end
-function V.TryEnrollVoxelVehicle(r, root, refresh)
+function V.TryEnrollVoxelVehicle(r, root, refresh, forBreach)
 	if states[root] and not refresh then
 		return states[root].region == r
 	end
@@ -131,7 +131,7 @@ function V.TryEnrollVoxelVehicle(r, root, refresh)
 		or not r.vehicleExterior
 		or not physics
 		or not physics.exteriorReady
-		or physics.jobs
+		or (physics.jobs and not (physics.deferPublish and (forBreach or root.IsGlideVehicle)))
 		or physics.failed
 		or physics.readyRevision ~= r.revision
 	then
@@ -166,7 +166,7 @@ function V.TryEnrollVoxelVehicle(r, root, refresh)
 	then
 		return false
 	end
-	if not V.HullTouchesModified(r, root:GetPos(), low - root:GetPos(), high - root:GetPos(), margin) then
+	if not forBreach and not V.HullTouchesModified(r, root:GetPos(), low - root:GetPos(), high - root:GetPos(), margin) then
 		return false
 	end
 	-- Do not search vertically in a Think/physics entry path. A chassis AABB
