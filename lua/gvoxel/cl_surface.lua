@@ -263,7 +263,7 @@ local function wallMaterial(variant, shader, name, params, projection)
 	return material
 end
 
-local function readMaterial(name, secondLayer)
+local function readMaterial(name, secondLayer, roomOnly)
 	local material = Material(name)
 	if material:IsError() then
 		return
@@ -335,10 +335,12 @@ local function readMaterial(name, secondLayer)
 		materialName = name,
 		tileU = math.max(16, (base.GetMappingWidth and base:GetMappingWidth() or base:Width()) * 0.25),
 		tileV = math.max(16, (base.GetMappingHeight and base:GetMappingHeight() or base:Height()) * 0.25),
-		interior = wallMaterial("native_v3", "VertexLitGeneric", name, params, projection),
-		interiorCut = wallMaterial("reveal_v4", "UnlitGeneric", name, cutParams, projection),
-		interiorCutLit = wallMaterial("reveal_lit_v4", "VertexLitGeneric", name, cutAlbedo, projection),
 	}
+	if not roomOnly then
+		result.interior = wallMaterial("native_v3", "VertexLitGeneric", name, params, projection)
+		result.interiorCut = wallMaterial("reveal_v4", "UnlitGeneric", name, cutParams, projection)
+		result.interiorCutLit = wallMaterial("reveal_lit_v4", "VertexLitGeneric", name, cutAlbedo, projection)
+	end
 	local surfaceParams = {}
 	for key, value in pairs(params) do
 		surfaceParams[key] = value
@@ -350,6 +352,7 @@ local function readMaterial(name, secondLayer)
 	local alphaReference = reference and tostring(reference) or nil
 	local alpha = getFloat("$alpha")
 	local translucent = flag("$translucent", 2097152) or alpha and alpha < 1
+	if roomOnly and translucent then return end
 	local selfIllum = flag("$selfillum", 64)
 	if alphaTest or translucent then
 		surfaceParams["$opaquetexture"] = nil
@@ -390,7 +393,7 @@ local function readMaterial(name, secondLayer)
 		surfaceParams["$alpha"] = alpha and tostring(alpha) or nil
 		result.translucent = true
 	end
-	if alphaTest and not translucent then
+	if alphaTest and not translucent and not roomOnly then
 		local albedo = {}
 		for key, value in pairs(surfaceParams) do
 			albedo[key] = value
@@ -435,6 +438,10 @@ local function readMaterial(name, secondLayer)
 				surfaceParams[key] = tostring(value)
 			end
 		end
+	end
+	if roomOnly then
+		surfaceParams["$nocull"] = nil
+		return wallMaterial("room_v1", "UnlitGeneric", name, surfaceParams, projection)
 	end
 	result.surfaceCut = wallMaterial("surface_v3", "UnlitGeneric", name, surfaceParams, projection)
 	if not alphaTest and not translucent and not baseMask and not normalMask and not selfIllum
@@ -522,6 +529,20 @@ local function readMaterial(name, secondLayer)
 		result.adjacentFlash = wallMaterial("phong_v3", "VertexLitGeneric", name, phong)
 	end
 	return result
+end
+
+function V.PortalRoomMaterial(r, face)
+	local texture = r.bsp.textures[face.tex.texture]
+	if not texture then return end
+	local second = face.dispAlphaMin == 255
+	local key = second and texture.name .. "#2" or texture.name
+	r.roomSurfaceMaterials = r.roomSurfaceMaterials or {}
+	local material = r.roomSurfaceMaterials[key]
+	if material == nil then
+		material = readMaterial(texture.name, second, true) or false
+		r.roomSurfaceMaterials[key] = material
+	end
+	if material then return material, texture end
 end
 
 local function recoverMaterial(source, r, findFace)

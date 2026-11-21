@@ -149,10 +149,19 @@ function V.ReadEditPlane()
     return plane
 end
 
-function V.ZoneLineOfSightBlocked(r, eye, viewer)
+function V.ZoneLineOfSightBlocked(r, eye, viewer, forward)
 	local high = r.origin + V.RegionSize(r)
 	local low = r.origin
 	local requests = {start=eye, mask=MASK_OPAQUE, filter=viewer}
+	local function blocked(point)
+		requests.endpos = point
+		local hit = util.TraceLine(requests)
+		return hit and hit.Hit and not hit.StartSolid and hit.HitPos:DistToSqr(point) > 12^2
+	end
+	if r.revision > 0 and forward then
+		local entry = V.CubeRayInterval(r, eye, forward)
+		if entry and not blocked(eye + forward * entry) then return false end
+	end
 	-- The nearest point and all eight corners sample the volume's silhouette.
 	-- Any unblocked sample keeps both terrain and aperture composition active.
 	for index=0,8 do
@@ -163,9 +172,12 @@ function V.ZoneLineOfSightBlocked(r, eye, viewer)
 			local corner=index-1
 			point=Vector(corner%2==0 and low.x or high.x,corner%4<2 and low.y or high.y,corner<4 and low.z or high.z)
 		end
-		requests.endpos=point
-		local hit=util.TraceLine(requests)
-		if not hit or not hit.Hit or hit.StartSolid or hit.HitPos:DistToSqr(point)<=12^2 then
+		if r.revision > 0 and index > 0 then
+			local direction = (point - eye):GetNormalized()
+			local entry = V.CubeRayInterval(r, eye, direction)
+			if entry then point = eye + direction * entry end
+		end
+		if not blocked(point) then
 			return false
 		end
 	end

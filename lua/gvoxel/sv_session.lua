@@ -44,16 +44,17 @@ local function progress(scan, ply, phase, ratio)
 	net.Send(ply)
 end
 function V.SendScanProgress(scan, phase, ratio)
+	local recipients = {}
 	for ply in pairs(scan.peers) do
-		if IsValid(ply) then
-			progress(scan, ply, phase, ratio)
-		end
+		if IsValid(ply) then recipients[#recipients + 1] = ply end
 	end
+	if #recipients > 0 then progress(scan, recipients, phase, ratio) end
 end
 local function attach(scan, ply)
 	-- Existing participants keep the atomic display/collision barrier. A late
 	-- join replays history without stopping everyone until it catches up.
 	scan.peers[ply] = { nextLayer = 0, sent = -1, acknowledged = -1, blocking = not scan.everReady }
+	scan.replicationIdle = nil
 	net.Start("vm_scan_begin")
 	net.WriteUInt(scan.region.id, 16)
 	net.WriteVector(scan.region.base)
@@ -72,6 +73,7 @@ function V.BeginScanSession(scan)
 	session = scan
 	scan.peers = {}
 	scan.history = {}
+	scan.replicationIdle = nil
 	if IsValid(scan.ply) then clients[scan.ply] = true end
 	for ply in pairs(clients) do
 		if IsValid(ply) then
@@ -213,24 +215,37 @@ function V.PrepareScanEdit(scan, work)
 	if not validStroke(work) then return false end
 	work.revision = work.revision or work.field.revision
 	work.previewReady = true
+	local recipients = {}
+	work.previewPeers = work.previewPeers or {}
 	for ply, peer in pairs(scan.peers) do
-		if IsValid(ply) then preparePeer(scan, work, ply, peer) end
+		if IsValid(ply) and peer.done and not peer.failed and peer.acknowledged == scan.region.revision
+			and work.previewPeers[ply] ~= peer then
+			recipients[#recipients + 1] = ply
+			work.previewPeers[ply] = peer
+		end
+	end
+	if #recipients > 0 then
+		strokePacket("vm_scan_prepare", scan, recipients, work.revision, work)
+		work.previewSent = true
 	end
 end
 function V.AbortScanPreparation(scan, work)
 	if not work or not work.previewPeers then
 		return
 	end
-	local recipients = work.previewPeers
+	local previews = work.previewPeers
 	work.previewPeers = nil
-	for ply, peer in pairs(recipients) do
+	local recipients = {}
+	for ply, peer in pairs(previews) do
 		if IsValid(ply) and scan.peers[ply] == peer and not peer.failed then
-			net.Start("vm_scan_abort")
-			net.WriteUInt(scan.region.id, 16)
-			net.WriteUInt(work.revision, 16)
-			net.Send(ply)
+			recipients[#recipients + 1] = ply
 		end
 	end
+	if #recipients == 0 then return end
+	net.Start("vm_scan_abort")
+	net.WriteUInt(scan.region.id, 16)
+	net.WriteUInt(work.revision, 16)
+	net.Send(recipients)
 end
 -- Budget catch-up traffic as a group. Full layers retain the two-packet cap;
 -- uniform layers can advance in the same tick without a dense-layer burst.
@@ -254,9 +269,12 @@ local function canStartStream(scan, ply, peer, allowProbe)
 	-- Broad view cone with a bounding sphere margin, independent of FOV zoom.
 	if delta:Dot(forward)<-extent:Length()/2 then return false end
 	local now=CurTime()
-	if peer.nextInterest and now<peer.nextInterest then return peer.interested end
+	if peer.nextInterest and now<peer.nextInterest and peer.interestRevision == r.revision
+		and eye:DistToSqr(peer.interestEye) <= 32^2
+		and (peer.interested or forward:DistToSqr(peer.interestAim) < 0.004) then return peer.interested end
 	if not allowProbe() then return false end
 	peer.nextInterest=now+math.max(0.25,(scan.pendingInterestCount or 0)/30)
+	peer.interestEye,peer.interestAim,peer.interestRevision=eye,forward,r.revision
 	peer.interested=true
 	-- PVS tests are broad and use native BSP. A positive result is sufficient.
 	-- A negative result is advisory on edited maps, since a new aperture may
@@ -272,7 +290,7 @@ local function canStartStream(scan, ply, peer, allowProbe)
 		end
 	end
 	if peer.interested and util.TraceLine and MASK_OPAQUE then
-		peer.interested=not V.ZoneLineOfSightBlocked(r,eye,ply)
+		peer.interested=not V.ZoneLineOfSightBlocked(r,eye,ply,forward)
 	end
 	return peer.interested
 end
@@ -283,8 +301,12 @@ function V.PumpScanReplication(scan, deadline)
 	end
 	local peers, count = scan.replicationPeers, 0
 	local latest = #scan.history
+	-- A settled zone does not need to poll every peer each tick. A new
+	-- history entry, attachment or recovery makes the next tick inspect it.
+	if scan.replicationIdle == latest then return end
 	local layers = V.RegionCells(scan.region, "z") + 1
 	local probes,pendingInterestCount=0,0
+	local settled = scan.completed
 	local function allowProbe()
 		if probes>=1 or SysTime()>=deadline then return false end
 		probes=probes+1
@@ -292,6 +314,7 @@ function V.PumpScanReplication(scan, deadline)
 	end
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) then
+			if not peer.features or not peer.done or peer.sent < latest then settled = false end
 			if not peer.features then pendingInterestCount=pendingInterestCount+1 end
 			local interested=not peer.failed and canStartStream(scan,ply,peer,allowProbe)
 			if not interested and not peer.features then peer.blocking=false end
@@ -308,6 +331,7 @@ function V.PumpScanReplication(scan, deadline)
 	scan.pendingInterestCount=pendingInterestCount
 	if peers then for i = #peers, count + 1, -1 do peers[i] = nil end end
 	if count == 0 then
+		if settled then scan.replicationIdle = latest end
 		return
 	end
 	local bytes, packets = REPLICATION_BYTES, REPLICATION_PACKETS
@@ -375,11 +399,14 @@ function V.PublishScanEdit(scan, work)
 	scan.history[revision] =
 		{ center = work.center, radius = work.radius, adding = work.adding, seed = work.seed, floorZ = work.floorZ, plane = work.plane, shape = work.shape }
 	work.sent = true
+	local recipients = {}
 	for ply, peer in pairs(scan.peers) do
 		if IsValid(ply) and not peer.failed and peer.done and peer.sent == revision - 1 then
-			edit(scan, ply, peer, revision, work)
+			recipients[#recipients + 1] = ply
+			peer.sent = revision
 		end
 	end
+	if #recipients > 0 then strokePacket("vm_scan_edit", scan, recipients, revision, work) end
 end
 function V.GetServerScanRegion()
 	return session and session.completed and session.region or nil
@@ -406,6 +433,7 @@ net.Receive("vm_scan_ready", function(length, ply)
 	end
     if revision<=peer.acknowledged and not peer.failed then return end
 	peer.acknowledged = math.max(peer.acknowledged, revision)
+	if peer.failed then scan.replicationIdle = nil end
 	peer.failed = nil
 	if revision >= scan.region.revision then peer.blocking = true end
 	scan.movementReady = V.ScanPeersReady(scan, scan.region.revision)

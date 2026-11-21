@@ -15,7 +15,7 @@ end
 local region, faces, failure
 local portals = {}
 local compileFace = 0
-local openingJob
+local openingJob, roomJob
 local nativeBackground
 local prepared, staged = false, false
 local targets = { hdr = {}, ldr = {} }
@@ -66,7 +66,9 @@ local function freePortals()
 	portals = {}
 	for _, portal in ipairs(old) do
 		V.ReleaseChunkMeshes(portal)
+		if portal.room then V.ReleaseChunkMeshes({ batches = portal.room }) end
 	end
+	if roomJob then V.ReleaseChunkMeshes({ batches = roomJob.batches }) roomJob = nil end
 end
 
 local function setVisualRegion(r, hidden)
@@ -140,21 +142,21 @@ local function compileOpenings(deadline)
 				nativeBackground = V.BuildNativeBackgroundData(region, coroutine.yield)
 			end
 			local vertices = V.BuildBoundaryOpening(region, faces[index], coroutine.yield)
-			local sky = V.PortalSkyFlags(region.bsp, vertices, faces[index].normal, coroutine.yield)
+			local sky, exits = V.PortalSkyFlags(region.bsp, vertices, faces[index].normal, coroutine.yield, true)
 			if #vertices > 0 then
 				local low, high = V.VertexBounds(vertices, coroutine.yield)
-				return vertices, sky, low, high
+				return vertices, sky, low, high, exits
 			end
 			return vertices
 		end)
-	local vertices, sky, low, high
+	local vertices, sky, low, high, exits
 	repeat
-		local ok, result, flags, min, max = coroutine.resume(openingJob)
+		local ok, result, flags, min, max, rooms = coroutine.resume(openingJob)
 		if not ok then
 			openingFailed(result)
 			return
 		end
-		vertices, sky, low, high = result, flags, min, max
+		vertices, sky, low, high, exits = result, flags, min, max, rooms
 	until coroutine.status(openingJob) == "dead" or SysTime() >= deadline
 	if coroutine.status(openingJob) ~= "dead" then
 		return
@@ -174,6 +176,7 @@ local function compileOpenings(deadline)
 			low = low,
 			high = high,
 			slot = index,
+			exits = exits,
 			sky3D = sky == nil or bit.band(sky, 1) ~= 0,
 		}
 	end
@@ -195,6 +198,38 @@ hook.Add("Think", "GVoxel.CompileOpenings", function()
 	if not staged and compileFace ~= 0 then
 		compileOpenings(SysTime() + 0.001)
 	end
+end)
+
+hook.Add("Think", "GVoxel.PreparePortalRoom", function()
+	if not region or not V.PortalRoomMaterial then return end
+	if not roomJob then
+		for _, portal in ipairs(portals) do
+			if portal.wantRoom and not portal.room then
+				local job = { portal = portal, batches = {} }
+				job.thread = coroutine.create(function()
+					V.BuildPortalRoom(region, portal, job.batches, coroutine.yield)
+				end)
+				roomJob = job
+				break
+			end
+		end
+	end
+	if not roomJob then return end
+	local job = roomJob
+	local deadline = SysTime() + 0.0007
+	repeat
+		local ok, err = coroutine.resume(job.thread)
+		if not ok then
+			V.ReleaseChunkMeshes({ batches = job.batches })
+			job.batches = {}
+			ErrorNoHalt("[GVoxel] Geometrie exterieure : " .. tostring(err) .. "\n")
+		end
+		if coroutine.status(job.thread) == "dead" then
+			job.portal.room = job.batches
+			roomJob = nil
+			return
+		end
+	until SysTime() >= deadline
 end)
 
 local function drawFace(face)
@@ -779,8 +814,23 @@ hook.Add("PostDrawOpaqueRenderables", "GVoxel.ExteriorMissingContent", function(
 	if depth or sky3D or not inBackgroundView() then
 		return
 	end
+	activateWorldClip()
 	if not backgroundContext.nativeSky and V.DrawVoxelSky then
 		V.DrawVoxelSky(backgroundContext.view, backgroundContext.sky)
+	end
+	if backgroundContext.room then
+		local row, area = frameViews.eyeRow, frameViews.eyeArea
+		for _, batch in ipairs(backgroundContext.room) do
+			if not (row and batch.areas[area] and V.BSPClustersInPVS(row, batch.clusters))
+				and V.BoundsInView(backgroundContext.frustum, batch.low, batch.high)
+				and V.BoundsInView(frameViews.frustum, batch.low, batch.high) then
+				render.SetColorModulation(batch.gain, batch.gain, batch.gain)
+				render.SetMaterial(batch.material)
+				V.DrawMesh(batch.mesh)
+				stats.roomDraws = stats.roomDraws + 1
+			end
+		end
+		render.SetColorModulation(1, 1, 1)
 	end
 	redrawExterior(backgroundContext)
 end)
@@ -818,6 +868,7 @@ local function renderBackground(portal, view, slot)
 	backgroundContext = {
 		targetName = slot.target:GetName(), view = view, sky = sky,
 		frustum = V.PortalFrustum(frameViews.frustum, portal, true),
+		room = frameViews.roomNeeds[portal] and portal.room or nil,
 	}
 	render.RenderView(view)
 	backgroundContext = nil
@@ -847,6 +898,7 @@ local function renderBackground(portal, view, slot)
 	slot.zfar = view.zfar
 	slot.renderedAt = RealTime()
 	slot.portal = portal
+	slot.room = portal.room
 	if render.GetToneMappingScaleLinear then
 		local tone = render.GetToneMappingScaleLinear()
 		slot.tone = Vector(tone.x, tone.y, tone.z)
@@ -854,7 +906,7 @@ local function renderBackground(portal, view, slot)
 end
 
 local function cachedBackground(slot, portal, view)
-	if slot.portal ~= portal or not slot.origin or RealTime() - (slot.renderedAt or 0) > 1 / 30 then
+	if slot.portal ~= portal or slot.room ~= portal.room or not slot.origin or RealTime() - (slot.renderedAt or 0) > 1 / 30 then
 		return false
 	end
 	if slot.origin:DistToSqr(view.origin) > 0.000001 or slot.forward:DistToSqr(view.angles:Forward()) > 1e-12 then
@@ -874,14 +926,15 @@ end
 local occlusionEnabled = CreateClientConVar("vm_cull_occluded", "1", true, true, "Cull occluded voxel zones")
 local occlusion
 
-local function occluded(r, eye)
+local function occluded(r, eye, forward)
 	if not occlusionEnabled:GetBool() or not V.ZoneDistanceSquared or not util.TraceLine
 		or V.ZoneDistanceSquared(r, eye) <= 256^2 then return false end
 	local now = RealTime()
 	if occlusion and occlusion.region == r and now < occlusion.expires
-		and eye:DistToSqr(occlusion.eye) <= 24^2 then return occlusion.hidden end
-	local hidden=V.ZoneLineOfSightBlocked(r,eye,LocalPlayer())
-	occlusion={region=r,eye=eye,hidden=hidden,expires=now+(hidden and 0.15 or 0.35)}
+		and occlusion.revision == r.revision and eye:DistToSqr(occlusion.eye) <= 24^2
+		and (not occlusion.hidden or forward:DistToSqr(occlusion.forward) < 0.004) then return occlusion.hidden end
+	local hidden=V.ZoneLineOfSightBlocked(r,eye,LocalPlayer(),forward)
+	occlusion={region=r,revision=r.revision,eye=eye,forward=forward,hidden=hidden,expires=now+(hidden and 0.15 or 0.35)}
 	return hidden
 end
 
@@ -898,6 +951,7 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 	stats.reused = 0
 	stats.native = 0
 	stats.backgroundPixels = 0
+	stats.roomDraws = 0
 	stats.exteriorBounds = 0
 	stats.exteriorPVS = 0
 	stats.exteriorCandidates = 0
@@ -935,43 +989,86 @@ hook.Add("RenderScene", "GVoxel.PrepareBackgrounds", function(origin, angles, fo
 			drawviewer = LocalPlayer():ShouldDrawLocalPlayer(),
 		}
 		local frustum = V.ViewFrustum(view, w, h)
+		local forward, right = angles:Forward(), angles.Right and angles:Right()
+		local previous = frameViews
+		local reuseProof = previous and previous.region == region and previous.revision == region.revision
+			and previous.origin:DistToSqr(origin) == 0 and previous.forward:DistToSqr(forward) == 0
+			and (not right or previous.right and previous.right:DistToSqr(right) == 0)
+			and previous.aspect == aspect and previous.fov == fov
 		frameViews = {
 			frame = FrameNumber(),
 			region = region,
 			origin = origin,
-			forward = angles:Forward(),
-			right = angles.Right and angles:Right(),
+			revision = region.revision,
+			forward = forward,
+			right = right,
+			aspect = aspect,
+			fov = fov,
 			frustum = frustum,
 			slots = {},
 			native = {},
+			proof = reuseProof and previous.proof or {},
+			roomNeeds = reuseProof and previous.roomNeeds or {},
 		}
 		if not V.BoundsInView(frustum, region.origin, region.origin + V.RegionSize(region)) then
 			return
 		end
-		if occluded(region, origin) then
+		if occluded(region, origin, forward) then
 			frameViews = nil
 			return
 		end
+		local bsp = region.bsp
+		local eyeSolid
+		if reuseProof then
+			frameViews.eyeRow, frameViews.eyeArea = previous.eyeRow, previous.eyeArea
+			eyeSolid = previous.eyeSolid
+		elseif bsp and bsp.nodes and bsp.leaves then
+			eyeSolid = V.BSPSolid(bsp, origin)
+			if not eyeSolid then frameViews.eyeRow, frameViews.eyeArea = V.BSPVisibleClusters(bsp, origin) end
+		end
+		frameViews.eyeSolid = eyeSolid
 		local hdr = IMAGE_FORMAT_RGBA16161616F and render.GetHDREnabled and render.GetHDREnabled()
+		local needsView, dominant, best = {}, nil, 0.6
 		for _, portal in ipairs(portals) do
 			if V.MaskFaceIsExit(portal.face, origin) then
 				if V.BoundsInView(frustum, portal.low, portal.high) then
-					if not V.PortalNeedsBackground(nativeBackground, portal, frustum) then
+					local needs = frameViews.proof[portal]
+					if needs == nil then
+						local missing = region.revision > 0 and V.PortalRoomMissing(portal, frameViews.eyeRow, frameViews.eyeArea)
+						frameViews.roomNeeds[portal] = missing
+						needs = missing or V.PortalNeedsBackground(nativeBackground, portal, frustum, eyeSolid)
+						frameViews.proof[portal] = needs
+					end
+					if not needs then
 						frameViews.native[portal] = true
 						stats.native = stats.native + 1
 					else
-						local slot = ensureTarget(portal.slot, captureW, captureH, hdr)
-						if cachedBackground(slot, portal, view) then
-							stats.reused = stats.reused + 1
-						else
-							renderBackground(portal, view, slot)
+						needsView[#needsView + 1] = portal
+						if frameViews.roomNeeds[portal] then portal.wantRoom = true end
+						if w >= 1600 and h >= 900 then
+							local coverage = V.PortalScreenCoverage(view, portal)
+							if coverage > best then best, dominant = coverage, portal end
 						end
-						frameViews.slots[portal] = slot
 					end
 				else
 					stats.culled = stats.culled + 1
 				end
 			end
+		end
+		for _, portal in ipairs(needsView) do
+			local slotIndex = portal.slot
+			view.w, view.h = captureW, captureH
+			if portal == dominant then
+				slotIndex = 0
+				view.w, view.h = 2048, 1024
+			end
+			local slot = ensureTarget(slotIndex, view.w, view.h, hdr)
+			if cachedBackground(slot, portal, view) then
+				stats.reused = stats.reused + 1
+			else
+				renderBackground(portal, view, slot)
+			end
+			frameViews.slots[portal] = slot
 		end
 	end, debug.traceback)
 	cleanup()
@@ -1241,11 +1338,12 @@ concommand.Add("vm_render_stats", function()
 		)
 	)
 	print(string.format(
-		"[GVoxel] Ouvertures : %d pixels captures | %.2f MiB couleurs de cibles | %d boites / %d candidats / %d tests PVS",
+		"[GVoxel] Ouvertures : %d pixels captures | %.2f MiB couleurs de cibles | %d boites / %d candidats / %d tests PVS | %d lots BSP de secours",
 		stats.backgroundPixels or 0,
 		(stats.backgroundTargetBytes or 0) / 1048576,
 		stats.exteriorBounds or 0,
 		stats.exteriorCandidates or 0,
-		stats.exteriorPVS or 0
+		stats.exteriorPVS or 0,
+		stats.roomDraws or 0
 	))
 end)

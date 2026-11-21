@@ -605,7 +605,7 @@ local function uint(bytes, pos)
 	return a + b * 256 + c * 65536 + d * 16777216
 end
 function V.BSPClusterPVS(data, cluster)
-	if cluster < 0 or not data.visibility or #data.visibility < 4 then
+	if type(cluster) ~= "number" or cluster < 0 or not data.visibility or #data.visibility < 4 then
 		return
 	end
 	local cached = data.pvsRows[cluster]

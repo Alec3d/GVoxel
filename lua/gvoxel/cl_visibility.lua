@@ -12,6 +12,19 @@ function V.BackgroundTargetSize(w, h)
 	return 512, 256
 end
 
+-- Only the largest visible exit may use the shared high-resolution target.
+function V.PortalScreenCoverage(view, portal)
+	local center = (portal.low + portal.high) * 0.5
+	local span = portal.high - portal.low
+	local delta = center - view.origin
+	local forward = view.angles:Forward()
+	local radius = span:Length() * 0.5
+	local near = delta:Dot(forward) - (math.abs(forward.x) * span.x
+		+ math.abs(forward.y) * span.y + math.abs(forward.z) * span.z) * 0.5
+	local horizontal = math.tan(math.rad(view.fov) * 0.5) * math.max(1, view.aspect / (4 / 3))
+	return radius / math.max(4, near * horizontal)
+end
+
 function V.ViewFrustum(view, w, h)
 	local f = view.angles:Forward()
 	local right = view.angles.Right and view.angles:Right() or f:Cross(Vector(0, 0, 1)):GetNormalized()
@@ -49,10 +62,10 @@ function V.BoundsInView(frustum, low, high)
 	return true
 end
 
-function V.VertexBounds(vertices, checkpoint)
+function V.VertexBounds(vertices, checkpoint, positions)
 	local low, high = Vector(math.huge, math.huge, math.huge), Vector(-math.huge, -math.huge, -math.huge)
 	for i, vertex in ipairs(vertices) do
-		local p = vertex.pos
+		local p = positions and vertex or vertex.pos
 		low.x, low.y, low.z = math.min(low.x, p.x), math.min(low.y, p.y), math.min(low.z, p.z)
 		high.x, high.y, high.z = math.max(high.x, p.x), math.max(high.y, p.y), math.max(high.z, p.z)
 		if checkpoint and i % 128 == 0 then checkpoint() end
@@ -62,26 +75,140 @@ end
 
 -- Prepared with the exit mesh. Indoor exits without sky in their native
 -- leaves do not need another full sky-camera RenderView every moving frame.
-function V.PortalSkyFlags(data, vertices, normal, checkpoint)
+function V.PortalSkyFlags(data, vertices, normal, checkpoint, collectRooms)
 	if not data or not data.nodes or not data.leaves then
 		return
 	end
-	local flags = 0
+	local flags, exits, seen, rooms = 0, {}, {}, {}
 	for i = 1, #vertices, 3 do
 		local point = (vertices[i].pos + vertices[i + 1].pos + vertices[i + 2].pos) / 3 + normal * 2
 		local leaf = V.BSPLeaf(data, point)
-		if leaf.flags == nil then
-			return
+		if flags ~= nil then
+			flags = leaf.flags and bit.bor(flags, bit.band(leaf.flags, 5))
 		end
-		flags = bit.bor(flags, bit.band(leaf.flags, 5))
-		if bit.band(flags, 1) ~= 0 then
+		if collectRooms and not seen[leaf] then
+			if leaf.solid or not leaf.cluster or leaf.cluster < 0 then
+				seen[leaf] = true
+			elseif not V.BSPSolid(data, point) then
+				seen[leaf] = true
+				local row = V.BSPClusterPVS(data, leaf.cluster)
+				local key = leaf.cluster .. ":" .. (leaf.area or 0)
+				if row and not rooms[key] then
+					rooms[key] = true
+					exits[#exits + 1] = { cluster = leaf.cluster, area = leaf.area, row = row }
+				end
+			end
+		elseif not collectRooms and (flags == nil or bit.band(flags, 1) ~= 0) then
 			return flags
 		end
 		if checkpoint and i % 96 == 1 then
 			checkpoint()
 		end
 	end
-	return flags
+	return flags, exits
+end
+
+function V.PortalRoomMissing(portal, row, area)
+	for _, exit in ipairs(portal.exits or {}) do
+		if area ~= exit.area or not row
+			or bit.band(row[math.floor(exit.cluster / 8) + 1] or 0, 2 ^ (exit.cluster % 8)) == 0 then
+			return true
+		end
+	end
+	return false
+end
+
+-- Only recover world faces in the compiled visibility of an actual exit.
+-- The exit plane and native depth still clip the fallback when it is drawn.
+function V.BuildPortalRoom(r, portal, batches, checkpoint)
+	local data, side = r.bsp, portal.face.normal
+	local low, high = portal.low * 1, portal.high * 1
+	local roomReach, vertexLimit, batchLimit = 1024, 16384, 128
+	for _, axis in ipairs({ "x", "y", "z" }) do
+		low[axis] = low[axis] - (side[axis] > 0 and 0 or roomReach)
+		high[axis] = high[axis] + (side[axis] < 0 and 0 or roomReach)
+	end
+	local center = (portal.low + portal.high) * 0.5
+	local candidates = {}
+	for index, face in ipairs(V.BSPBoundsCandidates(data, "faces", low, high, checkpoint)) do
+		local a, b = face.dispLow or face.low, face.dispHigh or face.high
+		-- Sky, water, translucent surfaces and NoDraw remain native.
+		if face.tex and face.areas and face.clusters and bit.band(face.tex.flags or 0, 0x9E) == 0
+			and V.BoundsOverlap(low, high, a, b) then
+			for _, exit in ipairs(portal.exits) do
+				if face.areas[exit.area] and V.BSPClustersInPVS(exit.row, face.clusters) then
+					local dx = math.max(a.x - center.x, 0, center.x - b.x)
+					local dy = math.max(a.y - center.y, 0, center.y - b.y)
+					local dz = math.max(a.z - center.z, 0, center.z - b.z)
+					candidates[#candidates + 1] = { face = face, distance = dx * dx + dy * dy + dz * dz, index = index }
+					break
+				end
+			end
+		end
+		if index % 64 == 0 then checkpoint() end
+	end
+	table.sort(candidates, function(a, b)
+		return a.distance < b.distance or a.distance == b.distance and a.index < b.index
+	end)
+	local groups, ordered, vertices = {}, {}, 0
+	for _, candidate in ipairs(candidates) do
+		local face = candidate.face
+		local count = face.dispGrid and (face.dispWidth - 1) ^ 2 * 6 or (#face.vertices - 2) * 3
+		if vertices + count <= vertexLimit then
+			local material, texture = V.PortalRoomMaterial(r, face)
+			if material then
+				local areas = {}
+				for area in pairs(face.areas) do areas[#areas + 1] = area end
+				table.sort(areas)
+				local key = (face.clusterKey or table.concat(face.clusters, ",")) .. ":" .. table.concat(areas, ",")
+				local byVisibility = groups[material] or {}
+				groups[material] = byVisibility
+				local group = byVisibility[key]
+				if not group and #ordered < batchLimit then
+					group = { material = material, clusters = face.clusters, areas = face.areas, vertices = {} }
+					byVisibility[key] = group
+					ordered[#ordered + 1] = group
+				end
+				if group then
+					local n, tex = face.normal, face.tex
+					local lightmap = V.PrepareBSPLightmap(data, face)
+					local offset = n * 0.125
+					local points = {}
+					local function vertex(pos)
+						if not points[pos] then
+							points[pos] = { pos = pos - offset, normal = n,
+								u = (tex.u:Dot(pos) + tex.uo) / texture.w, v = (tex.v:Dot(pos) + tex.vo) / texture.h,
+								color = color_white, cutLight = lightmap and V.SamplePreparedBSPLightmap(lightmap, pos)
+									or render.ComputeLighting(pos + n * 2, n) }
+						end
+						return points[pos]
+					end
+					local function triangle(a, b, c)
+						if (b - a):Cross(c - a):Dot(n) > 0 then b, c = c, b end
+						local list = group.vertices
+						list[#list + 1], list[#list + 2], list[#list + 3] = vertex(a), vertex(b), vertex(c)
+					end
+					if face.dispGrid then
+						V.ForDisplacementTriangles(face, function(t) triangle(t[1], t[2], t[3]) end, checkpoint)
+					else
+						local p = face.vertices
+						for i = 2, #p - 1 do triangle(p[1], p[i], p[i + 1]) end
+					end
+					vertices = vertices + count
+				end
+			end
+		end
+		checkpoint()
+	end
+	for _, group in ipairs(ordered) do
+		local encoded, gain = V.EncodeCutLighting(group.vertices, checkpoint)
+		local a, b = V.VertexBounds(group.vertices, checkpoint)
+		local mesh = Mesh(group.material)
+		batches[#batches + 1] = { mesh = mesh, material = group.material, gain = gain,
+			clusters = group.clusters, areas = group.areas, low = a, high = b }
+		mesh:BuildFromTriangles(encoded)
+		checkpoint()
+	end
 end
 
 -- Tight cone through an aperture rectangle. Unlike the camera frustum this
@@ -245,6 +372,11 @@ end
 
 -- Immutable original occluders, clipped once to the scan. Sculpture does not
 -- change this list: it describes what the native BSP could hide, not voxels.
+local clipPlanes = {
+	{ axis = "x", normal = Vector(1, 0, 0), opposite = Vector(-1, 0, 0) },
+	{ axis = "y", normal = Vector(0, 1, 0), opposite = Vector(0, -1, 0) },
+	{ axis = "z", normal = Vector(0, 0, 1), opposite = Vector(0, 0, -1) },
+}
 function V.BuildNativeBackgroundData(r, checkpoint)
 	if not r.bsp then
 		return
@@ -260,7 +392,8 @@ function V.BuildNativeBackgroundData(r, checkpoint)
 			high = Vector(math.min(big.x, high.x), math.min(big.y, high.y), math.min(big.z, high.z)),
 		}
 	end
-	for i, face in ipairs(r.bsp.faces) do
+	local candidates = r.bsp.boundsIndex and V.BSPBoundsCandidates(r.bsp, "faces", r.origin, high, checkpoint) or r.bsp.faces
+	for i, face in ipairs(candidates) do
 		local low, big = face.dispLow or face.low, face.dispHigh or face.high
 		if V.BoundsOverlap(low, big, r.origin, high) then
 			-- Non-flat displacements are only known by conservative bounds.
@@ -300,18 +433,14 @@ function V.BuildNativeBackgroundData(r, checkpoint)
 				addBounds(low, big)
 			else
 				local polygon = face.vertices
-				for _, axis in ipairs({ "x", "y", "z" }) do
-					local n = Vector()
-					n[axis] = 1
-					polygon = clipInside(polygon, n, r.origin[axis])
-					polygon = clipInside(polygon, -n, -high[axis])
+				for _, plane in ipairs(clipPlanes) do
+					local axis = plane.axis
+					if low[axis] < r.origin[axis] then polygon = clipInside(polygon, plane.normal, r.origin[axis]) end
+					if big[axis] > high[axis] then polygon = clipInside(polygon, plane.opposite, -high[axis]) end
 				end
 				if #polygon >= 3 then
-					local vertices = {}
-					for _, p in ipairs(polygon) do
-						vertices[#vertices + 1] = { pos = p }
-					end
-					local a, b = V.VertexBounds(vertices)
+					local a, b = low, big
+					if polygon ~= face.vertices then a, b = V.VertexBounds(polygon, checkpoint, true) end
 					result.faces[#result.faces + 1] = { low = a, high = b, polygon = polygon }
 				end
 			end
@@ -323,12 +452,13 @@ function V.BuildNativeBackgroundData(r, checkpoint)
 	return result
 end
 
-function V.PortalNeedsBackground(data, portal, frustum)
+function V.PortalNeedsBackground(data, portal, frustum, eyeSolid)
 	if not data then
 		return true
 	end
 	local eye = frustum.eye
-	if V.BSPSolid(data.data, eye) then
+	if eyeSolid == nil then eyeSolid = V.BSPSolid(data.data, eye) end
+	if eyeSolid then
 		return true
 	end
 	local cone = V.PortalFrustum(frustum, portal)
@@ -337,16 +467,16 @@ function V.PortalNeedsBackground(data, portal, frustum)
 	end
 	local exitNormal = -portal.face.normal
 	local exitDistance = exitNormal:Dot(portal.face.point)
+	local planeDistances = {}
+	for index, n in ipairs(cone.planes) do planeDistances[index] = n:Dot(eye) end
 	for _, face in ipairs(data.faces) do
 		local possible = true
-		for _, n in ipairs(cone.planes) do
-			local p = Vector(
-				n.x >= 0 and face.high.x or face.low.x,
-				n.y >= 0 and face.high.y or face.low.y,
-				n.z >= 0 and face.high.z or face.low.z
-			)
+		for i, n in ipairs(cone.planes) do
+			local x = n.x >= 0 and face.high.x or face.low.x
+			local y = n.y >= 0 and face.high.y or face.low.y
+			local z = n.z >= 0 and face.high.z or face.low.z
 			-- Touching a cone edge is zero projected area, not an occluder.
-			if n:Dot(p - eye) <= 1e-7 then
+			if n.x * x + n.y * y + n.z * z - planeDistances[i] <= 1e-7 then
 				possible = false
 				break
 			end
@@ -356,8 +486,8 @@ function V.PortalNeedsBackground(data, portal, frustum)
 				return true, face
 			end -- uncertain displacement
 			local polygon = face.polygon
-			for _, n in ipairs(cone.planes) do
-				polygon = clipInside(polygon, n, n:Dot(eye))
+			for i, n in ipairs(cone.planes) do
+				polygon = clipInside(polygon, n, planeDistances[i])
 				if #polygon < 3 then
 					break
 				end

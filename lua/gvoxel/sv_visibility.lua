@@ -167,15 +167,45 @@ hook.Add("AcceptInput", "GVoxel.KeepOpenedVisibility", function(ent, name, _, _,
 		end
 	end
 end)
-hook.Add("SetupPlayerVisibility", "GVoxel.OpenRoomPVS", function(ply)
+-- Each watcher in the same compiled leaf can share the same list. Keep
+-- origins in other areas, since a PVS row alone does not describe area doors.
+local function extraOrigins(r, eye)
+	local data = r.bsp
+	if not data or not data.nodes or not data.visibility then return r.visibilityOrigins end
+	local leaf = V.BSPLeaf(data, eye)
+	local row = V.BSPClusterPVS(data, leaf.cluster)
+	if not row then return r.visibilityOrigins end
+	local state = regions[r]
+	if not state then return r.visibilityOrigins end
+	state.originRows = state.originRows or {}
+	local key = leaf.cluster .. ":" .. (leaf.area or 0)
+	if state.originRows[key] then return state.originRows[key] end
+	if (state.originRowCount or 0) >= 64 then
+		state.originRows, state.originRowCount = {}, 0
+	end
+	local origins = {}
+	for _, point in ipairs(r.visibilityOrigins) do
+		local other = V.BSPLeaf(data, point)
+		local cluster = other.cluster
+		if other.area ~= leaf.area or not cluster or cluster < 0
+			or bit.band(row[math.floor(cluster / 8) + 1] or 0, 2 ^ (cluster % 8)) == 0 then
+			origins[#origins + 1] = point
+		end
+	end
+	state.originRows[key] = origins
+	state.originRowCount = (state.originRowCount or 0) + 1
+	return origins
+end
+hook.Add("SetupPlayerVisibility", "GVoxel.OpenRoomPVS", function(ply, viewEntity)
 	local r = V.GetServerMovementRegion(ply)
 	if not r or r.revision == 0 or not r.visibilityOrigins then
 		return
 	end
-	if ply:GetShootPos():DistToSqr(r.base) > (r.side + 2048) ^ 2 then
+	local eye = IsValid(viewEntity) and viewEntity ~= ply and viewEntity:GetPos() or ply:GetShootPos()
+	if eye:DistToSqr(r.base) > (r.side + 2048) ^ 2 then
 		return
 	end
-	for _, p in ipairs(r.visibilityOrigins) do
+	for _, p in ipairs(extraOrigins(r, eye)) do
 		AddOriginToPVS(p)
 	end
 	if r.bsp and r.bsp.sky and r.bsp.sky.camera then
